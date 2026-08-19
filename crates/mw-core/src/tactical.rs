@@ -5,7 +5,7 @@
 //! from JavaScript's dynamic/string-normalized side keys belongs in frontend
 //! adapters, while the live game supplies numeric `sideIndex` values.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 
@@ -422,19 +422,36 @@ impl TacticalGrid {
         if origin.x >= self.columns || origin.y >= self.rows {
             return 0;
         }
-        let keys = neighbor_keys(
-            side_cells,
-            origin.x,
-            origin.y,
-            self.columns,
-            self.rows,
-            options.radius_cells,
-            None,
-        );
-        for key in &keys {
-            visitor(&side_cells[key]);
+        if options.radius_cells <= 1 {
+            let (keys, key_count) = small_neighbor_keys(
+                side_cells,
+                origin.x,
+                origin.y,
+                self.columns,
+                self.rows,
+                options.radius_cells,
+                None,
+            );
+            for &key in &keys[..key_count] {
+                visitor(&side_cells[&key]);
+            }
+            return key_count;
         }
-        keys.len()
+        let mut visited = 0;
+        for cell in side_cells.values() {
+            if cells_are_neighbors(
+                origin.x,
+                origin.y,
+                cell.x,
+                cell.y,
+                self.columns,
+                options.radius_cells,
+            ) {
+                visitor(cell);
+                visited += 1;
+            }
+        }
+        visited
     }
 
     /// Streams each unordered same-side neighboring pair at most once.
@@ -466,17 +483,7 @@ impl TacticalGrid {
         };
 
         for (&source_key, source_cell) in side_cells {
-            let neighbor_keys = neighbor_keys(
-                side_cells,
-                source_cell.x,
-                source_cell.y,
-                self.columns,
-                self.rows,
-                options.radius_cells,
-                Some(source_key),
-            );
-            for target_key in neighbor_keys {
-                let target_cell = &side_cells[&target_key];
+            let mut visit_target = |target_key: CellKey, target_cell: &TacticalCell| {
                 if target_key == source_key {
                     for left_position in 0..source_cell.units.len() {
                         for right_position in left_position + 1..source_cell.units.len() {
@@ -510,6 +517,33 @@ impl TacticalGrid {
                         }
                     }
                 }
+            };
+            if options.radius_cells <= 1 {
+                let (keys, key_count) = small_neighbor_keys(
+                    side_cells,
+                    source_cell.x,
+                    source_cell.y,
+                    self.columns,
+                    self.rows,
+                    options.radius_cells,
+                    Some(source_key),
+                );
+                for &target_key in &keys[..key_count] {
+                    visit_target(target_key, &side_cells[&target_key]);
+                }
+            } else {
+                for (&target_key, target_cell) in side_cells.range(source_key..) {
+                    if cells_are_neighbors(
+                        source_cell.x,
+                        source_cell.y,
+                        target_cell.x,
+                        target_cell.y,
+                        self.columns,
+                        options.radius_cells,
+                    ) {
+                        visit_target(target_key, target_cell);
+                    }
+                }
             }
         }
 
@@ -523,7 +557,24 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }
 }
 
-fn neighbor_keys(
+fn cells_are_neighbors(
+    origin_x: usize,
+    origin_y: usize,
+    target_x: usize,
+    target_y: usize,
+    columns: usize,
+    radius: usize,
+) -> bool {
+    let delta_y = origin_y.abs_diff(target_y);
+    if delta_y > radius {
+        return false;
+    }
+    let direct_x = origin_x.abs_diff(target_x);
+    let wrapped_x = columns - direct_x;
+    direct_x.min(wrapped_x) <= radius
+}
+
+fn small_neighbor_keys(
     side_cells: &BTreeMap<CellKey, TacticalCell>,
     origin_x: usize,
     origin_y: usize,
@@ -531,9 +582,11 @@ fn neighbor_keys(
     rows: usize,
     radius: usize,
     minimum_key: Option<CellKey>,
-) -> BTreeSet<CellKey> {
-    let mut keys = BTreeSet::new();
-    let radius = radius.min(isize::MAX as usize) as isize;
+) -> ([CellKey; 9], usize) {
+    debug_assert!(radius <= 1);
+    let mut keys = [0; 9];
+    let mut key_count = 0;
+    let radius = radius as isize;
     for dy in -radius..=radius {
         let Some(y) = origin_y.checked_add_signed(dy) else {
             continue;
@@ -542,17 +595,27 @@ fn neighbor_keys(
             continue;
         }
         for dx in -radius..=radius {
-            let offset = dx.rem_euclid(columns as isize) as usize;
-            let x = (origin_x + offset) % columns;
-            let Ok(key) = tactical_cell_key(x, y, columns) else {
-                continue;
+            let x = match dx {
+                -1 if origin_x == 0 => columns - 1,
+                -1 => origin_x - 1,
+                0 => origin_x,
+                1 if origin_x + 1 == columns => 0,
+                1 => origin_x + 1,
+                _ => unreachable!("small tactical radius is at most one"),
             };
-            if minimum_key.is_none_or(|minimum| key >= minimum) && side_cells.contains_key(&key) {
-                keys.insert(key);
+            let key = y * columns + x;
+            if minimum_key.is_some_and(|minimum| key < minimum)
+                || !side_cells.contains_key(&key)
+                || keys[..key_count].contains(&key)
+            {
+                continue;
             }
+            keys[key_count] = key;
+            key_count += 1;
         }
     }
-    keys
+    keys[..key_count].sort_unstable();
+    (keys, key_count)
 }
 
 fn wrapped_distance_sq(left: &TacticalUnit, right: &TacticalUnit) -> f64 {

@@ -9,6 +9,7 @@ use mw_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod native_tick;
 mod unit_kernel;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -31,6 +32,8 @@ fn run() -> Result<()> {
         "tactical-bench" => tactical_bench(args.collect()),
         "unit-fixture" => unit_kernel::run_fixture_command(args.collect()),
         "unit-bench" => unit_kernel::run_bench_command(args.collect()),
+        "native-tick-fixture" => native_tick::run_fixture_command(args.collect()),
+        "native-tick-bench" => native_tick::run_bench_command(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -46,7 +49,9 @@ fn print_help() {
          tactical-fixture <fixture.json> [--json]\n  \
          tactical-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n  \
          unit-fixture <fixture.json> [--json]\n  \
-         unit-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
+         unit-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n  \
+         native-tick-fixture <fixture.json> [--json]\n  \
+         native-tick-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
          Inspects web-compatible scenarios and runs deterministic parity fixtures and\n\
          performance benchmarks for migrated native systems."
     );

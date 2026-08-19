@@ -6,7 +6,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
-use mw_core::{GridSpec, decode_mwsc_gzip_file};
+use mw_core::{
+    CombatConfig, CombatUnit, FrameSnapshot, GridSpec, HostilityMatrix, MovementFactors,
+    ResolvedCombatOrder, ResolvedUnitOrder, Simulation, SimulationConfig, SimulationUnit,
+    TickInput, UnitKind, WorldGridView, decode_mwsc_gzip_file,
+};
 use serde_json::Value;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -18,8 +22,14 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
+mod unit_renderer;
+
+use unit_renderer::{UnitRenderer, geographic_to_world};
+
 const DEFAULT_SCENARIO: &str = "../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz";
 const ROW_ALIGNMENT: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+const DEMO_CAMERA_ZOOM_MULTIPLIER: f32 = 70.0;
+const DEMO_TICK_INTERVAL: Duration = Duration::from_millis(33);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -39,13 +49,36 @@ struct GpuState {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     view_buffer: wgpu::Buffer,
+    unit_renderer: UnitRenderer,
+}
+
+struct DemoSimulation {
+    simulation: Simulation,
+    orders: Vec<ResolvedUnitOrder>,
+    max_sides: usize,
+    tick: u64,
+    next_step_at: Instant,
+    finished: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DemoBorder {
+    first_owner: u16,
+    second_owner: u16,
+    first_cell: [usize; 2],
+    second_cell: [usize; 2],
+    midpoint: [f64; 2],
+    toward_second: [f64; 2],
 }
 
 struct App {
     scenario_path: PathBuf,
+    demo_units_requested: bool,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     ownership: Vec<u16>,
+    land: Vec<u8>,
+    palette: Vec<[f32; 4]>,
     metadata: Value,
     grid_width: u32,
     grid_height: u32,
@@ -58,17 +91,24 @@ struct App {
     frame_count: u64,
     presented_frames: u64,
     smoke_frames: Option<u64>,
+    demo: Option<DemoSimulation>,
+    demo_center: Option<[f32; 2]>,
+    latest_snapshot: Option<FrameSnapshot>,
+    snapshot_dirty: bool,
     fps_epoch: Instant,
     fps: f64,
 }
 
 impl App {
-    fn new(scenario_path: PathBuf, smoke_frames: Option<u64>) -> Self {
+    fn new(scenario_path: PathBuf, smoke_frames: Option<u64>, demo_units_requested: bool) -> Self {
         Self {
             scenario_path,
+            demo_units_requested,
             window: None,
             gpu: None,
             ownership: Vec::new(),
+            land: Vec::new(),
+            palette: Vec::new(),
             metadata: Value::Null,
             grid_width: 0,
             grid_height: 0,
@@ -81,6 +121,10 @@ impl App {
             frame_count: 0,
             presented_frames: 0,
             smoke_frames,
+            demo: None,
+            demo_center: None,
+            latest_snapshot: None,
+            snapshot_dirty: false,
             fps_epoch: Instant::now(),
             fps: 0.0,
         }
@@ -104,6 +148,7 @@ impl App {
             u32::try_from(decoded.target.height).context("scenario height exceeds GPU limits")?;
         self.grid_res = decoded.target.grid_res as f32;
         self.ownership = decoded.world_control;
+        self.land = decoded.land;
         self.metadata = decoded.metadata;
 
         anyhow::ensure!(
@@ -113,10 +158,43 @@ impl App {
             self.grid_width,
             self.grid_height
         );
+        anyhow::ensure!(
+            self.land.len() == self.ownership.len(),
+            "land grid has {} cells, expected {}",
+            self.land.len(),
+            self.ownership.len()
+        );
 
-        let palette = build_palette(&self.metadata, &self.ownership);
+        self.palette = build_palette(&self.metadata, &self.ownership);
         let size = window.inner_size();
         self.zoom = reset_zoom(size);
+        if self.demo_units_requested {
+            let border = find_demo_border(
+                &self.ownership,
+                &self.land,
+                self.grid_width as usize,
+                self.grid_height as usize,
+                f64::from(self.grid_res),
+            )
+            .context("--demo-units requires an adjacent-country land border")?;
+            let first_name = self.country_name(border.first_owner).to_owned();
+            let second_name = self.country_name(border.second_owner).to_owned();
+            let (demo, snapshot) = create_demo_simulation(border)?;
+            self.demo_center = Some(geographic_to_world(border.midpoint[0], border.midpoint[1]));
+            self.center = self.demo_center.expect("demo center was just assigned");
+            self.zoom = demo_zoom(size);
+            self.latest_snapshot = Some(snapshot);
+            self.demo = Some(demo);
+            log::info!(
+                "demo units placed at border {} ({}) / {} ({}) near {:.3}, {:.3}",
+                border.first_owner,
+                first_name,
+                border.second_owner,
+                second_name,
+                border.midpoint[0],
+                border.midpoint[1]
+            );
+        }
 
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone())?;
@@ -203,7 +281,7 @@ impl App {
             ownership_texture.size(),
         );
 
-        let view_uniform = self.view_uniform(size, palette.len() as u32);
+        let view_uniform = self.view_uniform(size, self.palette.len() as u32);
         let view_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("map view uniform"),
             contents: bytemuck::bytes_of(&view_uniform),
@@ -211,7 +289,7 @@ impl App {
         });
         let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("country palette"),
-            contents: bytemuck::cast_slice(&palette),
+            contents: bytemuck::cast_slice(&self.palette),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let shader = device.create_shader_module(wgpu::include_wgsl!("map.wgsl"));
@@ -298,6 +376,14 @@ impl App {
             multiview_mask: None,
             cache: None,
         });
+        let mut unit_renderer = UnitRenderer::new(&device, &view_buffer, format);
+        if let Some(snapshot) = &self.latest_snapshot {
+            unit_renderer.upload(&device, &queue, snapshot, &self.palette);
+        }
+        log::info!(
+            "unit overlay initialized with {} instances",
+            unit_renderer.instance_count()
+        );
 
         self.gpu = Some(GpuState {
             surface,
@@ -307,6 +393,7 @@ impl App {
             pipeline,
             bind_group,
             view_buffer,
+            unit_renderer,
         });
         self.window = Some(window);
         Ok(())
@@ -320,6 +407,76 @@ impl App {
             palette_len,
             grid_size: [self.grid_width, self.grid_height],
         }
+    }
+
+    fn reset_camera(&mut self, size: PhysicalSize<u32>) {
+        if let Some(center) = self.demo_center {
+            self.center = center;
+            self.zoom = demo_zoom(size);
+        } else {
+            self.center = [1.0, 0.5];
+            self.zoom = reset_zoom(size);
+        }
+    }
+
+    fn advance_demo(&mut self) -> Result<()> {
+        let Some(demo) = &mut self.demo else {
+            return Ok(());
+        };
+        if demo.finished {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if demo.tick > 0 && now < demo.next_step_at {
+            return Ok(());
+        }
+        demo.next_step_at = now + DEMO_TICK_INTERVAL;
+
+        let world = WorldGridView::new(
+            f64::from(self.grid_res),
+            self.grid_width as usize,
+            self.grid_height as usize,
+            &self.land,
+        )
+        .context("invalid decoded land grid for demo simulation")?;
+        let next_tick = demo.tick.saturating_add(1);
+        let input = TickInput {
+            tick: next_tick,
+            frame: next_tick,
+            war_grace_end: 0,
+            world,
+            hostility: HostilityMatrix::new(None, demo.max_sides),
+            orders: &demo.orders,
+        };
+        let (snapshot, counters) = demo.simulation.step(input)?;
+        demo.tick = next_tick;
+
+        demo.orders
+            .retain(|order| snapshot.units.iter().any(|unit| unit.id == order.unit_id));
+        for order in &mut demo.orders {
+            if order
+                .preferred_target_id
+                .is_some_and(|target| !snapshot.units.iter().any(|unit| unit.id == target))
+            {
+                order.preferred_target_id = None;
+            }
+        }
+        demo.finished = snapshot.units.len() < 2
+            || snapshot
+                .units
+                .first()
+                .is_none_or(|first| snapshot.units.iter().all(|unit| unit.side == first.side));
+        log::trace!(
+            "demo tick {}: {} units, {} contacts, {} direct engagements, {} moves",
+            demo.tick,
+            snapshot.units.len(),
+            counters.accepted_contacts,
+            counters.direct_events,
+            counters.moved_units
+        );
+        self.latest_snapshot = Some(snapshot);
+        self.snapshot_dirty = true;
+        Ok(())
     }
 
     fn world_at(&self, point: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> [f64; 2] {
@@ -368,13 +525,25 @@ impl App {
     }
 
     fn render(&mut self) {
+        if let Err(error) = self.advance_demo() {
+            log::error!("demo simulation stopped: {error:#}");
+            self.demo = None;
+        }
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let palette_len = self.ownership.iter().copied().max().unwrap_or(0) as u32 + 1;
+        let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
         let Some(gpu) = &mut self.gpu else { return };
         gpu.queue
             .write_buffer(&gpu.view_buffer, 0, bytemuck::bytes_of(&uniform));
+        if self.snapshot_dirty
+            && let Some(snapshot) = &self.latest_snapshot
+        {
+            gpu.unit_renderer
+                .upload(&gpu.device, &gpu.queue, snapshot, &self.palette);
+            self.snapshot_dirty = false;
+        }
+        let rendered_unit_count = gpu.unit_renderer.instance_count();
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -428,6 +597,7 @@ impl App {
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.draw(0..3, 0..1);
+            gpu.unit_renderer.draw(&mut pass);
         }
         gpu.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
@@ -440,9 +610,20 @@ impl App {
             self.fps = self.frame_count as f64 / elapsed.as_secs_f64();
             self.frame_count = 0;
             self.fps_epoch = Instant::now();
+            let snapshot_status = self
+                .latest_snapshot
+                .as_ref()
+                .map_or_else(String::new, |snapshot| {
+                    format!(" | tick {} | {rendered_unit_count} units", snapshot.tick)
+                });
             window.set_title(&format!(
-                "Modern Wars Native | {:.0} FPS | {}x{} @ {:.2}° | zoom {:.1}",
-                self.fps, self.grid_width, self.grid_height, self.grid_res, self.zoom
+                "Modern Wars Native | {:.0} FPS | {}x{} @ {:.2}° | zoom {:.1}{}",
+                self.fps,
+                self.grid_width,
+                self.grid_height,
+                self.grid_res,
+                self.zoom,
+                snapshot_status
             ));
         }
         window.request_redraw();
@@ -491,8 +672,7 @@ impl ApplicationHandler for App {
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                     PhysicalKey::Code(KeyCode::KeyR) => {
-                        self.center = [1.0, 0.5];
-                        self.zoom = reset_zoom(window.inner_size());
+                        self.reset_camera(window.inner_size());
                         window.request_redraw();
                     }
                     _ => {}
@@ -557,6 +737,261 @@ impl ApplicationHandler for App {
 
 fn reset_zoom(size: PhysicalSize<u32>) -> f32 {
     (size.width as f32 * 0.5).min(size.height as f32).max(1.0)
+}
+
+fn demo_zoom(size: PhysicalSize<u32>) -> f32 {
+    (reset_zoom(size) * DEMO_CAMERA_ZOOM_MULTIPLIER).clamp(1.0, 100_000.0)
+}
+
+fn find_demo_border(
+    ownership: &[u16],
+    land: &[u8],
+    width: usize,
+    height: usize,
+    grid_res: f64,
+) -> Option<DemoBorder> {
+    let cell_count = width.checked_mul(height)?;
+    if width == 0
+        || height == 0
+        || ownership.len() != cell_count
+        || land.len() != cell_count
+        || !grid_res.is_finite()
+        || grid_res <= 0.0
+    {
+        return None;
+    }
+
+    let mut best: Option<(f64, usize, DemoBorder)> = None;
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            let owner = ownership[index];
+            if owner == 0 || land[index] == 0 {
+                continue;
+            }
+            if x + 1 < width {
+                consider_demo_border(
+                    &mut best,
+                    ownership,
+                    land,
+                    width,
+                    grid_res,
+                    [x, y],
+                    [x + 1, y],
+                    index * 2,
+                );
+            }
+            if y + 1 < height {
+                consider_demo_border(
+                    &mut best,
+                    ownership,
+                    land,
+                    width,
+                    grid_res,
+                    [x, y],
+                    [x, y + 1],
+                    index * 2 + 1,
+                );
+            }
+        }
+    }
+    best.map(|(_, _, border)| border)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consider_demo_border(
+    best: &mut Option<(f64, usize, DemoBorder)>,
+    ownership: &[u16],
+    land: &[u8],
+    width: usize,
+    grid_res: f64,
+    first_cell: [usize; 2],
+    second_cell: [usize; 2],
+    ordinal: usize,
+) {
+    let first_index = first_cell[1] * width + first_cell[0];
+    let second_index = second_cell[1] * width + second_cell[0];
+    let first_owner = ownership[first_index];
+    let second_owner = ownership[second_index];
+    if first_owner == 0
+        || second_owner == 0
+        || first_owner == second_owner
+        || land[first_index] == 0
+        || land[second_index] == 0
+    {
+        return;
+    }
+
+    let first = cell_geographic_center(first_cell, grid_res);
+    let second = cell_geographic_center(second_cell, grid_res);
+    let delta = [second[0] - first[0], second[1] - first[1]];
+    let magnitude = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return;
+    }
+    let midpoint = [(first[0] + second[0]) * 0.5, (first[1] + second[1]) * 0.5];
+    // Prefer a continental European border so the opt-in visual smoke test is
+    // stable and recognizable, while still deriving both countries and every
+    // coordinate from the decoded scenario.
+    let score = (midpoint[0] - 50.0).powi(2) + (midpoint[1] - 10.0).powi(2) * 0.4;
+    let border = DemoBorder {
+        first_owner,
+        second_owner,
+        first_cell,
+        second_cell,
+        midpoint,
+        toward_second: [delta[0] / magnitude, delta[1] / magnitude],
+    };
+    if best
+        .as_ref()
+        .is_none_or(|(best_score, best_ordinal, _)| (score, ordinal) < (*best_score, *best_ordinal))
+    {
+        *best = Some((score, ordinal, border));
+    }
+}
+
+fn cell_geographic_center(cell: [usize; 2], grid_res: f64) -> [f64; 2] {
+    [
+        -90.0 + (cell[1] as f64 + 0.5) * grid_res,
+        -180.0 + (cell[0] as f64 + 0.5) * grid_res,
+    ]
+}
+
+fn create_demo_simulation(border: DemoBorder) -> Result<(DemoSimulation, FrameSnapshot)> {
+    let normal = border.toward_second;
+    let tangent = [-normal[1], normal[0]];
+    let half_separation = 0.018;
+    let lane_offset = 0.03;
+    let first_base = [
+        border.midpoint[0] - normal[0] * half_separation,
+        border.midpoint[1] - normal[1] * half_separation,
+    ];
+    let second_base = [
+        border.midpoint[0] + normal[0] * half_separation,
+        border.midpoint[1] + normal[1] * half_separation,
+    ];
+    let positions = [
+        offset_geographic(first_base, tangent, -lane_offset),
+        offset_geographic(first_base, tangent, lane_offset),
+        offset_geographic(second_base, tangent, -lane_offset),
+        offset_geographic(second_base, tangent, lane_offset),
+    ];
+    let first_side = u64::from(border.first_owner);
+    let second_side = u64::from(border.second_owner);
+    let units = vec![
+        demo_unit(1, first_side, UnitKind::Army, positions[0], normal),
+        demo_unit(2, first_side, UnitKind::Armor, positions[1], normal),
+        demo_unit(
+            3,
+            second_side,
+            UnitKind::Army,
+            positions[2],
+            [-normal[0], -normal[1]],
+        ),
+        demo_unit(
+            4,
+            second_side,
+            UnitKind::Armor,
+            positions[3],
+            [-normal[0], -normal[1]],
+        ),
+    ];
+    let combat = CombatConfig {
+        combat_damage: 0.005,
+        target_jitter_scale: 0.0,
+        ..CombatConfig::default()
+    };
+    let simulation = Simulation::new(
+        SimulationConfig {
+            tactical_cell_size: 0.6,
+            combat,
+        },
+        units,
+    )?;
+    let snapshot = simulation.initial_snapshot(0, 0);
+    let orders = vec![
+        demo_order(1, 3, normal),
+        demo_order(2, 4, normal),
+        demo_order(3, 1, [-normal[0], -normal[1]]),
+        demo_order(4, 2, [-normal[0], -normal[1]]),
+    ];
+    let max_sides = usize::from(border.first_owner.max(border.second_owner)) + 1;
+    Ok((
+        DemoSimulation {
+            simulation,
+            orders,
+            max_sides,
+            tick: 0,
+            next_step_at: Instant::now(),
+            finished: false,
+        },
+        snapshot,
+    ))
+}
+
+fn offset_geographic(origin: [f64; 2], direction: [f64; 2], distance: f64) -> [f64; 2] {
+    [
+        origin[0] + direction[0] * distance,
+        origin[1] + direction[1] * distance,
+    ]
+}
+
+fn demo_unit(
+    id: u64,
+    side: u64,
+    kind: UnitKind,
+    position: [f64; 2],
+    direction: [f64; 2],
+) -> SimulationUnit {
+    let is_armor = kind == UnitKind::Armor;
+    SimulationUnit {
+        combat: CombatUnit {
+            id,
+            side,
+            sovereign: side,
+            kind,
+            lat: position[0],
+            lng: position[1],
+            health: 100.0,
+            max_health: 100.0,
+            personnel: if is_armor { 200 } else { 1_000 },
+            personnel_capacity: if is_armor { 200 } else { 1_000 },
+            equipment: if is_armor { 100 } else { 0 },
+            max_equipment: if is_armor { 100 } else { 0 },
+            quality: 50.0,
+            transport: false,
+            armor_supported: false,
+            landing_penalty_active: false,
+            at_sea: false,
+            last_combat_tick: 0,
+            victory_boost_ticks: 0,
+        },
+        dir_lat: direction[0],
+        dir_lng: direction[1],
+        coast_stuck_ticks: 0,
+        armor_landing_penalty_until_tick: 0,
+        is_support: false,
+        ally_weight: 1.0,
+    }
+}
+
+fn demo_order(unit_id: u64, preferred_target_id: u64, direction: [f64; 2]) -> ResolvedUnitOrder {
+    ResolvedUnitOrder {
+        unit_id,
+        preferred_target_id: Some(preferred_target_id),
+        movement_enabled: true,
+        dir_lat: direction[0],
+        dir_lng: direction[1],
+        factors: MovementFactors {
+            base_speed: 0.003,
+            speed_mult: 1.0,
+            plan_speed_mult: 1.0,
+            neutral_penalty: 1.0,
+            retreat_boost: 1.0,
+            push_readiness: 1.0,
+        },
+        combat: ResolvedCombatOrder::default(),
+    }
 }
 
 fn world_to_cell(world: [f64; 2], width: u32, height: u32) -> Option<(usize, usize)> {
@@ -659,9 +1094,12 @@ fn main() -> Result<()> {
     env_logger::init();
     let mut scenario = None;
     let mut smoke_frames = None;
+    let mut demo_units = false;
     for argument in std::env::args_os().skip(1) {
         if argument == "--smoke" {
             smoke_frames = Some(3);
+        } else if argument == "--demo-units" {
+            demo_units = true;
         } else if scenario.is_none() {
             scenario = Some(PathBuf::from(argument));
         } else {
@@ -671,7 +1109,7 @@ fn main() -> Result<()> {
     let scenario = scenario.unwrap_or_else(|| PathBuf::from(DEFAULT_SCENARIO));
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut App::new(scenario, smoke_frames))?;
+    event_loop.run_app(&mut App::new(scenario, smoke_frames, demo_units))?;
     Ok(())
 }
 
@@ -704,5 +1142,36 @@ mod tests {
             Some([10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 0.65])
         );
         assert_eq!(parse_color("not-a-color"), None);
+    }
+
+    #[test]
+    fn demo_border_requires_two_adjacent_land_countries() {
+        let ownership = [1, 1, 2, 2, 1, 1, 2, 2];
+        let land = [1; 8];
+        let border = find_demo_border(&ownership, &land, 4, 2, 45.0).unwrap();
+        assert_eq!(border.first_owner, 1);
+        assert_eq!(border.second_owner, 2);
+        assert_eq!(border.first_cell[0] + 1, border.second_cell[0]);
+
+        let ocean_between = [1, 0, 2, 2];
+        assert!(find_demo_border(&ocean_between, &[1, 0, 1, 1], 4, 1, 90.0).is_none());
+    }
+
+    #[test]
+    fn demo_simulation_publishes_country_colored_units() {
+        let border = DemoBorder {
+            first_owner: 7,
+            second_owner: 11,
+            first_cell: [10, 10],
+            second_cell: [11, 10],
+            midpoint: [45.0, 8.0],
+            toward_second: [0.0, 1.0],
+        };
+        let (demo, snapshot) = create_demo_simulation(border).unwrap();
+        assert_eq!(snapshot.units.len(), 4);
+        assert!(snapshot.units.iter().any(|unit| unit.side == 7));
+        assert!(snapshot.units.iter().any(|unit| unit.side == 11));
+        assert_eq!(demo.orders.len(), 4);
+        assert_eq!(demo.max_sides, 12);
     }
 }

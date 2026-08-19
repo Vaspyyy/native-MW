@@ -57,3 +57,9 @@ node "$native_root/scripts/compare-unit-kernel-parity.mjs" \
 		"$web_root" "$native_root/fixtures/movement-combat-v1.json") \
 	<("$native_root/target/debug/mw-tools" unit-fixture \
 		"$native_root/fixtures/movement-combat-v1.json" --json)
+
+node "$native_root/scripts/compare-native-tick-parity.mjs" \
+	<(node "$native_root/scripts/js-native-tick-reference.mjs" report \
+		"$web_root" "$native_root/fixtures/native-tick-v1.json") \
+	<("$native_root/target/debug/mw-tools" native-tick-fixture \
+		"$native_root/fixtures/native-tick-v1.json" --json)

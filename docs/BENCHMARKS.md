@@ -87,8 +87,9 @@ unit reconstruction, ID lookup maps, ordered mutation, sorted result
 projection, formation/equipment loss reporting, and knockback in both
 implementations. It excludes AI target selection, strategic modifiers,
 tactical contact discovery, territory updates, rendering, and worker/message
-overhead. A future native-tick benchmark should measure steady-state in-place
-combat separately once that orchestrator exists.
+overhead. The native-tick section below adds a complete fresh-state
+orchestration replay; persistent steady-state ticking remains a separate future
+measurement.
 
 Reproduce the workload:
 
@@ -97,4 +98,41 @@ unit_fixture=$(mktemp --suffix=.mw-units.json)
 node scripts/generate-unit-kernel-stress.mjs 2400 > "$unit_fixture"
 target/release/mw-tools unit-bench "$unit_fixture" --repeat 100 --warmup 20 --json
 node scripts/js-unit-kernel-reference.mjs bench ../modern-wars "$unit_fixture" 100 20
+```
+
+## Native tick orchestration
+
+Measured on 2026-08-20 on the same host and toolchain. The deterministic
+workload contains 4,800 units (2,400 per side) spread across isolated tactical
+cells. One fixture replay produces 3,200 proximity events, 800 direct
+engagements, and 4,000 resolved movement attempts. Each of five runs used 20
+warmups and 100 measured replays; the table reports the median per-run median
+and the median per-run p95.
+
+| Complete one-tick fixture replay | JavaScript reference | Rust release | Speedup |
+|---|---:|---:|---:|
+| Median | 27.368 ms | 6.830 ms | 4.01x |
+| p95 | 31.626 ms | 7.512 ms | 4.21x |
+
+Both implementations consume the browser tactical-grid semantics, execute the
+same reverse unit order and immediate mutation sequence, and produce matching
+full reports at `1e-10` tolerance. The canonical two-step fixture additionally
+covers direct combat, armor landing-penalty expiry, a removed unit's stale
+order, directed hostility, multi-contact ordering, movement fallback, cleanup,
+and ID-sorted immutable snapshots.
+
+This measures a complete fresh-state fixture replay: unit/order adaptation,
+tactical-grid construction, contact dispatch, movement/combat, cleanup, and
+report projection are inside the timed interval; JSON serialization is outside
+it in both languages. It is not a whole-game frame benchmark. Even with that
+extra fixture setup, the Rust replay is below a 16.67 ms 60 Hz frame budget on
+the measured machine.
+
+Reproduce the workload:
+
+```bash
+tick_fixture=$(mktemp --suffix=.mw-native-tick.json)
+node scripts/generate-native-tick-stress.mjs 2400 > "$tick_fixture"
+target/release/mw-tools native-tick-bench "$tick_fixture" --repeat 100 --warmup 20 --json
+node scripts/js-native-tick-reference.mjs bench ../modern-wars "$tick_fixture" 100 20
 ```

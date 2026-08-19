@@ -9,7 +9,8 @@ reference while systems move into the renderer-independent `mw-core` crate.
 - deterministic frontline direction-field generation
 - deterministic tactical spatial grid and same-side neighbor traversal
 - browser-parity final unit movement, coast handling, and pair combat
-- native `wgpu` ownership-map viewer
+- deterministic native tick orchestration over resolved orders and tactical contacts
+- immutable unit snapshots and a native `wgpu` unit overlay
 - headless JavaScript parity fixtures and timing
 
 The repository intentionally starts with the existing browser scenarios rather
@@ -32,6 +33,7 @@ From this directory:
 cargo run --release -p mw-tools -- inspect ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz --grid-res 0.15
 cargo run --release -p mw-tools -- tactical-fixture fixtures/tactical-grid-v1.json
 cargo run --release -p mw-tools -- unit-fixture fixtures/movement-combat-v1.json
+cargo run --release -p mw-tools -- native-tick-fixture fixtures/native-tick-v1.json
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
@@ -39,6 +41,7 @@ For an automated three-frame GPU/window smoke test:
 
 ```bash
 cargo run --release -p mw-native -- --smoke ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
+cargo run --release -p mw-native -- --smoke --demo-units ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
 Native viewer controls:
@@ -61,6 +64,15 @@ Generate and benchmark the 4,800-unit movement/combat workload:
 node scripts/generate-unit-kernel-stress.mjs 2400 > /tmp/mw-unit-stress.json
 target/release/mw-tools unit-bench /tmp/mw-unit-stress.json --repeat 100 --warmup 20 --json
 node scripts/js-unit-kernel-reference.mjs bench ../modern-wars /tmp/mw-unit-stress.json 100 20
+```
+
+Generate and benchmark the complete 4,800-unit native tick (tactical contact
+discovery, immediate combat, resolved movement, cleanup, and snapshot):
+
+```bash
+node scripts/generate-native-tick-stress.mjs 2400 > /tmp/mw-native-tick-stress.json
+target/release/mw-tools native-tick-bench /tmp/mw-native-tick-stress.json --repeat 100 --warmup 20 --json
+node scripts/js-native-tick-reference.mjs bench ../modern-wars /tmp/mw-native-tick-stress.json 100 20
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the migration boundary.

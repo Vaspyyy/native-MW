@@ -244,7 +244,20 @@ pub fn combined_arms_damage(
     mountain: bool,
     urban: bool,
 ) -> f64 {
-    let landing_multiplier = if attacker.kind == UnitKind::Armor && attacker.landing_penalty_active
+    combined_arms_damage_with_landing_penalty(base_damage, attacker, target, mountain, urban, true)
+}
+
+fn combined_arms_damage_with_landing_penalty(
+    base_damage: f64,
+    attacker: &CombatUnit,
+    target: &CombatUnit,
+    mountain: bool,
+    urban: bool,
+    apply_landing_penalty: bool,
+) -> f64 {
+    let landing_multiplier = if apply_landing_penalty
+        && attacker.kind == UnitKind::Armor
+        && attacker.landing_penalty_active
     {
         0.3
     } else {
@@ -390,12 +403,13 @@ pub fn resolve_proximity_contact(
         context.urban,
     );
     let target_apply = apply_land_unit_damage(target, target_damage, config.armor_crew_per_vehicle);
-    let attacker_damage = combined_arms_damage(
+    let attacker_damage = combined_arms_damage_with_landing_penalty(
         proximity_damage * 0.8 * context.attacker_damage_taken_multiplier,
         target,
         attacker,
         context.mountain,
         context.urban,
+        false,
     );
     let attacker_apply =
         apply_land_unit_damage(attacker, attacker_damage, config.armor_crew_per_vehicle);
@@ -453,7 +467,7 @@ pub fn resolve_direct_engagement(
         context.mountain,
         context.urban,
     );
-    let attacker_damage = combined_arms_damage(
+    let attacker_damage = combined_arms_damage_with_landing_penalty(
         config.combat_damage
             * 0.8
             * context.attacker_damage_taken_multiplier
@@ -463,6 +477,7 @@ pub fn resolve_direct_engagement(
         attacker,
         context.mountain,
         context.urban,
+        false,
     );
 
     attacker.last_combat_tick = context.frame;
@@ -894,6 +909,34 @@ mod tests {
         assert_eq!(event.target_resulting_health, 0.0);
         assert_eq!(event.attacker_resulting_health, 0.0);
         assert_eq!(units[0].victory_boost_ticks, 180);
+    }
+
+    #[test]
+    fn defender_landing_penalty_does_not_reduce_retaliation() {
+        let mut defender = armor(2, 0.0, 0.0);
+        defender.landing_penalty_active = true;
+        let mut proximity_units = vec![army(1, 0.0, 0.0), defender.clone()];
+        let proximity = resolve_proximity_contact(
+            &mut proximity_units,
+            0,
+            1,
+            &CombatContext::default(),
+            &CombatConfig::default(),
+        )
+        .unwrap()
+        .unwrap();
+        close(proximity.attacker_damage, 0.7 * 0.45 * 0.8 * 2.0);
+
+        let config = CombatConfig {
+            target_jitter_scale: 0.0,
+            ..CombatConfig::default()
+        };
+        let mut direct_units = vec![army(1, 0.0, 0.0), defender];
+        let direct =
+            resolve_direct_engagement(&mut direct_units, 0, 1, &CombatContext::default(), &config)
+                .unwrap()
+                .unwrap();
+        close(direct.attacker_damage, 0.7 * 0.8 * 2.0);
     }
 
     #[test]

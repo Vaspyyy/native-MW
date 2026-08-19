@@ -27,9 +27,11 @@ same-side pair enumeration. `mw-tools` replays the same JSON fixture through
 the JavaScript and Rust implementations and benchmarks a 4,800-unit stress
 case.
 
-The tactical grid is not executed during `mw-native` viewer startup. The viewer
-does not own units or a simulation tick yet, so doing that would add synthetic
-startup work rather than integrate real gameplay.
+Normal `mw-native` startup remains map-only. The opt-in `--demo-units` mode
+finds a real adjacent-country land border in the decoded scenario, feeds
+resolved orders through the native tick, and renders its immutable snapshots.
+This exercises the integration without adding synthetic work to normal viewer
+startup.
 
 The third core slice ports the resolved per-unit hot path from the browser:
 final movement-distance multiplication, ordered coast deflection, stuck-target
@@ -49,6 +51,20 @@ The current slice intentionally excludes AI planning, territory and
 occupation, economy and surrender, air/naval simulation, the map editor,
 online/community features, satellite tiles, and full HUD parity.
 
+The fourth slice connects these boundaries into `mw-core::Simulation`. Each
+logical tick rebuilds one tactical snapshot, consumes caller-resolved orders,
+executes units in reverse stable-storage order, applies every directed hostile
+proximity contact immediately, attempts direct combat against the preferred or
+first stable-ID target, falls back to resolved movement, and removes defeated
+units only at the cleanup barrier. Missing orders hold; stale casualty orders
+and vanished preferred targets are ignored like the browser loop.
+
+`FrameSnapshot` owns ID-sorted unit data and ordered combat/removal artifacts
+through reference-counted immutable slices. The renderer can retain a frame
+while the simulation advances without reading mutable gameplay state. The GPU
+overlay uploads a snapshot only when a new one is published and reuses its CPU
+and GPU instance capacity.
+
 ## Rendering model
 
 The world map is a regular geographic grid. Ownership IDs are uploaded as an
@@ -61,8 +77,8 @@ frame snapshots for units, cities, frontlines, labels, and effects.
 1. Scenario codec and direction field. **Complete.**
 2. Tactical spatial grid and unit-neighbor queries. **Complete in `mw-core`.**
 3. Resolved unit movement and immediate pair combat. **Complete in `mw-core`.**
-4. Native tick orchestration: target/order adapter, tactical contact dispatch,
-   unit snapshots, and renderer consumption.
+4. Native tick orchestration: resolved-order adapter, tactical contact
+   dispatch, immutable unit snapshots, and renderer consumption. **Complete.**
 5. Economy, occupation, surrender, and AI jobs.
 6. Native UI/editor/community parity only after the simulation benchmark shows
    the native core is worth continuing.
