@@ -1,0 +1,16 @@
+[package]
+name = "mw-native"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+env_logger.workspace = true
+futures-lite.workspace = true
+log.workspace = true
+mw-core = { path = "../mw-core" }
+serde_json.workspace = true
+wgpu.workspace = true
+winit.workspace = true

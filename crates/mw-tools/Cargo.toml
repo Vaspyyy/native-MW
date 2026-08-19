@@ -1,0 +1,11 @@
+[package]
+name = "mw-tools"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mw-core = { path = "../mw-core" }
+serde.workspace = true
+serde_json.workspace = true

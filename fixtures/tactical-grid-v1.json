@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1",
+  "cellSize": 0.6,
+  "units": [
+    { "id": 1, "side": 0, "lat": 0.1, "lng": 0.1, "strength": 4, "allyWeight": 2, "armor": true, "support": false },
+    { "id": 2, "side": 0, "lat": 0.3, "lng": 0.3, "strength": 2, "allyWeight": 1, "armor": false, "support": true },
+    { "id": 3, "side": 0, "lat": 0.3, "lng": 0.7, "strength": 3, "allyWeight": 1, "armor": false, "support": false },
+    { "id": 4, "side": 0, "lat": 10, "lng": 10, "strength": 5, "allyWeight": 1, "armor": false, "support": false },
+    { "id": 5, "side": 1, "lat": 0.2, "lng": 0.2, "strength": 7, "allyWeight": 1, "armor": false, "support": false },
+    { "id": 6, "side": null, "lat": 0, "lng": 0, "strength": 1, "allyWeight": 1, "armor": false, "support": false },
+    { "id": 7, "side": 2, "lat": 0, "lng": -179.9, "strength": 1, "allyWeight": 1, "armor": false, "support": false },
+    { "id": 8, "side": 2, "lat": 0, "lng": 179.9, "strength": 1, "allyWeight": 1, "armor": false, "support": false }
+  ],
+  "neighborQueries": [
+    { "side": 0, "lat": 0.1, "lng": 0.1, "radiusCells": 1 }
+  ],
+  "pairQueries": [
+    { "side": 0, "radiusCells": 1, "radiusSq": 0.25 },
+    { "side": 2, "radiusCells": 1, "radiusSq": 0.09 },
+    { "side": 0, "radiusCells": 1, "radiusSq": null, "rejectIdSumModulo": 3 }
+  ]
+}
