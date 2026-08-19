@@ -51,3 +51,9 @@ node "$native_root/scripts/compare-tactical-parity.mjs" \
 		"$native_root/fixtures/tactical-grid-v1.json" --json) \
 	<(node "$native_root/scripts/js-tactical-reference.mjs" report \
 		"$web_root" "$native_root/fixtures/tactical-grid-v1.json")
+
+node "$native_root/scripts/compare-unit-kernel-parity.mjs" \
+	<(node "$native_root/scripts/js-unit-kernel-reference.mjs" report \
+		"$web_root" "$native_root/fixtures/movement-combat-v1.json") \
+	<("$native_root/target/debug/mw-tools" unit-fixture \
+		"$native_root/fixtures/movement-combat-v1.json" --json)

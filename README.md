@@ -8,6 +8,7 @@ reference while systems move into the renderer-independent `mw-core` crate.
 - MWSC v2 scenario decoding and grid remapping
 - deterministic frontline direction-field generation
 - deterministic tactical spatial grid and same-side neighbor traversal
+- browser-parity final unit movement, coast handling, and pair combat
 - native `wgpu` ownership-map viewer
 - headless JavaScript parity fixtures and timing
 
@@ -30,6 +31,7 @@ From this directory:
 ```bash
 cargo run --release -p mw-tools -- inspect ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz --grid-res 0.15
 cargo run --release -p mw-tools -- tactical-fixture fixtures/tactical-grid-v1.json
+cargo run --release -p mw-tools -- unit-fixture fixtures/movement-combat-v1.json
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
@@ -51,6 +53,14 @@ Run the complete cross-language parity matrix against the adjacent web checkout:
 
 ```bash
 ./scripts/verify-scenario-parity.sh
+```
+
+Generate and benchmark the 4,800-unit movement/combat workload:
+
+```bash
+node scripts/generate-unit-kernel-stress.mjs 2400 > /tmp/mw-unit-stress.json
+target/release/mw-tools unit-bench /tmp/mw-unit-stress.json --repeat 100 --warmup 20 --json
+node scripts/js-unit-kernel-reference.mjs bench ../modern-wars /tmp/mw-unit-stress.json 100 20
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the migration boundary.

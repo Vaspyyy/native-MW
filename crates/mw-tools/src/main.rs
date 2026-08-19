@@ -9,6 +9,8 @@ use mw_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod unit_kernel;
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -27,6 +29,8 @@ fn run() -> Result<()> {
         "field-bench" => field_bench(args.collect()),
         "tactical-fixture" => tactical_fixture(args.collect()),
         "tactical-bench" => tactical_bench(args.collect()),
+        "unit-fixture" => unit_kernel::run_fixture_command(args.collect()),
+        "unit-bench" => unit_kernel::run_bench_command(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -40,9 +44,11 @@ fn print_help() {
         "mw-tools\n\n  inspect <scenario.mwsc.gz> [--grid-res N] [--repeat N] [--json]\n  \
          field-bench <scenario.mwsc.gz> [--grid-res N] [--repeat N] [--side-a NAME] [--side-b NAME] [--json]\n  \
          tactical-fixture <fixture.json> [--json]\n  \
-         tactical-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
-         Decodes a web-compatible scenario, prints deterministic array hashes, and reports\n\
-         median decode time."
+         tactical-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n  \
+         unit-fixture <fixture.json> [--json]\n  \
+         unit-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
+         Inspects web-compatible scenarios and runs deterministic parity fixtures and\n\
+         performance benchmarks for migrated native systems."
     );
 }
 

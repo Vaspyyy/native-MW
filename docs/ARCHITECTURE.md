@@ -29,10 +29,24 @@ case.
 
 The tactical grid is not executed during `mw-native` viewer startup. The viewer
 does not own units or a simulation tick yet, so doing that would add synthetic
-startup work rather than integrate real gameplay. It will enter the native
-runtime with the unit movement/combat slice.
+startup work rather than integrate real gameplay.
 
-This slice intentionally excludes battle rules, AI planning, the map editor,
+The third core slice ports the resolved per-unit hot path from the browser:
+final movement-distance multiplication, ordered coast deflection, stuck-target
+signaling, geographic clamping and wrapping, proximity damage, direct combat,
+formation and equipment losses, combined-arms modifiers, and guarded
+knockback. The fixture runner replays the same ordered operations through the
+JavaScript reference and Rust.
+
+Target selection and strategic context remain on the caller side of this
+boundary. The browser still resolves plans, waypoints, retreat, terrain and
+country modifiers, defense context, and whether a pair should fight. Rust then
+applies the resolved movement or combat operation with the browser's immediate
+mutation order. This keeps the migration exact without copying the entire
+shared-state simulation loop at once.
+
+The current slice intentionally excludes AI planning, territory and
+occupation, economy and surrender, air/naval simulation, the map editor,
 online/community features, satellite tiles, and full HUD parity.
 
 ## Rendering model
@@ -46,7 +60,9 @@ frame snapshots for units, cities, frontlines, labels, and effects.
 
 1. Scenario codec and direction field. **Complete.**
 2. Tactical spatial grid and unit-neighbor queries. **Complete in `mw-core`.**
-3. Deterministic unit movement/combat slice. **Next.**
-4. Economy, occupation, surrender, and AI jobs.
-5. Native UI/editor/community parity only after the simulation benchmark shows
+3. Resolved unit movement and immediate pair combat. **Complete in `mw-core`.**
+4. Native tick orchestration: target/order adapter, tactical contact dispatch,
+   unit snapshots, and renderer consumption.
+5. Economy, occupation, surrender, and AI jobs.
+6. Native UI/editor/community parity only after the simulation benchmark shows
    the native core is worth continuing.

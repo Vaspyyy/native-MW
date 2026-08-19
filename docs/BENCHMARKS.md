@@ -62,3 +62,39 @@ node scripts/generate-tactical-stress.mjs 2400 > "$tactical_fixture"
 target/release/mw-tools tactical-bench "$tactical_fixture" --repeat 100 --warmup 20 --json
 node scripts/js-tactical-reference.mjs bench ../modern-wars "$tactical_fixture" 100 20
 ```
+
+## Resolved unit movement and combat
+
+Measured on 2026-08-20 on the same host and toolchain. The deterministic
+workload uses seed `0x4d575031`, 4,800 movement cases, and 4,800 combat units
+executing 2,400 ordered proximity/direct operations. Each of five runs used 20
+warmups and 100 measured iterations; the table reports the median of those five
+per-run medians.
+
+| Workload | JavaScript reference | Rust release | Speedup |
+|---|---:|---:|---:|
+| Final movement integration and coast handling | 0.559 ms | 0.452 ms | 1.24x |
+| Fresh-state pair-combat fixture replay | 12.038 ms | 0.528 ms | 22.82x |
+
+Median p95 was 0.657 ms versus 0.566 ms for movement and 12.818 ms
+versus 0.594 ms for combat. Both implementations produced the same full stress
+report at `1e-10` tolerance and the same untimed checksum
+(`13660.317874844264`).
+
+This is a resolved-operation fixture benchmark, not an isolated arithmetic
+microbenchmark or a whole-game FPS claim. The timed combat path includes fresh
+unit reconstruction, ID lookup maps, ordered mutation, sorted result
+projection, formation/equipment loss reporting, and knockback in both
+implementations. It excludes AI target selection, strategic modifiers,
+tactical contact discovery, territory updates, rendering, and worker/message
+overhead. A future native-tick benchmark should measure steady-state in-place
+combat separately once that orchestrator exists.
+
+Reproduce the workload:
+
+```bash
+unit_fixture=$(mktemp --suffix=.mw-units.json)
+node scripts/generate-unit-kernel-stress.mjs 2400 > "$unit_fixture"
+target/release/mw-tools unit-bench "$unit_fixture" --repeat 100 --warmup 20 --json
+node scripts/js-unit-kernel-reference.mjs bench ../modern-wars "$unit_fixture" 100 20
+```
