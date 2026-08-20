@@ -22,15 +22,16 @@ use anyhow::{Context, Result, bail};
 use mw_core::{
     ARMOR_PAYROLL_PER_100, BATTLEFIELD_SCHEMA_VERSION, BattlefieldBuff, BattlefieldConfig,
     BattlefieldRuntimeState, BattlefieldUnitState, BattlefieldUrbanCenter, BattlefieldWarPhase,
-    CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand, ConflictResolutionPlan,
-    CountryBattlefieldPrimitives, DecodedScenario, EconomyState, FrontLayoutPrior, FrontObjective,
-    GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime, OccupationState, PAYROLL_PER_UNIT,
-    ProductionConfig, ResolvedCombatModifiers, ResolvedMovementModifiers, RuntimeCheckpoint,
-    RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy,
-    STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
-    StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState,
-    TerritoryConfig, TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitInfluencePolicy, UnitKind,
-    WorldGridView, decode_mwsc_gzip, derive_scenario_production,
+    CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand, CommandHomeTarget,
+    ConflictResolutionPlan, CountryBattlefieldPrimitives, DecodedScenario, EconomyState,
+    FrontLayoutPrior, FrontObjective, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
+    OccupationState, PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers,
+    ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot,
+    RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation,
+    SimulationConfig, SimulationUnit, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE,
+    TerritoryCity, TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps,
+    UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy, UnitKind, WorldGridView,
+    browser_discipline, command_refusal_share, decode_mwsc_gzip, derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -587,7 +588,21 @@ fn unit_json(unit: &SimulationUnit, policy: &RuntimeUnitPolicy) -> Value {
             "temporalSeed": influence.browser_temporal_seed,
         })
     });
-    json!({"id":unit.combat.id,"side":unit.combat.side,"countryId":unit.combat.sovereign,"kind":format!("{:?}",unit.combat.kind).to_ascii_lowercase(),"lat":unit.combat.lat,"lng":unit.combat.lng,"health":unit.combat.health,"maxHealth":unit.combat.max_health,"personnel":unit.combat.personnel,"personnelCapacity":unit.combat.personnel_capacity,"equipment":unit.combat.equipment,"maxEquipment":unit.combat.max_equipment,"quality":unit.combat.quality,"transport":unit.combat.transport,"armorSupported":unit.combat.armor_supported,"landingPenaltyActive":unit.combat.landing_penalty_active,"atSea":unit.combat.at_sea,"lastCombatTick":unit.combat.last_combat_tick,"victoryBoostTicks":unit.combat.victory_boost_ticks,"dirLat":unit.dir_lat,"dirLng":unit.dir_lng,"coastStuckTicks":unit.coast_stuck_ticks,"armorLandingPenaltyUntilTick":unit.armor_landing_penalty_until_tick,"isSupport":unit.is_support,"allyWeight":unit.ally_weight,"aiPolicy":ai,"influencePolicy":influence})
+    let command = policy.command;
+    let command = json!({
+        "band": command.band,
+        "discipline": command.discipline,
+        "refusesOffense": command.refuses_offense,
+        "returnHome": command.return_home,
+        "selfDefenseOnly": command.self_defense_only,
+        "homeTarget": command.home_target.map(|target| json!({
+            "cell": target.cell,
+            "lat": target.lat,
+            "lng": target.lng,
+        })),
+        "transitionCycle": command.transition_cycle,
+    });
+    json!({"id":unit.combat.id,"side":unit.combat.side,"countryId":unit.combat.sovereign,"kind":format!("{:?}",unit.combat.kind).to_ascii_lowercase(),"lat":unit.combat.lat,"lng":unit.combat.lng,"health":unit.combat.health,"maxHealth":unit.combat.max_health,"personnel":unit.combat.personnel,"personnelCapacity":unit.combat.personnel_capacity,"equipment":unit.combat.equipment,"maxEquipment":unit.combat.max_equipment,"quality":unit.combat.quality,"transport":unit.combat.transport,"armorSupported":unit.combat.armor_supported,"landingPenaltyActive":unit.combat.landing_penalty_active,"atSea":unit.combat.at_sea,"lastCombatTick":unit.combat.last_combat_tick,"victoryBoostTicks":unit.combat.victory_boost_ticks,"dirLat":unit.dir_lat,"dirLng":unit.dir_lng,"coastStuckTicks":unit.coast_stuck_ticks,"armorLandingPenaltyUntilTick":unit.armor_landing_penalty_until_tick,"isSupport":unit.is_support,"allyWeight":unit.ally_weight,"aiPolicy":ai,"commandPolicy":command,"influencePolicy":influence})
 }
 
 fn covered_casualties(
@@ -1529,7 +1544,29 @@ struct RuntimeUnitFixture {
     is_support: bool,
     ally_weight: f64,
     ai_policy: AiPolicyFixture,
+    #[serde(default)]
+    command_policy: Option<CommandPolicyFixture>,
     influence_policy: Option<InfluencePolicyFixture>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandPolicyFixture {
+    band: CommandBand,
+    discipline: f64,
+    refuses_offense: bool,
+    return_home: bool,
+    self_defense_only: bool,
+    home_target: Option<CommandHomeTargetFixture>,
+    transition_cycle: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CommandHomeTargetFixture {
+    cell: usize,
+    lat: f64,
+    lng: f64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -2627,8 +2664,51 @@ impl RuntimeUnitFixture {
         }
     }
 
-    fn runtime_policy(&self, coalition: &BTreeSet<u16>) -> RuntimeUnitPolicy {
+    fn runtime_policy(
+        &self,
+        coalition: &BTreeSet<u16>,
+        economy_band: CommandBand,
+        strategic_cycle: u64,
+    ) -> RuntimeUnitPolicy {
         let ai = self.ai_policy;
+        let synthesized_command = self.command_policy.is_none();
+        let command = self.command_policy.map_or_else(
+            || {
+                let share = command_refusal_share(economy_band);
+                let seed = self
+                    .influence_policy
+                    .as_ref()
+                    .and_then(|policy| policy.temporal_seed)
+                    .unwrap_or(self.id as f64);
+                let discipline = browser_discipline(seed, self.country_id);
+                let refuses_offense = discipline < share;
+                UnitCommandPolicy {
+                    band: economy_band,
+                    discipline,
+                    refuses_offense,
+                    return_home: matches!(
+                        economy_band,
+                        CommandBand::Breakdown | CommandBand::Mutiny
+                    ),
+                    self_defense_only: economy_band == CommandBand::Mutiny,
+                    home_target: None,
+                    transition_cycle: strategic_cycle,
+                }
+            },
+            |command| UnitCommandPolicy {
+                band: command.band,
+                discipline: command.discipline,
+                refuses_offense: command.refuses_offense,
+                return_home: command.return_home,
+                self_defense_only: command.self_defense_only,
+                home_target: command.home_target.map(|target| CommandHomeTarget {
+                    cell: target.cell,
+                    lat: target.lat,
+                    lng: target.lng,
+                }),
+                transition_cycle: command.transition_cycle,
+            },
+        );
         RuntimeUnitPolicy {
             unit_id: self.id,
             ai: UnitAiPolicy {
@@ -2656,8 +2736,9 @@ impl RuntimeUnitFixture {
                 deploy_until_tick: ai.deploy_until_tick,
                 garrison_excluded: ai.garrison_excluded,
             },
+            command,
             influence: self.influence_policy.as_ref().map(|policy| {
-                UnitInfluencePolicy {
+                let mut influence = UnitInfluencePolicy {
                     radius: policy.radius,
                     delta: policy.delta,
                     concentration_bonus: policy.concentration_bonus,
@@ -2671,7 +2752,11 @@ impl RuntimeUnitFixture {
                     credit_de_jure_by_country: policy.credit_de_jure_by_country.clone(),
                     refuses_offense: policy.refuses_offense,
                     browser_temporal_seed: policy.temporal_seed,
+                };
+                if synthesized_command {
+                    influence.refuses_offense = command.refuses_offense;
                 }
+                influence
             }),
         }
     }
@@ -2722,6 +2807,11 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         },
         units,
     )?;
+    let economy_bands = checkpoint
+        .economies
+        .iter()
+        .map(|economy| (economy.country_id, economy.command_band))
+        .collect::<BTreeMap<_, _>>();
     let unit_policies = checkpoint
         .units
         .iter()
@@ -2731,6 +2821,11 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
                     .coalition_by_side
                     .get(usize::from(unit.side))
                     .expect("checkpoint side validated"),
+                economy_bands
+                    .get(&unit.country_id)
+                    .copied()
+                    .unwrap_or(CommandBand::Paid),
+                checkpoint.strategic_cycle,
             )
         })
         .collect::<Vec<_>>();
@@ -3680,6 +3775,13 @@ fn counters_json(snapshot: &RuntimeSnapshot) -> Value {
             "removedUnits": counters.simulation.removed_units,
             "abandonedOrders": counters.simulation.abandoned_orders,
         },
+        "attrition": {
+            "damagedUnits": counters.attrition.damaged_units,
+            "removedUnits": counters.attrition.removed_units,
+            "personnelLoss": counters.attrition.personnel_loss,
+            "equipmentLoss": counters.attrition.equipment_loss,
+            "supplyCollapses": counters.attrition.supply_collapses,
+        },
         "influence": {
             "sources": counters.influence.sources,
             "processedSourceCells": counters.influence.processed_source_cells,
@@ -4195,6 +4297,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_checkpoint_recovers_stable_discipline_from_browser_seed() {
+        let checkpoint: RuntimeCheckpointFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/native-runtime-checkpoint-v1.json"
+        ))
+        .unwrap();
+        let unit = &checkpoint.units[0];
+        assert!(unit.command_policy.is_none());
+        let seed = unit
+            .influence_policy
+            .as_ref()
+            .and_then(|policy| policy.temporal_seed)
+            .unwrap_or(unit.id as f64);
+        let coalition = checkpoint.sides[usize::from(unit.side)]
+            .country_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let unpaid = unit.runtime_policy(&coalition, CommandBand::Unpaid, 2);
+        assert_eq!(
+            unpaid.command.discipline,
+            browser_discipline(seed, unit.country_id)
+        );
+        assert_eq!(
+            unpaid.command.refuses_offense,
+            unpaid.command.discipline < command_refusal_share(CommandBand::Unpaid)
+        );
+
+        let breakdown = unit.runtime_policy(&coalition, CommandBand::Breakdown, 3);
+        assert!(breakdown.command.refuses_offense);
+        assert!(breakdown.influence.as_ref().unwrap().refuses_offense);
+    }
+
+    #[test]
     fn resolved_runtime_state_report_preserves_terminal_result() {
         let resolution = ConflictResolutionPlan {
             kind: mw_core::ConflictResolutionKind::FullCapitulation,
@@ -4680,6 +4816,7 @@ mod tests {
                 deploy_until_tick: 13,
                 ..UnitAiPolicy::default()
             },
+            command: UnitCommandPolicy::paid(7.0, 42),
             influence: Some(influence),
         };
         let value = unit_json(&unit, &policy);

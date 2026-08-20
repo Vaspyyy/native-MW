@@ -136,6 +136,9 @@ pub struct AiUnitInput {
     pub is_reserve: bool,
     pub reinforcement_eligible: bool,
     pub encircled: bool,
+    /// Keep front positioning and self-defense active, but never chase a
+    /// tactical contact into an offensive move.
+    pub defensive_only: bool,
 }
 
 impl AiUnitInput {
@@ -906,7 +909,10 @@ fn choose_direction(
     if contact.preferred_target_id.is_some()
         && let Some(direction) = normalize(contact.preferred_delta_lat, contact.preferred_delta_lng)
     {
-        return (Some(direction), AssignmentReason::Contact);
+        return (
+            (!unit.defensive_only).then_some(direction),
+            AssignmentReason::Contact,
+        );
     }
     if let Some(index) = objective_index {
         let objective = world.objectives[index];
@@ -1112,6 +1118,7 @@ mod tests {
             is_reserve: false,
             reinforcement_eligible: false,
             encircled: false,
+            defensive_only: false,
         }
     }
 
@@ -1209,6 +1216,27 @@ mod tests {
             .unwrap();
         assert_eq!(order.preferred_target_id, Some(2));
         assert_eq!((order.dir_lat, order.dir_lng), (0.0, -1.0));
+    }
+
+    #[test]
+    fn defensive_unit_keeps_contact_for_combat_without_chasing_it() {
+        let land = [1; 8];
+        let dominant = [-1; 8];
+        let mut defender = unit(1, 0, 0.0, 0.0);
+        defender.defensive_only = true;
+        let units = [defender, unit(2, 1, 0.0, 0.1)];
+
+        let result = resolve_ai_orders(
+            AiOrderConfig::default(),
+            &units,
+            standard_world(&land, &dominant, &[]),
+        )
+        .unwrap();
+        let order = &result.orders[0];
+        assert_eq!(order.preferred_target_id, Some(2));
+        assert!(!order.movement_enabled);
+        assert_eq!((order.dir_lat, order.dir_lng), (0.0, 0.0));
+        assert_eq!(result.assignments[0].reason, AssignmentReason::Contact);
     }
 
     #[test]

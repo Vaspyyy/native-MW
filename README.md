@@ -22,7 +22,10 @@ reference while systems move into the renderer-independent `mw-core` crate.
   territory -> strategic settlement
 - opt-in, bounded live battlefield resolution for current terrain/sea/city
   context, encirclement-driven combat/retreat policy, armor support, formation
-  concentration, cohesion, local repulsion, and pre-combat influence exclusion
+  concentration, cohesion, local repulsion, pre-combat influence exclusion, and
+  browser-parity sea/supply/encirclement attrition
+- deterministic command-band feedback: pay-cycle bands refresh per-unit refusal,
+  return-home, self-defense, influence eligibility, and planning policy
 - reference-counted immutable snapshots, FIFO territory render deltas, and a
   native `wgpu` unit overlay
 - a named dedicated simulation worker with bounded, lossless atomic
@@ -244,18 +247,34 @@ step.
 This remains a bounded simulation port. Mid-war v2 does not serialize a
 partial census or render queues. The surrender path does not yet include the
 browser's releasables, province-border smoothing, equipment-reserve or air
-cleanup, or treaty/UI presentation. Encirclement history currently drives
-combat and retreat modifiers, but browser encirclement attrition and
-supply-cutoff damage remain pending. Repulsion is local and deterministic, but
-task-force-aware suppression is not represented yet. Strategic command-band
-changes do not yet refresh each unit's `refuses_offense` flag or resolved order
-policy. Browser influence cohort scheduling and frontier diffusion, live
-war-phase/posture transitions, air/naval simulation, and the full gameplay UI
-remain outside this slice. Native `frame` advances once per runtime step; a
-browser speed mode may execute several logical ticks in one RAF frame, so
-frame-window mechanics become deterministic native-step windows after handoff
-rather than preserving a different browser cadence. These bounded contracts
-are not a claim of exact full-browser tick parity.
+cleanup, or treaty/UI presentation. The live battlefield resolver now applies
+browser-parity attrition as one validated batch after staged influence and
+before AI and combat: sea units
+take the naval attrition rule, supply collapse and encirclement add their
+bounded damage, and personnel/equipment losses are folded into runtime
+casualties. This is deliberately a native adaptation of the browser's reverse
+unit-loop interleaving, which can mutate one unit before a later unit is
+visited; the native batch resolves one coherent pre-movement image, preserves
+the same per-unit arithmetic, and makes the mutation atomic and rollback-safe.
+
+At each 600-tick strategic boundary, economy settlement produces command bands
+first. A changed band then refreshes every surviving unit's refusal cohort,
+return-home/self-defense flags, influence refusal gate, and front/assignment
+priors. Breakdown and mutiny use the controlled capital when available, then
+the first controlled land cell in stable row-major order. That fallback is
+deterministic; it intentionally replaces the browser's gameplay-RNG reservoir
+selection. The update is committed with the strategic cycle at the end of the
+current native step, so the refreshed command order affects the next native
+tick rather than the already-staged tick.
+
+Remaining bounded omissions are supply-collapse reactions that rebuild
+task-force intent, naval exile/recovery RNG, task-force identity-aware
+repulsion, browser influence cohorts/frontier diffusion, live war-phase and
+posture transitions, air/naval simulation, and the full gameplay UI. Native
+`frame` advances once per runtime step; a browser speed mode may execute
+several logical ticks in one RAF frame, so frame-window mechanics after
+handoff follow deterministic native cadence. These contracts are not a claim
+of exact full-browser tick parity.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the migration boundary.
 Measured Rust-versus-JavaScript results are recorded in

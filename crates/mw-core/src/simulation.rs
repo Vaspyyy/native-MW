@@ -188,12 +188,34 @@ pub struct DesertionOutcome {
     pub removed_ids: Arc<[u64]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DamageCommand {
+    pub unit_id: u64,
+    pub damage: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DamageResult {
+    pub unit_id: u64,
+    pub personnel_loss: u64,
+    pub equipment_loss: u64,
+    pub removed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DamageOutcome {
+    pub results: Arc<[DamageResult]>,
+    pub removed_ids: Arc<[u64]>,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum SimulationError {
     #[error("invalid simulation config")]
     InvalidConfig,
     #[error("duplicate unit id {0}")]
     DuplicateUnit(u64),
+    #[error("damage command references unknown unit id {0}")]
+    UnknownDamageUnit(u64),
     #[error("duplicate order for unit id {0}")]
     DuplicateOrder(u64),
     #[error("inactive unit ids must be sorted, unique, and reference live units")]
@@ -288,6 +310,98 @@ impl Simulation {
         commands: &[DesertionCommand],
     ) -> Result<DesertionOutcome, SimulationError> {
         self.apply_strategic_unit_consequences_atomic(commands, &[])
+    }
+
+    /// Apply per-unit damage atomically, with the browser's health-to-strength
+    /// rounding and zero-health removal rules.
+    pub fn apply_batch_damage(
+        &mut self,
+        commands: &[DamageCommand],
+    ) -> Result<DamageOutcome, SimulationError> {
+        let mut by_id = BTreeMap::new();
+        for command in commands {
+            if !command.damage.is_finite() || command.damage <= 0.0 {
+                return Err(SimulationError::NonFiniteInput);
+            }
+            if by_id.insert(command.unit_id, command.damage).is_some() {
+                return Err(SimulationError::DuplicateUnit(command.unit_id));
+            }
+        }
+        let mut next = Vec::with_capacity(self.units.len());
+        let mut results = Vec::new();
+        let mut removed_ids = Vec::new();
+        for current in &self.units {
+            let Some(&damage) = by_id.get(&current.combat.id) else {
+                next.push(current.clone());
+                continue;
+            };
+            let mut unit = current.clone();
+            let before_health = unit.combat.health;
+            let effective = damage.min(before_health).max(0.0);
+            let next_health = (before_health - effective).max(0.0);
+            let (personnel_loss, equipment_loss) = if unit.combat.kind == UnitKind::Armor {
+                let before = unit.combat.equipment;
+                let capacity = if unit.combat.max_equipment > 0 {
+                    unit.combat.max_equipment
+                } else {
+                    before
+                };
+                let proportional = ((capacity as f64) * (next_health / UNIT_HEALTH))
+                    .ceil()
+                    .max(0.0) as u64;
+                let after = before.min(proportional);
+                unit.combat.equipment = after;
+                let equipment_loss = before - after;
+                (equipment_loss.saturating_mul(2), equipment_loss)
+            } else {
+                let before = unit.combat.personnel;
+                let capacity = before.max(unit.combat.personnel_capacity);
+                let after = ((capacity as f64) * (next_health / unit.combat.max_health.max(1.0)))
+                    .round()
+                    .max(0.0) as u64;
+                let after = before.min(after);
+                unit.combat.personnel = after;
+                (before - after, 0)
+            };
+            unit.combat.health = next_health;
+            let removed = unit.combat.health <= 0.0
+                || (unit.combat.kind == UnitKind::Army && unit.combat.personnel == 0)
+                || (unit.combat.kind == UnitKind::Armor && unit.combat.equipment == 0);
+            results.push(DamageResult {
+                unit_id: unit.combat.id,
+                personnel_loss,
+                equipment_loss,
+                removed,
+            });
+            if removed {
+                removed_ids.push(unit.combat.id);
+            } else {
+                next.push(unit);
+            }
+        }
+        if results.len() != by_id.len() {
+            let unknown = by_id
+                .keys()
+                .find(|id| !self.units.iter().any(|unit| unit.combat.id == **id))
+                .copied()
+                .expect("damage result count differs only for an unknown unit");
+            return Err(SimulationError::UnknownDamageUnit(unknown));
+        }
+        validate_unit_slice(&next, None)?;
+        self.units = next;
+        self.rebuild_unit_index()?;
+        self.tactical_units.clear();
+        self.candidates.clear();
+        self.accepted.clear();
+        self.order_by_unit.clear();
+        self.events.clear();
+        self.removed.clone_from(&removed_ids);
+        self.abandoned.clear();
+        self.latest = None;
+        Ok(DamageOutcome {
+            results: results.into(),
+            removed_ids: removed_ids.into(),
+        })
     }
 
     /// Atomically apply desertion first, then remove every unit belonging to a
@@ -1054,6 +1168,76 @@ mod tests {
         let retained = snapshot.clone();
         simulation.units[0].combat.lng = 20.0;
         assert_eq!(retained.units[1].lng, 1.0);
+    }
+
+    #[test]
+    fn batch_damage_matches_browser_rounding_and_is_atomic() {
+        let mut armor = army(2, 1, 0.0, 0.0);
+        armor.combat.kind = UnitKind::Armor;
+        armor.combat.personnel = 200;
+        armor.combat.personnel_capacity = 200;
+        armor.combat.equipment = 100;
+        armor.combat.max_equipment = 100;
+        let mut simulation = Simulation::new(
+            SimulationConfig::default(),
+            vec![army(1, 0, 0.0, 0.0), armor],
+        )
+        .unwrap();
+
+        let outcome = simulation
+            .apply_batch_damage(&[
+                DamageCommand {
+                    unit_id: 1,
+                    damage: 25.0,
+                },
+                DamageCommand {
+                    unit_id: 2,
+                    damage: 99.1,
+                },
+            ])
+            .unwrap();
+        assert_eq!(outcome.results[0].personnel_loss, 250);
+        assert_eq!(outcome.results[1].equipment_loss, 99);
+        assert_eq!(outcome.results[1].personnel_loss, 198);
+        assert_eq!(simulation.units[0].combat.personnel, 750);
+        assert_eq!(simulation.units[1].combat.equipment, 1);
+
+        let before = simulation.units.clone();
+        assert!(
+            simulation
+                .apply_batch_damage(&[
+                    DamageCommand {
+                        unit_id: 1,
+                        damage: 1.0,
+                    },
+                    DamageCommand {
+                        unit_id: 1,
+                        damage: 2.0,
+                    },
+                ])
+                .is_err()
+        );
+        assert_eq!(simulation.units, before);
+
+        let lethal = simulation
+            .apply_batch_damage(&[DamageCommand {
+                unit_id: 2,
+                damage: 1.0,
+            }])
+            .unwrap();
+        assert_eq!(lethal.removed_ids.as_ref(), &[2]);
+
+        simulation.units[0].combat.health = 0.04;
+        simulation.units[0].combat.personnel = 1;
+        simulation.units[0].combat.personnel_capacity = 1_000;
+        let strength_zero = simulation
+            .apply_batch_damage(&[DamageCommand {
+                unit_id: 1,
+                damage: 0.01,
+            }])
+            .unwrap();
+        assert_eq!(strength_zero.results[0].personnel_loss, 1);
+        assert_eq!(strength_zero.removed_ids.as_ref(), &[1]);
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod ai;
 pub mod battlefield;
 pub mod bootstrap;
 pub mod combat;
+pub mod command;
 pub mod direction;
 pub mod economy;
 pub mod front;
@@ -28,12 +29,13 @@ pub use ai::{
     ResolvedCombatModifiers, ResolvedMovementModifiers, resolve_ai_orders,
 };
 pub use battlefield::{
-    BATTLEFIELD_SCHEMA_VERSION, BattlefieldBuff, BattlefieldCellState, BattlefieldCohesionGroup,
-    BattlefieldConfig, BattlefieldDirectionInput, BattlefieldDirectionResult, BattlefieldError,
-    BattlefieldInfluenceModifiers, BattlefieldLocalTacticsResult, BattlefieldLocalUnitInput,
-    BattlefieldLocalUnitResult, BattlefieldMapView, BattlefieldRuntimeState, BattlefieldTickInput,
-    BattlefieldTickResult, BattlefieldUnitInput, BattlefieldUnitResult, BattlefieldUnitState,
-    BattlefieldUrbanCenter, BattlefieldVector, BattlefieldWarPhase, CountryBattlefieldPrimitives,
+    ATTRITION_DAMAGE, BATTLEFIELD_SCHEMA_VERSION, BattlefieldAttritionResult, BattlefieldBuff,
+    BattlefieldCellState, BattlefieldCohesionGroup, BattlefieldConfig, BattlefieldDirectionInput,
+    BattlefieldDirectionResult, BattlefieldError, BattlefieldInfluenceModifiers,
+    BattlefieldLocalTacticsResult, BattlefieldLocalUnitInput, BattlefieldLocalUnitResult,
+    BattlefieldMapView, BattlefieldRuntimeState, BattlefieldTickInput, BattlefieldTickResult,
+    BattlefieldUnitInput, BattlefieldUnitResult, BattlefieldUnitState, BattlefieldUrbanCenter,
+    BattlefieldVector, BattlefieldWarPhase, CountryBattlefieldPrimitives, ENCIRCLEMENT_DAMAGE_MULT,
     active_combat_influence_eligible, apply_cohesion_and_repulsion, armor_influence_multiplier,
     armor_speed_multiplier, cohesion_group, resolve_battlefield_tick, resolve_local_tactics,
 };
@@ -45,6 +47,10 @@ pub use combat::{
     formation_strength, jittered_target_distance, matchup_multiplier, quality_multiplier,
     resolve_direct_engagement, resolve_proximity_contact, wrapped_distance_squared,
     wrapped_longitude_delta,
+};
+pub use command::{
+    CommandHomeTarget, CommandResolveError, CommandUnitState, CommandWorld, ResolvedCommandPolicy,
+    browser_discipline, refusal_share, resolve_command_batch, resolve_command_policy,
 };
 pub use direction::{
     DirectionField, DirectionFieldError, DirectionFieldInput, HostilityMatrix,
@@ -83,17 +89,18 @@ pub use production::{
 pub use runtime::{
     DEFAULT_CENSUS_BUDGET, DEFAULT_CENSUS_FLUSH_CHUNK, DEFAULT_FRONT_REFRESH_TICKS,
     DEFAULT_RUNTIME_FRONT_STICKINESS, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
-    NativeRuntimeCheckpointState, RuntimeCensusCounters, RuntimeCheckpoint, RuntimeConfig,
-    RuntimeDiplomacy, RuntimeError, RuntimeInfluenceCounters, RuntimeSnapshot, RuntimeState,
-    RuntimeStepCounters, RuntimeUnitPolicy, UnitAiPolicy, UnitInfluencePolicy,
+    NativeRuntimeCheckpointState, RuntimeAttritionCounters, RuntimeCensusCounters,
+    RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeError, RuntimeInfluenceCounters,
+    RuntimeSnapshot, RuntimeState, RuntimeStepCounters, RuntimeUnitPolicy, UnitAiPolicy,
+    UnitCommandPolicy, UnitInfluencePolicy,
 };
 pub use scenario::{
     DecodedScenario, GridSpec, ScenarioError, decode_mwsc, decode_mwsc_gzip, decode_mwsc_gzip_file,
 };
 pub use simulation::{
-    DesertionOutcome, FrameSnapshot, NATIVE_TICK_SCHEMA_VERSION, ResolvedCombatOrder,
-    ResolvedUnitOrder, Simulation, SimulationConfig, SimulationError, SimulationUnit, TickCounters,
-    TickInput, UnitSnapshot,
+    DamageCommand, DamageOutcome, DamageResult, DesertionOutcome, FrameSnapshot,
+    NATIVE_TICK_SCHEMA_VERSION, ResolvedCombatOrder, ResolvedUnitOrder, Simulation,
+    SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput, UnitSnapshot,
 };
 pub use strategic::{
     ConflictResolutionPlan, CountryCycleInput, CountryStrategicSnapshot, DesertionCommand,

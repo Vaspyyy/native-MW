@@ -19,6 +19,156 @@ use crate::{
 };
 
 pub const BATTLEFIELD_SCHEMA_VERSION: &str = "native-battlefield-v1";
+pub const ATTRITION_DAMAGE: f64 = 0.06;
+pub const ENCIRCLEMENT_DAMAGE_MULT: f64 = 5.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BattlefieldAttritionResult {
+    pub damage: f64,
+    pub encircled: bool,
+    pub encircled_ticks: u64,
+    pub friendly_tiles: usize,
+    pub supply_collapsed: bool,
+}
+
+/// Browser-parity attrition arithmetic. This is intentionally pure: callers
+/// commit the returned damage through `Simulation::apply_batch_damage`.
+fn calculate_attrition(
+    config: BattlefieldConfig,
+    maps: BattlefieldMapView<'_>,
+    unit: BattlefieldUnitInput,
+    frame: u64,
+    target_land_size: f64,
+    damage_taken_multiplier: f64,
+) -> BattlefieldAttritionResult {
+    let cell = maps.world.grid_index(unit.lat, unit.lng);
+    let at_sea = cell.is_none_or(|i| maps.world.land_mask[i] == 0);
+    if at_sea {
+        return BattlefieldAttritionResult {
+            damage: if unit.transport {
+                0.0
+            } else {
+                ATTRITION_DAMAGE * 3.0
+            },
+            encircled: false,
+            encircled_ticks: 0,
+            friendly_tiles: 0,
+            supply_collapsed: false,
+        };
+    }
+    let encircled = !at_sea
+        && !matches!(
+            unit.country.combat_buff,
+            BattlefieldBuff::Buff | BattlefieldBuff::Super
+        )
+        && cell.is_some_and(|i| {
+            unit_is_encircled(
+                config,
+                maps,
+                unit,
+                BattlefieldCellState {
+                    index: Some(i),
+                    at_sea,
+                    mountain_intensity: 0.0,
+                    mountain: false,
+                    current_cell_urban: false,
+                    combat_urban: false,
+                },
+            )
+        });
+    let encircled_ticks = if encircled {
+        unit.encircled_ticks.saturating_add(1)
+    } else {
+        0
+    };
+    let enemy = !at_sea
+        && cell
+            .is_some_and(|i| sides_are_hostile(maps.hostility, unit.side, maps.dominant_side[i]));
+    let gate = (enemy || encircled)
+        && !matches!(
+            unit.country.combat_buff,
+            BattlefieldBuff::Buff | BattlefieldBuff::Super
+        )
+        // Browser applies this tick's combat/speed boost, decrements the
+        // counter, then evaluates attrition. A saved value of one therefore
+        // no longer grants attrition immunity.
+        && (unit.victory_boost_ticks <= 1 || encircled);
+    if !gate {
+        return BattlefieldAttritionResult {
+            damage: 0.0,
+            encircled,
+            encircled_ticks,
+            friendly_tiles: 0,
+            supply_collapsed: false,
+        };
+    }
+    let control = cell.map_or(0.0, |i| {
+        if maps.world.land_mask[i] == 2 {
+            maps.occupation[i] as f64
+        } else {
+            0.0
+        }
+    });
+    let logistics = (target_land_size / 500.0 + 1.0).log10().max(1.0);
+    let mut damage =
+        ATTRITION_DAMAGE * (1.0 + control.abs() * 3.0) * logistics * (1.0 + frame as f64 / 8000.0);
+    if encircled {
+        let scale = if encircled_ticks > 360 {
+            4.0
+        } else if encircled_ticks > 180 {
+            2.5
+        } else if encircled_ticks > 60 {
+            1.5
+        } else {
+            1.0
+        };
+        damage *= ENCIRCLEMENT_DAMAGE_MULT * scale;
+    }
+    let mut friendly_tiles = 0;
+    let mut collapsed = false;
+    if enemy
+        && !encircled
+        && let Some(i) = cell
+    {
+        let radius = (0.8 / maps.world.grid_res).round() as isize;
+        let row = (i / maps.world.width) as isize;
+        let col = (i % maps.world.width) as isize;
+        for dr in -radius..=radius {
+            for dc in -radius..=radius {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+                let (r, c) = (row + dr, col + dc);
+                if r >= 0
+                    && c >= 0
+                    && r < maps.world.height as isize
+                    && c < maps.world.width as isize
+                {
+                    let n = r as usize * maps.world.width + c as usize;
+                    if maps.world.land_mask[n] > 0 && maps.dominant_side[n] == unit.side as i16 {
+                        friendly_tiles += 1;
+                    }
+                }
+            }
+        }
+        match friendly_tiles {
+            0 => {
+                damage += 2.5;
+                collapsed = true;
+            }
+            1..=2 => damage += 0.8,
+            3..=7 => damage += 0.3,
+            _ => {}
+        }
+    }
+    BattlefieldAttritionResult {
+        damage: damage * damage_taken_multiplier,
+        encircled,
+        encircled_ticks,
+        friendly_tiles,
+        supply_collapsed: collapsed,
+    }
+}
 
 /// Browser country buff states that alter combat and territorial influence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -279,6 +429,7 @@ pub struct BattlefieldUnitInput {
     pub side: SideKey,
     pub sovereign: u16,
     pub kind: UnitKind,
+    pub transport: bool,
     pub lat: f64,
     pub lng: f64,
     /// Browser formation-equivalent strength. Armor supplies `1.0`.
@@ -308,6 +459,9 @@ pub struct BattlefieldTickInput<'a> {
     pub frame: u64,
     pub mountains_enabled: bool,
     pub maps: BattlefieldMapView<'a>,
+    /// Browser country-ledger controlled-cell totals, already summed across
+    /// every side that this side treats as hostile.
+    pub hostile_controlled_land_by_side: &'a [f64],
     pub units: &'a [BattlefieldUnitInput],
 }
 
@@ -344,6 +498,7 @@ pub struct BattlefieldUnitResult {
     pub movement: ResolvedMovementModifiers,
     pub combat: ResolvedCombatModifiers,
     pub influence: BattlefieldInfluenceModifiers,
+    pub attrition: BattlefieldAttritionResult,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -443,6 +598,8 @@ pub enum BattlefieldError {
     SideInfluenceRows,
     #[error("hostility matrix has invalid dimensions")]
     InvalidHostility,
+    #[error("hostile controlled-land totals have invalid dimensions or values")]
+    InvalidHostileLandTotals,
     #[error("country-to-side topology contains an invalid side")]
     InvalidCountryTopology,
     #[error("duplicate battlefield unit id {0}")]
@@ -838,6 +995,14 @@ pub fn resolve_battlefield_tick(
     validate_config(config)?;
     validate_maps(input.maps)?;
     validate_units(input.units, input.maps)?;
+    if input.hostile_controlled_land_by_side.len() != input.maps.hostility.max_sides
+        || input
+            .hostile_controlled_land_by_side
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(BattlefieldError::InvalidHostileLandTotals);
+    }
 
     // This intentionally mirrors the browser/native hand-off's side-zero and
     // side-one test, including its behavior in a topology with more sides.
@@ -863,7 +1028,13 @@ pub fn resolve_battlefield_tick(
 
     let mut units = Vec::with_capacity(input.units.len());
     for unit in input.units {
-        let result = resolve_unit(config, input, *unit, unopposed_multiplier)?;
+        let result = resolve_unit(
+            config,
+            input,
+            *unit,
+            unopposed_multiplier,
+            input.hostile_controlled_land_by_side[usize::from(unit.side)],
+        )?;
         units.push(result);
     }
     Ok(BattlefieldTickResult {
@@ -879,6 +1050,7 @@ fn resolve_unit(
     input: BattlefieldTickInput<'_>,
     unit: BattlefieldUnitInput,
     unopposed_multiplier: f64,
+    target_land_size: f64,
 ) -> Result<BattlefieldUnitResult, BattlefieldError> {
     let maps = input.maps;
     let index = maps.world.grid_index(unit.lat, unit.lng);
@@ -1056,7 +1228,19 @@ fn resolve_unit(
         ),
     };
 
-    if !result_numbers_are_valid(base_speed, movement, combat, influence) {
+    let attrition = calculate_attrition(
+        config,
+        maps,
+        unit,
+        input.frame,
+        target_land_size,
+        combat.taken_multiplier,
+    );
+
+    if !result_numbers_are_valid(base_speed, movement, combat, influence)
+        || !attrition.damage.is_finite()
+        || attrition.damage < 0.0
+    {
         return Err(BattlefieldError::InvalidUnit(unit.id));
     }
     Ok(BattlefieldUnitResult {
@@ -1068,6 +1252,7 @@ fn resolve_unit(
         movement,
         combat,
         influence,
+        attrition,
     })
 }
 
@@ -1411,6 +1596,7 @@ mod tests {
             side: 0,
             sovereign: 1,
             kind: UnitKind::Army,
+            transport: false,
             lat,
             lng,
             formation_strength: 1.0,
@@ -1437,6 +1623,7 @@ mod tests {
                 frame: 100,
                 mountains_enabled: true,
                 maps: maps.view(),
+                hostile_controlled_land_by_side: &[0.0, 0.0],
                 units: &[unit],
             },
         )
@@ -1620,6 +1807,46 @@ mod tests {
         assert!(!active_combat_influence_eligible(100, Some(95), 5));
         assert!(active_combat_influence_eligible(100, Some(94), 5));
         assert!(!active_combat_influence_eligible(100, Some(101), 5));
+    }
+
+    #[test]
+    fn attrition_matches_sea_supply_victory_and_encirclement_gates() {
+        let mut maps = Maps::flat();
+        let corner = 0;
+        maps.world_control.fill(2);
+        maps.dominant.fill(1);
+        maps.occupation[corner] = 0.5;
+        let unit = army(20, corner);
+        let collapsed = resolve(&maps, unit);
+        assert!(!collapsed.encircled);
+        assert!(collapsed.attrition.supply_collapsed);
+        assert_eq!(collapsed.attrition.friendly_tiles, 0);
+        assert!(collapsed.attrition.damage > 2.5);
+        maps.land[corner] = 2;
+        let active_theater = resolve(&maps, unit);
+        assert!(active_theater.attrition.damage > collapsed.attrition.damage);
+
+        let mut boosted = unit;
+        boosted.victory_boost_ticks = 1;
+        assert!(resolve(&maps, boosted).attrition.damage > 0.0);
+        boosted.victory_boost_ticks = 2;
+        assert_eq!(resolve(&maps, boosted).attrition.damage, 0.0);
+
+        let center = 3 * WIDTH + 3;
+        maps.dominant.fill(1);
+        let mut encircled = army(21, center);
+        encircled.encircled_ticks = 60;
+        let pressure = resolve(&maps, encircled);
+        assert!(pressure.encircled);
+        assert_eq!(pressure.encircled_ticks, 61);
+        assert!(pressure.attrition.damage > ATTRITION_DAMAGE * 5.0 * 1.5);
+
+        maps.land[center] = 0;
+        let mut naval = army(22, center);
+        let sea = resolve(&maps, naval);
+        assert_close(sea.attrition.damage, ATTRITION_DAMAGE * 3.0);
+        naval.transport = true;
+        assert_eq!(resolve(&maps, naval).attrition.damage, 0.0);
     }
 
     fn battlefield_state(
@@ -1835,6 +2062,7 @@ mod tests {
                     frame: 1,
                     mountains_enabled: true,
                     maps: maps.view(),
+                    hostile_controlled_land_by_side: &[0.0, 0.0],
                     units: &units,
                 },
             ),
@@ -1851,6 +2079,7 @@ mod tests {
                     frame: 1,
                     mountains_enabled: true,
                     maps: bad_maps.view(),
+                    hostile_controlled_land_by_side: &[0.0, 0.0],
                     units: &[army(7, 0)],
                 },
             ),

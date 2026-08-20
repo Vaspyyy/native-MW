@@ -252,6 +252,23 @@ deterministic allocation. No new timing is claimed for these consequence paths;
 the table above measures the existing 100-cycle `StrategicSimulation` workload,
 which deliberately emits no desertion or capitulation commands.
 
+The production runtime also resolves browser-parity battlefield attrition after
+staged influence and before AI and combat. Sea exposure, supply collapse, and
+encirclement are evaluated from one coherent pre-movement battlefield image; all resulting personnel/equipment damage
+is applied as one validated batch, with rollback on downstream failure. This is
+deliberately not a claim that the browser's reverse-loop mutation order is
+identical: native preserves the per-unit arithmetic while making the attrition
+mutation atomic.
+
+At a pay-cycle boundary, the settled command band is resolved back into each
+surviving unit's refusal flag, return-home/self-defense behavior, influence
+eligibility, and planning priors. The update is committed with the strategic
+cycle and therefore affects the next native tick. Home fallback is the first
+controlled land cell in stable row-major order after a controlled capital; the
+browser instead selects a fallback through gameplay RNG. These policy and
+attrition paths are correctness-covered runtime behavior, not included in the
+steady-state table above.
+
 Reproduce the workload:
 
 ```bash
@@ -342,10 +359,11 @@ trips the safety gate rather than being acknowledged silently. The measured
 full-cap fixture stays `running`, so the table does not claim timings for
 capitulation allocation or conflict termination.
 
-Command-band evaluation in this measured slice settles strategic state, but a
-live command-band transition does not yet refresh each unit's
-`refuses_offense` flag or its resolved order policy. The timing should not be
-read as covering that remaining feedback path.
+Command-band evaluation in this measured slice settles strategic state. The
+live runtime additionally refreshes changed units' `refuses_offense`,
+return-home/self-defense order policy, influence gate, and assignment priors;
+the timing should not be read as covering those correctness paths because this
+stress fixture deliberately emits no band transitions.
 
 Reproduce production inspection, the canonical deterministic replay, and the
 4,800-unit workload:
@@ -404,11 +422,17 @@ deterministic radius/delta noise from the exported unit seed. A strict optional
 `native-battlefield-v1` block lets it also recompute terrain, city, formation,
 encirclement combat/retreat, armor-support, cohesion, local repulsion, and
 prior-combat influence policy from current positions and maps. Encirclement
-history does not yet apply the browser's attrition or supply-cutoff damage, and
-repulsion does not yet implement task-force-aware suppression. Strategic
-command-band changes also do not refresh per-unit `refuses_offense` or order
-policy. Browser influence cohorts/frontier diffusion and live war-phase/posture
-remain omitted. Native frames advance once per logical runtime step, so
+history now also feeds the bounded browser-parity attrition path, including sea
+exposure and supply collapse. Attrition is applied as a pre-planning atomic
+batch, whereas the browser reverse loop can interleave damage mutation with
+later unit visits. Native command-band changes refresh per-unit refusal,
+return-home/self-defense behavior, influence eligibility, and planning priors at
+the pay-cycle commit; those effects begin on the next native tick. Home
+fallback is deterministic first-controlled-cell selection rather than the
+browser's RNG reservoir. Task-force-aware supply-collapse reaction, naval
+exile/recovery RNG, task-force-aware repulsion suppression, browser influence
+cohorts/frontier diffusion, and live war-phase/posture remain omitted. Native
+frames advance once per logical runtime step, so
 frame-window mechanics after handoff follow native cadence rather than a
 browser speed mode that batches several ticks into one RAF frame. Old saves
 without the block retain their frozen resolved inputs.

@@ -23,9 +23,13 @@ use crate::{
         BattlefieldTickInput, BattlefieldUnitInput, BattlefieldUnitResult, BattlefieldUnitState,
         apply_cohesion_and_repulsion, resolve_battlefield_tick, resolve_local_tactics,
     },
-    combat::{UnitKind, formation_strength},
+    combat::{UnitKind, formation_strength, wrapped_longitude_delta},
+    command::{
+        CommandHomeTarget, CommandResolveError, CommandUnitState, CommandWorld,
+        ResolvedCommandPolicy, browser_discipline, resolve_command_batch,
+    },
     direction::HostilityMatrix,
-    economy::{EconomyState, PAY_CYCLE_TICKS},
+    economy::{CommandBand, EconomyState, PAY_CYCLE_TICKS},
     front::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
         derive_front_layout,
@@ -37,8 +41,8 @@ use crate::{
     },
     scenario::GridSpec,
     simulation::{
-        FrameSnapshot, ResolvedCombatOrder, ResolvedUnitOrder, Simulation, SimulationConfig,
-        SimulationError, SimulationUnit, TickCounters, TickInput,
+        DamageCommand, DamageOutcome, FrameSnapshot, ResolvedCombatOrder, ResolvedUnitOrder,
+        Simulation, SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput,
     },
     strategic::{
         ConflictResolutionPlan, PreparedStrategicCycle, StrategicCounters, StrategicError,
@@ -133,6 +137,7 @@ impl Default for UnitInfluencePolicy {
 pub struct RuntimeUnitPolicy {
     pub unit_id: u64,
     pub ai: UnitAiPolicy,
+    pub command: UnitCommandPolicy,
     /// `None` means the unit never stamps territory influence.
     pub influence: Option<UnitInfluencePolicy>,
 }
@@ -144,7 +149,35 @@ impl RuntimeUnitPolicy {
         Self {
             unit_id,
             ai: UnitAiPolicy::default(),
+            command: UnitCommandPolicy::paid(unit_id as f64, sovereign),
             influence: Some(influence),
+        }
+    }
+}
+
+/// Persistent command-band state. Unlike terrain/combat policy, this changes
+/// only at a strategic pay-cycle transition and must survive checkpoint reload.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnitCommandPolicy {
+    pub band: CommandBand,
+    pub discipline: f64,
+    pub refuses_offense: bool,
+    pub return_home: bool,
+    pub self_defense_only: bool,
+    pub home_target: Option<CommandHomeTarget>,
+    pub transition_cycle: u64,
+}
+
+impl UnitCommandPolicy {
+    pub fn paid(seed: f64, sovereign: u16) -> Self {
+        Self {
+            band: CommandBand::Paid,
+            discipline: browser_discipline(seed, sovereign),
+            refuses_offense: false,
+            return_home: false,
+            self_defense_only: false,
+            home_target: None,
+            transition_cycle: 0,
         }
     }
 }
@@ -202,12 +235,22 @@ pub struct RuntimeInfluenceCounters {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeAttritionCounters {
+    pub damaged_units: usize,
+    pub removed_units: usize,
+    pub personnel_loss: u64,
+    pub equipment_loss: u64,
+    pub supply_collapses: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeStepCounters {
     pub front_refreshed: bool,
     pub front_segments: usize,
     pub front_objectives: usize,
     pub ai: AiPlanningCounters,
     pub simulation: TickCounters,
+    pub attrition: RuntimeAttritionCounters,
     pub influence: RuntimeInfluenceCounters,
     pub census: RuntimeCensusCounters,
     pub strategic: Option<StrategicCounters>,
@@ -278,6 +321,8 @@ pub enum RuntimeError {
     Front(#[from] FrontLayoutError),
     #[error("battlefield policy: {0}")]
     Battlefield(#[from] BattlefieldError),
+    #[error("command policy: {0}")]
+    Command(#[from] CommandResolveError),
     #[error("unit simulation: {0}")]
     Simulation(#[from] SimulationError),
     #[error("territory: {0}")]
@@ -373,6 +418,83 @@ fn next_casualties_by_victim(
     casualties
 }
 
+fn add_attrition_casualties(
+    casualties: &mut BTreeMap<u16, f64>,
+    sovereign_by_unit: &[(u64, u16)],
+    outcome: Option<&DamageOutcome>,
+) {
+    let Some(outcome) = outcome else {
+        return;
+    };
+    for result in outcome.results.iter() {
+        if result.personnel_loss == 0 {
+            continue;
+        }
+        if let Ok(index) = sovereign_by_unit.binary_search_by_key(&result.unit_id, |entry| entry.0)
+        {
+            *casualties.entry(sovereign_by_unit[index].1).or_default() +=
+                result.personnel_loss as f64;
+        }
+    }
+}
+
+fn attrition_counters(
+    outcome: Option<&DamageOutcome>,
+    stage: Option<&StagedBattlefieldTick>,
+) -> RuntimeAttritionCounters {
+    let mut counters = RuntimeAttritionCounters::default();
+    if let Some(outcome) = outcome {
+        counters.damaged_units = outcome.results.len();
+        counters.removed_units = outcome.removed_ids.len();
+        for result in outcome.results.iter() {
+            counters.personnel_loss = counters
+                .personnel_loss
+                .saturating_add(result.personnel_loss);
+            counters.equipment_loss = counters
+                .equipment_loss
+                .saturating_add(result.equipment_loss);
+        }
+    }
+    counters.supply_collapses = outcome.zip(stage).map_or(0, |(outcome, stage)| {
+        outcome
+            .results
+            .iter()
+            .filter(|damage| {
+                stage
+                    .resolved_unit(damage.unit_id)
+                    .is_some_and(|result| result.attrition.supply_collapsed)
+            })
+            .count()
+    });
+    counters
+}
+
+fn hostile_controlled_land_by_side(
+    snapshot: &TerritorySnapshot,
+    country_to_side: &BTreeMap<u16, usize>,
+    hostility: &[u8],
+    side_count: usize,
+) -> Vec<f64> {
+    let mut controlled = vec![0.0; side_count];
+    for country in &snapshot.countries {
+        if let Some(&side) = country_to_side.get(&country.country_id)
+            && side < side_count
+        {
+            controlled[side] += country.controlled as f64;
+        }
+    }
+    (0..side_count)
+        .map(|side| {
+            controlled
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| hostility[side * side_count + *other] == 1)
+                .map(|(_, cells)| *cells)
+                .sum()
+        })
+        .collect()
+}
+
 fn ai_units(
     simulation: &Simulation,
     policies: &BTreeMap<u64, RuntimeUnitPolicy>,
@@ -418,9 +540,10 @@ fn ai_units(
                 movement: policy.ai.movement,
                 combat: policy.ai.combat,
                 prior_front_objective_id: prior_objective_by_unit.get(&unit.combat.id).copied(),
-                is_reserve: policy.ai.is_reserve,
+                is_reserve: policy.ai.is_reserve || policy.command.refuses_offense,
                 reinforcement_eligible: policy.ai.reinforcement_eligible,
                 encircled: policy.ai.encircled,
+                defensive_only: policy.command.refuses_offense,
             })
         })
         .collect()
@@ -440,20 +563,109 @@ fn garrison_hold_orders(
             continue;
         }
         let mut order = ResolvedUnitOrder::hold(unit.combat.id);
-        order.combat = ResolvedCombatOrder {
-            dealt_multiplier: policy.ai.combat.dealt_multiplier,
-            taken_multiplier: policy.ai.combat.taken_multiplier,
-            defense_bonus: policy.ai.combat.defense_bonus,
-            long_war_defense: policy.ai.combat.long_war_defense,
-            mountain: policy.ai.combat.mountain,
-            urban: policy.ai.combat.urban,
-            current_cell_mountain: policy.ai.combat.current_cell_mountain,
-            current_cell_urban: policy.ai.combat.current_cell_urban,
-        };
+        order.combat = resolved_combat_order(policy.ai.combat);
         orders.push(order);
     }
     orders.sort_unstable_by_key(|order| order.unit_id);
     Ok(orders)
+}
+
+fn command_orders(
+    simulation: &Simulation,
+    policies: &BTreeMap<u64, RuntimeUnitPolicy>,
+    tick: u64,
+) -> Result<(Vec<ResolvedUnitOrder>, Vec<FrontAssignmentRecord>), RuntimeError> {
+    let mut orders = Vec::new();
+    let mut assignments = Vec::new();
+    for unit in &simulation.units {
+        let policy = policies
+            .get(&unit.combat.id)
+            .ok_or(RuntimeError::InvalidUnitPolicy(unit.combat.id))?;
+        if !policy.command.return_home
+            || policy.ai.garrison_excluded
+            || unit_deploying(policy, tick)
+        {
+            continue;
+        }
+        let Some(target) = policy.command.home_target else {
+            continue;
+        };
+        let delta_lat = target.lat - unit.combat.lat;
+        let delta_lng = wrapped_longitude_delta(unit.combat.lng, target.lng);
+        let distance = delta_lat.hypot(delta_lng);
+        if distance <= 0.15 && !policy.command.self_defense_only {
+            continue;
+        }
+        let mut order = ResolvedUnitOrder::hold(unit.combat.id);
+        order.combat = resolved_combat_order(policy.ai.combat);
+        if distance > 0.15 {
+            order.movement_enabled = true;
+            order.dir_lat = delta_lat / distance;
+            order.dir_lng = delta_lng / distance;
+            order.factors.base_speed = policy.ai.base_speed;
+            order.factors.speed_mult =
+                policy.ai.movement.terrain_speed_multiplier * policy.ai.movement.speed_multiplier;
+            order.factors.plan_speed_mult = policy.ai.movement.plan_speed_multiplier * 0.8;
+            order.factors.neutral_penalty = policy.ai.movement.neutral_penalty;
+            order.factors.push_readiness = 1.0;
+        }
+        orders.push(order);
+        assignments.push(FrontAssignmentRecord {
+            unit_id: unit.combat.id,
+            objective_id: None,
+            reason: AssignmentReason::Hold,
+        });
+    }
+    orders.sort_unstable_by_key(|order| order.unit_id);
+    assignments.sort_unstable_by_key(|assignment| assignment.unit_id);
+    Ok((orders, assignments))
+}
+
+fn resolved_combat_order(combat: ResolvedCombatModifiers) -> ResolvedCombatOrder {
+    ResolvedCombatOrder {
+        dealt_multiplier: combat.dealt_multiplier,
+        taken_multiplier: combat.taken_multiplier,
+        defense_bonus: combat.defense_bonus,
+        long_war_defense: combat.long_war_defense,
+        mountain: combat.mountain,
+        urban: combat.urban,
+        current_cell_mountain: combat.current_cell_mountain,
+        current_cell_urban: combat.current_cell_urban,
+    }
+}
+
+fn apply_command_policy_updates(
+    policies: &mut BTreeMap<u64, RuntimeUnitPolicy>,
+    staged: &StagedCommandPolicies,
+) {
+    for &unit_id in &staged.changed_unit_ids {
+        let resolved = staged
+            .policies
+            .get(&unit_id)
+            .expect("validated command stage covers each changed unit");
+        let Some(policy) = policies.get_mut(&unit_id) else {
+            // Strategic consequences may have removed the formation after the
+            // command policy was staged.
+            continue;
+        };
+        policy.command = UnitCommandPolicy {
+            band: resolved.band,
+            discipline: resolved.discipline,
+            refuses_offense: resolved.refuses_offense,
+            return_home: resolved.return_home,
+            self_defense_only: resolved.self_defense_only,
+            home_target: resolved.home_target,
+            transition_cycle: staged.cycle,
+        };
+        if let Some(influence) = &mut policy.influence {
+            influence.refuses_offense = resolved.refuses_offense;
+        }
+        // Browser clears operational/front/garrison assignment caches whenever
+        // a band's refusal cohort changes. Native assignment history is cleared
+        // below; these two unit-local roles must not survive the transition.
+        policy.ai.is_reserve = false;
+        policy.ai.garrison_excluded = false;
+    }
 }
 
 fn front_layout_units(
@@ -477,7 +689,7 @@ fn front_layout_units(
                 side_index,
                 lat: unit.combat.lat,
                 lng: unit.combat.lng,
-                garrison_excluded: policy.ai.garrison_excluded,
+                garrison_excluded: policy.ai.garrison_excluded || policy.command.refuses_offense,
                 deploy_ticks: u32::from(unit_deploying(policy, tick)),
                 previous_pair_key: prior.map(|prior| prior.pair_key.clone()),
                 previous_segment_idx: prior.map(|prior| prior.segment_idx),
@@ -687,6 +899,12 @@ struct StagedInfluenceTick {
     source_count: usize,
 }
 
+struct StagedCommandPolicies {
+    cycle: u64,
+    policies: BTreeMap<u64, ResolvedCommandPolicy>,
+    changed_unit_ids: BTreeSet<u64>,
+}
+
 impl StagedBattlefieldTick {
     fn resolved_unit(&self, unit_id: u64) -> Option<&BattlefieldUnitResult> {
         self.resolved_by_id.get(&unit_id)
@@ -708,10 +926,22 @@ impl NativeRuntime {
         validate_diplomacy(&checkpoint.diplomacy, &checkpoint.territory)?;
         validate_scenario_grid(&checkpoint.scenario, &checkpoint.territory)?;
 
-        let unit_policies = collect_unit_policies(
+        let mut unit_policies = collect_unit_policies(
             &checkpoint.simulation,
             checkpoint.unit_policies,
             &checkpoint.territory,
+        )?;
+        hydrate_missing_command_home_targets(
+            &checkpoint.simulation,
+            &mut unit_policies,
+            &checkpoint.strategic,
+            &checkpoint.scenario,
+            &checkpoint.territory,
+        )?;
+        validate_command_checkpoint(
+            &checkpoint.simulation,
+            &unit_policies,
+            &checkpoint.strategic,
         )?;
         let battlefield_urban_mask = if let Some(battlefield) = &checkpoint.battlefield {
             let world = WorldGridView::new(
@@ -955,6 +1185,7 @@ impl NativeRuntime {
         next_tick: u64,
         next_frame: u64,
         territory: &TerritoryControl,
+        hostile_controlled_land: &[f64],
     ) -> Result<Option<StagedBattlefieldTick>, RuntimeError> {
         let Some(state) = &self.battlefield else {
             return Ok(None);
@@ -1058,6 +1289,7 @@ impl NativeRuntime {
                     side,
                     sovereign,
                     kind: unit.combat.kind,
+                    transport: unit.combat.transport,
                     lat: unit.combat.lat,
                     lng: unit.combat.lng,
                     formation_strength: strength,
@@ -1101,6 +1333,7 @@ impl NativeRuntime {
                         territory.max_sides(),
                     ),
                 },
+                hostile_controlled_land_by_side: hostile_controlled_land,
                 units: &battlefield_inputs,
             },
         )?;
@@ -1144,7 +1377,9 @@ impl NativeRuntime {
                 let memory = next_unit_state.get_mut(&result.unit_id).ok_or(
                     RuntimeError::InvalidCheckpoint("battlefield result has no persistent state"),
                 )?;
-                memory.encircled_ticks = result.encircled_ticks;
+                if !unit_deploying(policy, next_tick) {
+                    memory.encircled_ticks = result.encircled_ticks;
+                }
                 let local =
                     local_by_id
                         .get(&result.unit_id)
@@ -1166,6 +1401,39 @@ impl NativeRuntime {
             ally_weight_by_id,
             influence_eligible,
         }))
+    }
+
+    fn stage_command_policies(
+        &self,
+        snapshot: &StrategicSnapshot,
+        simulation: &Simulation,
+    ) -> Result<StagedCommandPolicies, RuntimeError> {
+        let country_bands = snapshot
+            .countries
+            .iter()
+            .map(|country| (country.country_id, country.economy.command_band))
+            .collect::<BTreeMap<_, _>>();
+        let resolved = resolve_command_policies_for(
+            simulation,
+            &self.unit_policies,
+            &country_bands,
+            &self.scenario,
+            &self.territory,
+        )?;
+        let changed_unit_ids = resolved
+            .iter()
+            .filter_map(|(&unit_id, resolved)| {
+                self.unit_policies
+                    .get(&unit_id)
+                    .filter(|policy| policy.command.band != resolved.band)
+                    .map(|_| unit_id)
+            })
+            .collect();
+        Ok(StagedCommandPolicies {
+            cycle: snapshot.cycle,
+            policies: resolved,
+            changed_unit_ids,
+        })
     }
 
     fn stage_strategic_effects(
@@ -1417,8 +1685,20 @@ impl NativeRuntime {
         // apply it through a sparse undo transaction, then resolve the rest of the tick against
         // that staged map. A fallible pre-simulation path rolls the transaction back; dropping it
         // after a successful simulation commits it without cloning the full world.
-        let pre_influence_battlefield =
-            self.stage_battlefield_tick(next_tick, next_frame, &self.territory)?;
+        let hostile_controlled_land = self.battlefield.as_ref().map_or_else(Vec::new, |_| {
+            hostile_controlled_land_by_side(
+                &self.latest.territory_snapshot,
+                self.territory.country_to_side(),
+                &self.diplomacy.hostility,
+                self.territory.max_sides(),
+            )
+        });
+        let pre_influence_battlefield = self.stage_battlefield_tick(
+            next_tick,
+            next_frame,
+            &self.territory,
+            &hostile_controlled_land,
+        )?;
         let mut staged_influence = None;
         let staged_battlefield = if let Some(pre_stage) = pre_influence_battlefield {
             let before = self.simulation.initial_snapshot(self.tick, self.frame);
@@ -1433,7 +1713,12 @@ impl NativeRuntime {
                 transaction,
                 source_count: sources.len(),
             });
-            match self.stage_battlefield_tick(next_tick, next_frame, &self.territory) {
+            match self.stage_battlefield_tick(
+                next_tick,
+                next_frame,
+                &self.territory,
+                &hostile_controlled_land,
+            ) {
                 Ok(Some(stage)) => Some(stage),
                 Ok(None) => {
                     let staged = staged_influence
@@ -1458,11 +1743,19 @@ impl NativeRuntime {
             None
         };
 
+        // Attrition mutates units before AI/combat. Retain one O(units) image so
+        // every later planning or simulation failure rolls back both subsystems.
+        let simulation_backup = self.simulation.units.clone();
+        let simulation_config = self.simulation.config();
+
         macro_rules! rollback_try {
             ($expression:expr) => {
                 match $expression {
                     Ok(value) => value,
                     Err(error) => {
+                        self.simulation =
+                            Simulation::new(simulation_config, simulation_backup.clone())
+                                .expect("validated simulation rollback must reconstruct");
                         if let Some(staged) = staged_influence.take() {
                             self.territory
                                 .rollback_influence_transaction(staged.transaction);
@@ -1472,6 +1765,32 @@ impl NativeRuntime {
                 }
             };
         }
+
+        let attrition_commands = if let Some(stage) = &staged_battlefield {
+            self.simulation
+                .units
+                .iter()
+                .filter_map(|unit| {
+                    let policy = stage.policies.get(&unit.combat.id)?;
+                    let result = stage.resolved_unit(unit.combat.id)?;
+                    (!unit_deploying(policy, next_tick) && result.attrition.damage > 0.0).then_some(
+                        DamageCommand {
+                            unit_id: unit.combat.id,
+                            damage: result.attrition.damage,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let attrition_outcome = if attrition_commands.is_empty() {
+            None
+        } else {
+            Some(rollback_try!(
+                self.simulation.apply_batch_damage(&attrition_commands)
+            ))
+        };
 
         let planning_policies = staged_battlefield
             .as_ref()
@@ -1546,7 +1865,76 @@ impl NativeRuntime {
             planning_policies,
             next_tick,
         )));
+        let (mut command_orders, mut command_assignments) = rollback_try!(command_orders(
+            &self.simulation,
+            planning_policies,
+            next_tick,
+        ));
+        let engaged_or_retreating = planning
+            .assignments
+            .iter()
+            .filter(|assignment| {
+                matches!(
+                    assignment.reason,
+                    AssignmentReason::Contact | AssignmentReason::Retreat
+                )
+            })
+            .map(|assignment| assignment.unit_id)
+            .collect::<BTreeSet<_>>();
+        command_orders.retain(|order| !engaged_or_retreating.contains(&order.unit_id));
+        command_assignments
+            .retain(|assignment| !engaged_or_retreating.contains(&assignment.unit_id));
+        let command_override_ids = command_orders
+            .iter()
+            .map(|order| order.unit_id)
+            .collect::<BTreeSet<_>>();
+        for assignment in planning
+            .assignments
+            .iter()
+            .filter(|assignment| command_override_ids.contains(&assignment.unit_id))
+        {
+            match assignment.reason {
+                AssignmentReason::Front => {
+                    let was_sticky = assignment.objective_id.is_some_and(|objective| {
+                        planning_prior.get(&assignment.unit_id) == Some(&objective)
+                    });
+                    if was_sticky {
+                        planning.counters.sticky_assignments =
+                            planning.counters.sticky_assignments.saturating_sub(1);
+                    } else {
+                        planning.counters.front_assignments =
+                            planning.counters.front_assignments.saturating_sub(1);
+                    }
+                }
+                AssignmentReason::Reinforce => {
+                    planning.counters.reinforcement_assignments = planning
+                        .counters
+                        .reinforcement_assignments
+                        .saturating_sub(1);
+                }
+                AssignmentReason::Field => {
+                    planning.counters.field_orders =
+                        planning.counters.field_orders.saturating_sub(1);
+                }
+                AssignmentReason::Hold => {
+                    planning.counters.hold_orders = planning.counters.hold_orders.saturating_sub(1);
+                }
+                AssignmentReason::Contact | AssignmentReason::Retreat => {}
+            }
+        }
+        planning
+            .orders
+            .retain(|order| !command_override_ids.contains(&order.unit_id));
+        planning
+            .assignments
+            .retain(|assignment| !command_override_ids.contains(&assignment.unit_id));
+        planning.counters.hold_orders += command_orders.len();
+        planning.orders.extend(command_orders);
+        planning.assignments.extend(command_assignments);
         planning.orders.sort_unstable_by_key(|order| order.unit_id);
+        planning
+            .assignments
+            .sort_unstable_by_key(|assignment| assignment.unit_id);
         if let Some(stage) = &staged_battlefield {
             let reasons = planning
                 .assignments
@@ -1581,7 +1969,8 @@ impl NativeRuntime {
                         ),
                         at_sea,
                         active_retreat: reason == AssignmentReason::Retreat,
-                        occupation_garrison_holding: policy.ai.garrison_excluded,
+                        occupation_garrison_holding: policy.ai.garrison_excluded
+                            || command_override_ids.contains(&order.unit_id),
                     })
                 })
                 .collect::<Result<Vec<_>, RuntimeError>>();
@@ -1637,26 +2026,32 @@ impl NativeRuntime {
                             "battlefield ally weight omitted a live unit",
                         ),
                     )?;
-                    Ok((resolved.cell.at_sea, local.armor_supported, ally_weight))
+                    Ok((
+                        unit.combat.id,
+                        (resolved.cell.at_sea, local.armor_supported, ally_weight),
+                    ))
                 })
-                .collect::<Result<Vec<_>, RuntimeError>>();
+                .collect::<Result<BTreeMap<_, _>, RuntimeError>>();
             Some(rollback_try!(updates))
         } else {
             None
         };
 
-        // Keep an O(units) rollback image so movement/combat errors cannot strand a half-tick;
-        // the sparse territory transaction above is rolled back on the same path.
-        let simulation_backup = self.simulation.units.clone();
-        let simulation_config = self.simulation.config();
         if let Some(updates) = staged_simulation_updates {
-            debug_assert_eq!(self.simulation.units.len(), updates.len());
-            for (unit, (at_sea, armor_supported, ally_weight)) in
-                self.simulation.units.iter_mut().zip(updates)
-            {
+            for unit in &mut self.simulation.units {
+                let (at_sea, armor_supported, ally_weight) = updates
+                    .get(&unit.combat.id)
+                    .copied()
+                    .expect("battlefield updates cover every surviving unit");
                 unit.combat.at_sea = at_sea;
                 unit.combat.armor_supported = armor_supported;
-                unit.combat.victory_boost_ticks = unit.combat.victory_boost_ticks.saturating_sub(1);
+                let policy = planning_policies
+                    .get(&unit.combat.id)
+                    .expect("planning policy covers every surviving unit");
+                if !unit_deploying(policy, next_tick) {
+                    unit.combat.victory_boost_ticks =
+                        unit.combat.victory_boost_ticks.saturating_sub(1);
+                }
                 unit.ally_weight = ally_weight;
             }
         }
@@ -1687,7 +2082,7 @@ impl NativeRuntime {
         let (mut frame_snapshot, mut simulation_counters) = match simulation_result {
             Ok(result) => result,
             Err(error) => {
-                self.simulation = Simulation::new(simulation_config, simulation_backup)
+                self.simulation = Simulation::new(simulation_config, simulation_backup.clone())
                     .expect("validated simulation rollback must reconstruct");
                 if let Some(staged) = staged_influence.take() {
                     self.territory
@@ -1696,10 +2091,24 @@ impl NativeRuntime {
                 return Err(RuntimeError::Simulation(error));
             }
         };
-        let next_casualties = next_casualties(
+        if let Some(outcome) = &attrition_outcome {
+            let mut removed_ids = frame_snapshot.removed_ids.to_vec();
+            removed_ids.extend(outcome.removed_ids.iter().copied());
+            removed_ids.sort_unstable();
+            removed_ids.dedup();
+            frame_snapshot.removed_ids = removed_ids.into();
+            simulation_counters.input_units = simulation_backup.len();
+            simulation_counters.removed_units = frame_snapshot.removed_ids.len();
+        }
+        let mut next_casualties = next_casualties(
             &self.casualties,
             &self.unit_sovereign_by_id,
             &frame_snapshot,
+        );
+        add_attrition_casualties(
+            &mut next_casualties,
+            &self.unit_sovereign_by_id,
+            attrition_outcome.as_ref(),
         );
         let next_casualties_by_victim = next_casualties_by_victim(
             &self.casualties_by_victim,
@@ -1743,6 +2152,7 @@ impl NativeRuntime {
         let mut derivation_counters = None;
         let mut next_state = RuntimeState::Running;
         let mut strategic_fronts_invalidated = false;
+        let mut staged_command_policies = None;
         if strategic_due {
             let derived = match derive_production_input(
                 next_tick,
@@ -1787,6 +2197,16 @@ impl NativeRuntime {
                         return Err(error);
                     }
                 };
+            let command_updates = match self.stage_command_policies(
+                &prepared.snapshot(),
+                effects.simulation.as_ref().unwrap_or(&self.simulation),
+            ) {
+                Ok(updates) => updates,
+                Err(error) => {
+                    self.state = RuntimeState::Poisoned;
+                    return Err(error);
+                }
+            };
             let (published, counters) = match self.strategic.commit_cycle(prepared) {
                 Ok(result) => result,
                 Err(error) => {
@@ -1825,11 +2245,14 @@ impl NativeRuntime {
                 self.territory = territory;
             }
             strategic_fronts_invalidated = effects.fronts_invalidated;
+            staged_command_policies = Some(command_updates);
             next_state = effects.state;
             strategic_snapshot = Some(published);
             strategic_counters = Some(counters);
         }
 
+        let attrition_counters =
+            attrition_counters(attrition_outcome.as_ref(), staged_battlefield.as_ref());
         let mut next_prior = assignments_by_unit(&planning.assignments);
         let surviving_ids = frame_snapshot
             .units
@@ -1847,6 +2270,13 @@ impl NativeRuntime {
                 .units
                 .retain(|unit_id, _| surviving_ids.contains(unit_id));
         }
+        let command_changed_ids = staged_command_policies
+            .as_ref()
+            .map(|stage| stage.changed_unit_ids.clone())
+            .unwrap_or_default();
+        if let Some(staged) = &staged_command_policies {
+            apply_command_policy_updates(&mut self.unit_policies, staged);
+        }
         self.unit_policies
             .retain(|unit_id, _| surviving_ids.contains(unit_id));
         self.unit_sovereign_by_id
@@ -1863,7 +2293,10 @@ impl NativeRuntime {
         }
         self.front_prior_by_unit
             .retain(|unit_id, _| surviving_ids.contains(unit_id));
+        self.front_prior_by_unit
+            .retain(|unit_id, _| !command_changed_ids.contains(unit_id));
         next_prior.retain(|unit_id, _| surviving_ids.contains(unit_id));
+        next_prior.retain(|unit_id, _| !command_changed_ids.contains(unit_id));
         self.prior_objective_by_unit = next_prior;
         self.casualties = next_casualties;
         self.casualties_by_victim = next_casualties_by_victim;
@@ -1895,6 +2328,7 @@ impl NativeRuntime {
             front_objectives: self.objectives.len(),
             ai: planning.counters,
             simulation: simulation_counters,
+            attrition: attrition_counters,
             influence: influence_counters(influence_source_count, &influence),
             census,
             strategic: strategic_counters,
@@ -2020,6 +2454,127 @@ fn collect_unit_policies(
     Ok(by_id)
 }
 
+fn hydrate_missing_command_home_targets(
+    simulation: &Simulation,
+    policies: &mut BTreeMap<u64, RuntimeUnitPolicy>,
+    strategic: &StrategicSimulation,
+    scenario: &ScenarioProduction,
+    territory: &TerritoryControl,
+) -> Result<(), RuntimeError> {
+    if !policies
+        .values()
+        .any(|policy| policy.command.return_home && policy.command.home_target.is_none())
+    {
+        return Ok(());
+    }
+    let country_bands = strategic
+        .economies()
+        .iter()
+        .map(|(&country, economy)| (country, economy.command_band))
+        .collect::<BTreeMap<_, _>>();
+    let resolved =
+        resolve_command_policies_for(simulation, policies, &country_bands, scenario, territory)?;
+    for (&unit_id, policy) in policies.iter_mut() {
+        if policy.command.return_home && policy.command.home_target.is_none() {
+            policy.command.home_target = resolved
+                .get(&unit_id)
+                .and_then(|resolved| resolved.home_target);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_command_policies_for(
+    simulation: &Simulation,
+    policies: &BTreeMap<u64, RuntimeUnitPolicy>,
+    country_bands: &BTreeMap<u16, CommandBand>,
+    scenario: &ScenarioProduction,
+    territory: &TerritoryControl,
+) -> Result<BTreeMap<u64, ResolvedCommandPolicy>, RuntimeError> {
+    let capital_targets = scenario
+        .cities
+        .iter()
+        .filter(|city| {
+            city.capital
+                && city.owner_id > 0
+                && city.cell < territory.total_cells()
+                && city.lat.is_finite()
+                && city.lng.is_finite()
+                && territory.country_to_side().contains_key(&city.owner_id)
+        })
+        .map(|city| {
+            (
+                city.owner_id,
+                CommandHomeTarget {
+                    cell: city.cell,
+                    lat: city.lat,
+                    lng: city.lng,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let units = simulation
+        .units
+        .iter()
+        .map(|unit| {
+            let policy = policies
+                .get(&unit.combat.id)
+                .ok_or(RuntimeError::InvalidUnitPolicy(unit.combat.id))?;
+            Ok(CommandUnitState {
+                id: unit.combat.id,
+                sovereign_id: u16::try_from(unit.combat.sovereign)
+                    .map_err(|_| RuntimeError::InvalidCheckpoint("invalid unit sovereign"))?,
+                side: usize::try_from(unit.combat.side).map_err(|_| {
+                    RuntimeError::InvalidCheckpoint("unit side exceeds platform width")
+                })?,
+                discipline: policy.command.discipline,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    resolve_command_batch(
+        &units,
+        country_bands,
+        CommandWorld {
+            grid_resolution: territory.grid_resolution(),
+            width: territory.width(),
+            height: territory.height(),
+            land: territory.land(),
+            world_control: territory.world_control(),
+            dominant_side: territory.dominant_side(),
+            country_side: territory.country_to_side(),
+            capital_targets: &capital_targets,
+        },
+    )
+    .map_err(RuntimeError::from)
+}
+
+fn validate_command_checkpoint(
+    simulation: &Simulation,
+    policies: &BTreeMap<u64, RuntimeUnitPolicy>,
+    strategic: &StrategicSimulation,
+) -> Result<(), RuntimeError> {
+    for unit in &simulation.units {
+        let country = u16::try_from(unit.combat.sovereign)
+            .map_err(|_| RuntimeError::InvalidCheckpoint("invalid unit sovereign"))?;
+        let policy = policies
+            .get(&unit.combat.id)
+            .ok_or(RuntimeError::InvalidUnitPolicy(unit.combat.id))?;
+        let economy =
+            strategic
+                .economies()
+                .get(&country)
+                .ok_or(RuntimeError::InvalidCheckpoint(
+                    "unit country has no strategic economy",
+                ))?;
+        if policy.command.band != economy.command_band
+            || policy.command.transition_cycle > strategic.cycle()
+        {
+            return Err(RuntimeError::InvalidUnitPolicy(unit.combat.id));
+        }
+    }
+    Ok(())
+}
+
 fn validate_unit_policy(
     policy: &RuntimeUnitPolicy,
     territory: &TerritoryControl,
@@ -2052,6 +2607,23 @@ fn validate_unit_policy(
     {
         return Err(RuntimeError::InvalidUnitPolicy(policy.unit_id));
     }
+    let command = policy.command;
+    let expected_refusal = command.discipline < crate::economy::command_refusal_share(command.band);
+    let expected_return = matches!(command.band, CommandBand::Breakdown | CommandBand::Mutiny);
+    if !command.discipline.is_finite()
+        || !(0.0..1.0).contains(&command.discipline)
+        || command.refuses_offense != expected_refusal
+        || command.return_home != expected_return
+        || command.self_defense_only != (command.band == CommandBand::Mutiny)
+        || (command.home_target.is_some() && !command.return_home)
+        || command.home_target.is_some_and(|target| {
+            target.cell >= territory.width() * territory.height()
+                || !target.lat.is_finite()
+                || !target.lng.is_finite()
+        })
+    {
+        return Err(RuntimeError::InvalidUnitPolicy(policy.unit_id));
+    }
     let Some(influence) = &policy.influence else {
         return Ok(());
     };
@@ -2069,6 +2641,9 @@ fn validate_unit_policy(
             .browser_temporal_seed
             .is_some_and(|seed| !seed.is_finite())
     {
+        return Err(RuntimeError::InvalidUnitPolicy(policy.unit_id));
+    }
+    if influence.refuses_offense != command.refuses_offense {
         return Err(RuntimeError::InvalidUnitPolicy(policy.unit_id));
     }
     for country in influence
@@ -2383,7 +2958,7 @@ mod tests {
     use crate::{
         battlefield::{BattlefieldConfig, CountryBattlefieldPrimitives},
         combat::{CombatConfig, CombatEvent, CombatLayer, CombatUnit, UnitKind},
-        economy::{EconomySeed, create_economy_state},
+        economy::{CommandBand, EconomySeed, create_economy_state},
         production::{PRODUCTION_SCHEMA_VERSION, ProductionCountry, ScenarioProductionCounters},
         simulation::{SimulationConfig, SimulationUnit},
         territory::{CellStateUpdate, TerritoryConfig, TerritoryMaps},
@@ -2468,6 +3043,18 @@ mod tests {
         let casualties = next_casualties(&BTreeMap::new(), &[(1, 10), (2, 20)], &snapshot);
 
         assert_eq!(casualties, BTreeMap::from([(10, 3.0), (20, 7.0)]));
+    }
+
+    #[test]
+    fn attrition_land_totals_use_committed_country_control_and_directed_hostility() {
+        let runtime = fixture(0, false);
+        let totals = hostile_controlled_land_by_side(
+            &runtime.latest.territory_snapshot,
+            runtime.territory.country_to_side(),
+            &[0, 1, 0, 0],
+            2,
+        );
+        assert_eq!(totals, vec![4.0, 0.0]);
     }
 
     fn fixture(tick: u64, collapsed_second_side: bool) -> NativeRuntime {
@@ -2745,13 +3332,25 @@ mod tests {
             .unwrap()
             .combat
             .lng = -90.0;
+        let pre_step_strength = formation_strength(
+            &runtime
+                .simulation
+                .units
+                .iter()
+                .find(|unit| unit.combat.id == 1)
+                .unwrap()
+                .combat,
+        );
         runtime.step().unwrap();
         let flat = &runtime.unit_policies[&1];
         assert_eq!(flat.ai.movement.terrain_speed_multiplier, 1.0);
         assert_eq!(flat.ai.combat.dealt_multiplier, 1.0);
         assert_eq!(flat.ai.combat.taken_multiplier, 1.0);
         assert_eq!(flat.influence.as_ref().unwrap().radius, 0.4);
-        assert_eq!(flat.influence.as_ref().unwrap().delta, 0.18);
+        assert_eq!(
+            flat.influence.as_ref().unwrap().delta,
+            0.18 * pre_step_strength
+        );
     }
 
     #[test]
@@ -2822,7 +3421,7 @@ mod tests {
             .encirclement_radius = 90.0;
 
         let staged = runtime
-            .stage_battlefield_tick(1, 1, &runtime.territory)
+            .stage_battlefield_tick(1, 1, &runtime.territory, &[4.0, 4.0])
             .unwrap()
             .unwrap();
 
@@ -3168,6 +3767,41 @@ mod tests {
     }
 
     #[test]
+    fn deploying_live_units_preserve_momentum_and_encirclement_history() {
+        let mut runtime = with_live_battlefield(fixture(0, false), vec![0.0; 8]);
+        runtime
+            .unit_policies
+            .get_mut(&1)
+            .unwrap()
+            .ai
+            .deploy_until_tick = 1;
+        runtime.simulation.units[0].combat.victory_boost_ticks = 5;
+        runtime
+            .battlefield
+            .as_mut()
+            .unwrap()
+            .units
+            .get_mut(&1)
+            .unwrap()
+            .encircled_ticks = 77;
+
+        runtime.step().unwrap();
+
+        assert_eq!(runtime.simulation.units[0].combat.victory_boost_ticks, 5);
+        assert_eq!(
+            runtime
+                .battlefield
+                .as_ref()
+                .unwrap()
+                .units
+                .get(&1)
+                .unwrap()
+                .encircled_ticks,
+            77
+        );
+    }
+
+    #[test]
     fn garrison_excluded_units_hold_without_consuming_front_capacity() {
         let mut runtime = fixture(0, false);
         runtime.config.front_refresh_ticks = 1;
@@ -3266,12 +3900,126 @@ mod tests {
                 &RuntimeUnitPolicy {
                     unit_id: 1,
                     ai: UnitAiPolicy::default(),
+                    command: UnitCommandPolicy::paid(1.0, 1),
                     influence: Some(policy),
                 },
                 &runtime.territory,
             ),
             Err(RuntimeError::InvalidUnitPolicy(1))
         ));
+    }
+
+    #[test]
+    fn strategic_band_transition_updates_live_unit_policy_and_clears_front_memory() {
+        let mut runtime = fixture(PAY_CYCLE_TICKS - 1, false);
+        let mut economies = runtime
+            .strategic
+            .economies()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let economy = economies
+            .iter_mut()
+            .find(|economy| economy.country_id == 1)
+            .unwrap();
+        economy.base_income = 0.0;
+        economy.income = 0.0;
+        economy.treasury = 0.0;
+        economy.arrears_cycles = 2.0;
+        economy.command_band = CommandBand::Unpaid;
+        economy.last_event_band = CommandBand::Unpaid;
+        runtime.strategic = StrategicSimulation::restore(0, economies, []).unwrap();
+
+        let policy = runtime.unit_policies.get_mut(&1).unwrap();
+        policy.command = UnitCommandPolicy {
+            band: CommandBand::Unpaid,
+            discipline: 0.1,
+            refuses_offense: true,
+            return_home: false,
+            self_defense_only: false,
+            home_target: None,
+            transition_cycle: 0,
+        };
+        policy.influence.as_mut().unwrap().refuses_offense = true;
+        runtime.prior_objective_by_unit.insert(1, 1);
+
+        let published = runtime.step().unwrap();
+        let policy = runtime.unit_policies.get(&1).unwrap();
+        assert_eq!(policy.command.band, CommandBand::Breakdown);
+        assert!(policy.command.refuses_offense);
+        assert!(policy.command.return_home);
+        assert!(!policy.command.self_defense_only);
+        assert_eq!(policy.command.transition_cycle, 1);
+        assert_eq!(policy.command.home_target.unwrap().cell, 0);
+        assert!(policy.influence.as_ref().unwrap().refuses_offense);
+        assert!(!runtime.prior_objective_by_unit.contains_key(&1));
+        assert_eq!(
+            published.strategic_snapshot.as_ref().unwrap().countries[0]
+                .economy
+                .command_band,
+            CommandBand::Breakdown
+        );
+
+        let before_lng = published
+            .frame_snapshot
+            .units
+            .iter()
+            .find(|unit| unit.id == 1)
+            .unwrap()
+            .lng;
+        let next = runtime.step().unwrap();
+        let after_lng = next
+            .frame_snapshot
+            .units
+            .iter()
+            .find(|unit| unit.id == 1)
+            .unwrap()
+            .lng;
+        assert!(after_lng < before_lng);
+        assert!(next.counters.ai.hold_orders >= 1);
+    }
+
+    #[test]
+    fn restore_hydrates_missing_legacy_return_home_target() {
+        let mut source = fixture(0, false);
+        let mut state = source.checkpoint_state().unwrap();
+        let economy = state
+            .economies
+            .iter_mut()
+            .find(|economy| economy.country_id == 1)
+            .unwrap();
+        economy.arrears_cycles = 3.0;
+        economy.command_band = CommandBand::Breakdown;
+        economy.last_event_band = CommandBand::Breakdown;
+        let policy = state
+            .unit_policies
+            .iter_mut()
+            .find(|policy| policy.unit_id == 1)
+            .unwrap();
+        policy.command = UnitCommandPolicy {
+            band: CommandBand::Breakdown,
+            discipline: 0.1,
+            refuses_offense: true,
+            return_home: true,
+            self_defense_only: false,
+            home_target: None,
+            transition_cycle: 0,
+        };
+        policy.influence.as_mut().unwrap().refuses_offense = true;
+
+        let mut resumed =
+            NativeRuntime::new(state.runtime_config, runtime_checkpoint(state)).unwrap();
+        let target = resumed
+            .unit_policies
+            .get(&1)
+            .unwrap()
+            .command
+            .home_target
+            .unwrap();
+        assert_eq!(target.cell, 0);
+        let before_lng = resumed.simulation.units[0].combat.lng;
+        resumed.step().unwrap();
+        assert!(resumed.simulation.units[0].combat.lng < before_lng);
     }
 
     #[test]

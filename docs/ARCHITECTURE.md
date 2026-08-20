@@ -45,7 +45,10 @@ browser runtime's shared mutable `main.js` structure.
 11. Resolve the bounded live battlefield policy carried by optional v2 state:
     current terrain/city/control context, encirclement combat and retreat
     modifiers, local support/cohesion/repulsion, and pre-combat influence
-    eligibility.
+    eligibility, plus browser-parity attrition as an atomic damage batch.
+12. Feed settled command bands back into live per-unit policy: refusal cohorts,
+    return-home/self-defense orders, influence eligibility, and front/assignment
+    invalidation.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -225,13 +228,29 @@ suppressed on the following tick. Old checkpoints without the block keep their
 frozen resolved-policy semantics.
 
 This resolver is deliberately narrower than the complete browser tick.
-Encirclement history feeds combat and retreat modifiers, but browser
-encirclement attrition and supply-cutoff damage are not applied yet. Local
-repulsion does not yet suppress separation for units belonging to the same task
-force. Strategic command-band changes are settled, but they do not yet refresh
-the per-unit `refuses_offense` flag or corresponding resolved order policy.
-Influence cohort scheduling/frontier diffusion and live war-phase/posture
-transitions are also omitted.
+Encirclement history feeds combat, retreat, and attrition; sea exposure,
+supply collapse, and encirclement damage are calculated per unit after staged
+influence and committed through one validated batch before AI and combat. The batch is an intentional
+ordering adaptation: the browser's reverse unit loop can interleave attrition
+mutation with later unit planning, while native computes all damage from one
+pre-tick image and applies it atomically so a later failure can roll back the
+whole step.
+
+At a 600-tick pay boundary, `StrategicSimulation` settles treasuries and bands
+before native stages desertion/capitulation effects. Native then resolves the
+new band against every surviving unit, updates refusal/return-home/self-defense
+and influence gates, and clears the affected unit's objective and assignment
+priors. These changes are committed with the strategic result at the end of
+the current step and are consumed by the next native tick. Breakdown/mutiny
+home targets use a controlled capital, with the first controlled land cell in
+stable row-major order as fallback; this replaces the browser's RNG reservoir
+fallback with a replay-safe choice.
+
+Remaining omissions are supply-collapse reactions that rebuild task-force
+intent, naval exile/recovery RNG, task-force identity-aware repulsion,
+influence cohort scheduling/frontier diffusion, and live war-phase/posture
+transitions. Air/naval simulation and full gameplay/UI parity are also outside
+this slice.
 
 The native runtime advances `frame` once per successful logical step. The
 browser can run multiple logical subticks before advancing its RAF-owned
@@ -373,16 +392,15 @@ publication model for cities, frontlines, labels, and effects.
 14. Recompute live battlefield terrain, urban, encirclement, support,
     concentration, cohesion, repulsion, and active-combat influence policy.
     **Complete for the bounded optional-v2/native-bootstrap resolver; browser
-    attrition and supply-cutoff damage, task-force-aware repulsion suppression,
-    command-band-to-unit policy refresh, influence cohorts/frontier diffusion,
-    and live phase/posture remain pending. Older checkpoints intentionally
-    retain frozen-policy behavior.**
+    task-force-aware repulsion suppression, influence cohorts/frontier
+    diffusion, and live phase/posture remain pending. Older checkpoints
+    intentionally retain frozen-policy behavior.**
 15. Native UI/editor/community parity remains later work after the remaining
     simulation boundaries are chosen and measured.
 
 Browser influence cohort scheduling/frontier diffusion, live war-phase/posture
-transitions, encirclement attrition and supply-cutoff damage, task-force-aware
-repulsion suppression, command-band-to-unit order-policy refresh, air/naval
+transitions, task-force-aware repulsion suppression, naval exile/recovery RNG,
+air/naval
 simulation, the full gameplay HUD, map editor, online/community features, and
 satellite-map parity are still outside the native port. The migrated kernel and
 handoff contracts do not imply exact full-browser tick parity.
