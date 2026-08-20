@@ -9,7 +9,17 @@ if [[ ! -f "$web_root/src/scenario-codec.js" ]]; then
 	exit 1
 fi
 
+if [[ ! -f "$web_root/scripts/native-runtime-checkpoint-v2-smoke.mjs" ]]; then
+	printf 'Modern Wars checkpoint v2 smoke test not found at %s\n' "$web_root" >&2
+	exit 1
+fi
+
+node "$web_root/scripts/native-runtime-checkpoint-smoke.mjs"
+node "$web_root/scripts/native-runtime-checkpoint-v2-smoke.mjs"
+
 cargo build --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-core committed_state_restore
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v2
 
 scenarios=(
 	"world-map-2022-v2.mwsc.gz"
@@ -103,7 +113,7 @@ fi
 
 if ! jq -e '
 	.schema == "native-runtime-checkpoint-v1"
-	and .runtimeSchema == "native-runtime-v1"
+	and .runtimeSchema == "native-runtime-v2"
 	and .checkpointBoundary.kind == "baselineReplay"
 	and .checkpointBoundary.resumable == false
 	and .requestedSteps == 3

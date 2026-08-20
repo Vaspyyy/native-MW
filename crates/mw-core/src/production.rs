@@ -638,6 +638,18 @@ pub fn derive_strategic_cycle_input(
 
     let active_sides = active_sides.into_iter().collect::<Vec<_>>();
     counters.active_sides = active_sides.len();
+    let capitulation_active_sides = active_sides
+        .iter()
+        .copied()
+        .filter(|&left| {
+            active_sides.iter().copied().any(|right| {
+                left != right
+                    && source.hostility_matrix
+                        [usize::from(left) * source.side_count + usize::from(right)]
+                        == 1
+            })
+        })
+        .collect::<Vec<_>>();
     let mut active_hostile_pairs = Vec::new();
     for (position, &left) in active_sides.iter().enumerate() {
         for &right in &active_sides[position + 1..] {
@@ -663,6 +675,7 @@ pub fn derive_strategic_cycle_input(
             occupations,
             active_sides,
             active_hostile_pairs,
+            capitulation_active_sides: Some(capitulation_active_sides),
         },
         counters,
     })
@@ -1276,6 +1289,7 @@ mod tests {
 
         assert_eq!(output.input.active_sides, [0, 1]);
         assert_eq!(output.input.active_hostile_pairs, [(0, 1)]);
+        assert_eq!(output.input.capitulation_active_sides, Some(vec![0]));
         assert_eq!(output.input.countries[0].unit_count, 2);
         assert_eq!(output.input.countries[0].payroll_due, 2.5);
         assert_eq!(output.input.countries[1].unit_count, 1);

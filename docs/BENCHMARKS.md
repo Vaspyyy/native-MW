@@ -241,6 +241,15 @@ capitulation, desertion, conflict resolution, duplicate/regressing replay
 guards, stable territory markers, and errors proving that a failed cycle leaves
 economy, occupation, cycle, and snapshot state unchanged.
 
+`NativeRuntime` now consumes those bounded commands in-process: desertion is
+applied before capitulated-country unit removal, surrender allocation transfers
+the live controller/influence planes and creates an occupation, and conflict
+resolution publishes a clean terminal state. Victim-by-attacker personnel-loss
+attribution is accumulated alongside country casualty totals and feeds the
+deterministic allocation. No new timing is claimed for these consequence paths;
+the table above measures the existing 100-cycle `StrategicSimulation` workload,
+which deliberately emits no desertion or capitulation commands.
+
 Reproduce the workload:
 
 ```bash
@@ -254,11 +263,11 @@ node scripts/js-strategic-cycle-reference.mjs "$strategic_fixture" bench --repea
 
 The production runtime benchmark covers the entire migrated orchestration
 slice in one owned process: production front refresh, AI contact/order
-resolution, tactical movement/combat, casualty accounting, territory influence
-and census, strategic pay-cycle derivation/settlement, immutable snapshot
-publication, and FIFO render-delta draining. Scenario read/decompression,
-production derivation, checkpoint validation, and runtime construction are
-outside the timed region.
+resolution, tactical movement/combat, total and victim-by-attacker casualty
+accounting, territory influence and census, strategic pay-cycle
+derivation/settlement, immutable snapshot publication, and FIFO render-delta
+draining. Scenario read/decompression, production derivation, checkpoint
+validation, and runtime construction are outside the timed region.
 
 The generated full-cap workload contains 4,800 units (2,400 per side) spread
 along the real eastern Russia-China front in the Modern 2022 MWSC scenario. It
@@ -320,12 +329,16 @@ arrived, to the newest snapshot. Teardown explicitly stops and joins the
 worker; initialization, worker, render, panic, and headless validation failures
 exit nonzero.
 
-The report also publishes milliseconds per tick, completed steps, gate state,
-render updates drained, and deterministic final-state checksums. The benchmark
-fails if two untimed fresh executions diverge or if the requested fresh sample
-hits the strategic-effects gate. A persistent run never acknowledges that
-gate silently: any desertion, surrender, or conflict-resolution command ends
-the available persistent sample.
+The report also publishes milliseconds per tick, completed steps, terminal
+state, render updates drained, and deterministic final-state checksums. The
+benchmark fails if two untimed fresh executions diverge or if the requested
+sample cannot remain runnable for its full step count. Desertion and surrender
+commands are now applied during the pay cycle and do not end a sample. A
+resolved conflict deliberately ends later stepping after its final publication;
+a legacy checkpoint already containing unapplied strategic commands still
+trips the safety gate rather than being acknowledged silently. The measured
+full-cap fixture stays `running`, so the table does not claim timings for
+capitulation allocation or conflict termination.
 
 Reproduce production inspection, the canonical deterministic replay, and the
 4,800-unit workload:
@@ -340,8 +353,8 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported `postStartWar` checkpoint in the production
-viewer or validate an exact number of steps without a window:
+Run an exact browser-exported v1 `postStartWar` or v2 `midWar` checkpoint in the
+production viewer, or validate steps without a window:
 
 ```bash
 checkpoint=/path/to/native-runtime-checkpoint.json
@@ -349,14 +362,30 @@ target/release/mw-native --runtime-checkpoint "$checkpoint" "$scenario"
 target/release/mw-native --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
 ```
 
-`postStartWar` is the separate production-resumable checkpoint boundary. It is
-accepted only at tick/frame/strategic-cycle zero with exact RLE land,
-world-control, and de-jure maps, zero casualties, no occupations, and
-deployment-adjusted starting economies. The native runtime recomputes the
+V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
+exact RLE land, world-control, and de-jure maps, zero casualties, no
+occupations, and deployment-adjusted starting economies. Its strict contract
+is unchanged, and v1 remains the browser export default.
+
+V2 `midWar` is requested explicitly with
+`window.nativeRuntimeCheckpoint({ version: 2, steps })` after simulation has
+advanced. It is a quiescent save barrier: the browser flushes territory census
+work and rejects an active or dirty census. The checkpoint preserves exact
+Float32 bits for occupation and every side-influence plane, current control,
+primary/dominant attribution, territory revisions, the committed census,
+occupations, and nested victim-by-attacker casualties. Immutable baseline
+geography is still carried and used for production derivation before the live
+territory overlay is restored. V2 encoding/decoding and restore are outside the
+timed benchmark region, and no v2 performance number is claimed here.
+
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2
+`midWar` while rejecting `baselineReplay`. The native runtime recomputes the
 browser's logical-tick influence ramp and deterministic radius/delta noise from
 the exported unit seed. Other terrain-, urban-, cohesion-, and live-state
 modifiers are resolved at handoff and become native-owned inputs; this is a
 production boundary, not a claim that the remaining browser tick has already
-been ported. Both `mw-native` production modes require this exact-geography
-`postStartWar` boundary and reject `baselineReplay`. Map-only viewing and the
-small scenario-derived `--demo-units` runtime remain separate modes.
+been ported. A v2 restore rebuilds private territory summaries and starts a
+fresh deterministic native front-planning boundary; partial census work,
+render queues, and prior front assignments are not serialized. Map-only
+viewing and the small scenario-derived `--demo-units` runtime remain separate
+modes.

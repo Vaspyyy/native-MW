@@ -1,6 +1,7 @@
 //! Deterministic, window-free validation of the production runtime worker.
 
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -9,7 +10,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use mw_checkpoint::native_runtime::load_runtime_checkpoint;
 use mw_core::{
-    CombatEvent, CombatLayer, RuntimeSnapshot, RuntimeState, TerritoryRenderUpdate, UnitKind,
+    CombatEvent, CombatLayer, ConflictResolutionKind, RuntimeSnapshot, RuntimeState,
+    TerritoryRenderUpdate, UnitKind,
 };
 use serde_json::json;
 
@@ -18,16 +20,17 @@ use crate::{
     runtime_worker::{RuntimeWorker, RuntimeWorkerStatus},
 };
 
-const HEADLESS_SCHEMA: &str = "mw-native-headless-v1";
-const EXPECTED_CHECKPOINT_BOUNDARY: &str = "postStartWar";
+const HEADLESS_SCHEMA: &str = "mw-native-headless-v2";
+const RESUMABLE_CHECKPOINT_BOUNDARIES: [&str; 2] = ["postStartWar", "midWar"];
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MIN_WATCHDOG: Duration = Duration::from_secs(30);
 const MAX_WATCHDOG: Duration = Duration::from_secs(24 * 60 * 60);
 const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Load a strict production checkpoint, execute exactly `steps` worker ticks, and print a
-/// deterministic report. This path deliberately constructs no window or GPU state.
+/// Load a strict production checkpoint, execute up to `steps` worker ticks, and print a
+/// deterministic report. A resolved conflict ends cleanly before that cap. This path deliberately
+/// constructs no window or GPU state.
 pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
     ensure!(steps > 0, "headless worker steps must be greater than zero");
     let checkpoint_path = options
@@ -47,8 +50,8 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         loaded.checkpoint_boundary
     );
     ensure!(
-        loaded.checkpoint_boundary == EXPECTED_CHECKPOINT_BOUNDARY,
-        "headless runtime requires a {EXPECTED_CHECKPOINT_BOUNDARY} checkpoint, got {}",
+        RESUMABLE_CHECKPOINT_BOUNDARIES.contains(&loaded.checkpoint_boundary),
+        "headless runtime requires a postStartWar or midWar checkpoint, got {}",
         loaded.checkpoint_boundary
     );
     ensure!(
@@ -64,10 +67,10 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
     );
     let initial_tick = initial.tick;
     let initial_frame = initial.frame;
-    let expected_final_tick = initial_tick
+    initial_tick
         .checked_add(steps)
         .context("requested headless steps overflow the runtime tick")?;
-    let expected_final_frame = initial_frame
+    initial_frame
         .checked_add(steps)
         .context("requested headless steps overflow the runtime frame")?;
 
@@ -80,12 +83,23 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
     .context("failed to start the native runtime worker")?;
 
     let watchdog = watchdog_duration(options.runtime_tick_interval, steps);
-    let outcome = monitor_worker(&worker, steps, watchdog);
+    let outcome = monitor_worker(&worker, steps, initial_tick, initial_frame, watchdog);
     let joined = worker.stop_and_join();
     if joined.is_err() {
         bail!("native runtime worker panicked while joining");
     }
     let completion = outcome?;
+    ensure!(
+        completion.completed_steps <= steps,
+        "headless worker completed {} steps, exceeding its requested limit of {steps}",
+        completion.completed_steps
+    );
+    let expected_final_tick = initial_tick
+        .checked_add(completion.completed_steps)
+        .context("completed headless steps overflow the runtime tick")?;
+    let expected_final_frame = initial_frame
+        .checked_add(completion.completed_steps)
+        .context("completed headless steps overflow the runtime frame")?;
 
     ensure!(
         completion.final_snapshot.tick == expected_final_tick,
@@ -125,12 +139,13 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
                 "units": units,
                 "territoryUpdates": completion.territory_updates,
                 "joined": true,
+                "termination": completion.reason.as_str(),
                 "checksum": checksum,
             }))?
         );
     } else {
         println!(
-            "{HEADLESS_SCHEMA} {boundary}: {}/{} steps, tick {}->{}, frame {}->{}, {} units, {} territory updates, joined, checksum {}",
+            "{HEADLESS_SCHEMA} {boundary}: {}/{} steps, tick {}->{}, frame {}->{}, {} units, {} territory updates, {}, joined, checksum {}",
             completion.completed_steps,
             steps,
             initial_tick,
@@ -139,6 +154,7 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
             completion.final_snapshot.frame,
             units,
             completion.territory_updates,
+            completion.reason.as_str(),
             checksum,
         );
     }
@@ -150,11 +166,29 @@ struct WorkerCompletion {
     final_snapshot: Arc<RuntimeSnapshot>,
     territory_updates: usize,
     update_checksum: Fnv64,
+    reason: CompletionReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionReason {
+    StepLimit,
+    ConflictResolved,
+}
+
+impl CompletionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StepLimit => "stepLimit",
+            Self::ConflictResolved => "conflictResolved",
+        }
+    }
 }
 
 fn monitor_worker(
     worker: &RuntimeWorker,
     requested_steps: u64,
+    initial_tick: u64,
+    initial_frame: u64,
     watchdog: Duration,
 ) -> Result<WorkerCompletion> {
     let started = Instant::now();
@@ -187,20 +221,54 @@ fn monitor_worker(
                     );
                     let final_snapshot = latest_snapshot
                         .context("worker completed without publishing a runtime snapshot")?;
+                    let reason = completion_reason(final_snapshot.state)?;
                     return Ok(WorkerCompletion {
                         completed_steps: steps,
                         final_snapshot,
                         territory_updates,
                         update_checksum,
+                        reason,
                     });
                 }
                 RuntimeWorkerStatus::Stopped => {
                     bail!("native runtime worker stopped before its exact step limit")
                 }
                 RuntimeWorkerStatus::Terminal(state) => {
-                    bail!(
-                        "native runtime reached terminal state {state:?} before its exact step limit"
-                    )
+                    drain_worker(
+                        worker,
+                        &mut latest_snapshot,
+                        &mut territory_updates,
+                        &mut update_checksum,
+                    );
+                    let final_snapshot = latest_snapshot
+                        .context("terminal worker stopped without publishing its final snapshot")?;
+                    ensure!(
+                        final_snapshot.state == state,
+                        "terminal worker status does not match its final snapshot"
+                    );
+                    let reason = completion_reason(state)?;
+                    let completed_ticks = final_snapshot.tick.checked_sub(initial_tick).context(
+                        "terminal worker final tick precedes its initial checkpoint tick",
+                    )?;
+                    let completed_frames =
+                        final_snapshot.frame.checked_sub(initial_frame).context(
+                            "terminal worker final frame precedes its initial checkpoint frame",
+                        )?;
+                    ensure!(
+                        completed_ticks == completed_frames,
+                        "terminal worker advanced {completed_ticks} ticks but {completed_frames} frames"
+                    );
+                    ensure!(
+                        completed_ticks < requested_steps,
+                        "terminal worker reported early completion after {completed_ticks} steps, but its limit was {requested_steps}"
+                    );
+                    return Ok(WorkerCompletion {
+                        completed_steps: completed_ticks,
+                        final_snapshot,
+                        territory_updates,
+                        update_checksum,
+                        reason,
+                    });
                 }
                 RuntimeWorkerStatus::Failed(error) => {
                     bail!("native runtime worker failed before its exact step limit: {error}")
@@ -218,6 +286,17 @@ fn monitor_worker(
             );
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn completion_reason(state: RuntimeState) -> Result<CompletionReason> {
+    match state {
+        RuntimeState::Running => Ok(CompletionReason::StepLimit),
+        RuntimeState::ConflictResolved { .. } => Ok(CompletionReason::ConflictResolved),
+        RuntimeState::AwaitingStrategicEffects { .. } => {
+            bail!("native runtime stopped while awaiting unapplied strategic effects")
+        }
+        RuntimeState::Poisoned => bail!("native runtime stopped in a poisoned state"),
     }
 }
 
@@ -299,6 +378,24 @@ fn checksum_runtime_snapshot(checksum: &mut Fnv64, snapshot: &RuntimeSnapshot) -
             checksum.write_bool(conflict_resolution);
         }
         RuntimeState::Poisoned => checksum.write_u64(2),
+        RuntimeState::ConflictResolved {
+            cycle,
+            tick,
+            resolution,
+        } => {
+            checksum.write_u64(3);
+            checksum.write_u64(cycle);
+            checksum.write_u64(tick);
+            checksum.write_u64(match resolution.kind {
+                ConflictResolutionKind::WhitePeace => 0,
+                ConflictResolutionKind::FullCapitulation => 1,
+            });
+            checksum.write_bool(resolution.winner_side.is_some());
+            if let Some(winner_side) = resolution.winner_side {
+                checksum.write_u16(winner_side);
+            }
+            checksum.write_bool(resolution.stop_simulation);
+        }
     }
 
     let frame = &snapshot.frame_snapshot;
@@ -369,7 +466,23 @@ fn checksum_runtime_snapshot(checksum: &mut Fnv64, snapshot: &RuntimeSnapshot) -
         checksum.write_bool(false);
     }
     checksum.write_bytes(&serde_json::to_vec(snapshot.casualty_totals.as_ref())?);
+    checksum_casualties_by_victim(checksum, snapshot.casualties_by_victim.as_ref());
     Ok(())
+}
+
+fn checksum_casualties_by_victim(
+    checksum: &mut Fnv64,
+    casualties_by_victim: &BTreeMap<u16, BTreeMap<u16, f64>>,
+) {
+    checksum.write_u64(casualties_by_victim.len() as u64);
+    for (&victim_id, attackers) in casualties_by_victim {
+        checksum.write_u16(victim_id);
+        checksum.write_u64(attackers.len() as u64);
+        for (&attacker_id, &casualties) in attackers {
+            checksum.write_u16(attacker_id);
+            checksum.write_f64(casualties);
+        }
+    }
 }
 
 fn checksum_combat_event(checksum: &mut Fnv64, event: &CombatEvent) {
@@ -459,6 +572,7 @@ impl Fnv64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mw_core::ConflictResolutionPlan;
 
     #[test]
     fn watchdog_has_a_floor_and_scales_without_overflow() {
@@ -480,5 +594,55 @@ mod tests {
 
         assert_eq!(left.finish(), right.finish());
         assert_ne!(left.finish(), reordered.finish());
+    }
+
+    #[test]
+    fn resolved_conflict_is_a_clean_headless_completion() {
+        let state = RuntimeState::ConflictResolved {
+            cycle: 4,
+            tick: 2_400,
+            resolution: ConflictResolutionPlan {
+                kind: ConflictResolutionKind::FullCapitulation,
+                winner_side: Some(1),
+                stop_simulation: true,
+            },
+        };
+
+        assert_eq!(
+            completion_reason(state).unwrap(),
+            CompletionReason::ConflictResolved
+        );
+        assert!(
+            completion_reason(RuntimeState::AwaitingStrategicEffects {
+                cycle: 4,
+                tick: 2_400,
+                desertion_commands: 0,
+                surrender_commands: 1,
+                conflict_resolution: false,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_casualty_checksum_is_sorted_and_value_sensitive() {
+        let mut left = BTreeMap::new();
+        left.insert(7, BTreeMap::from([(3, 12.5), (5, 4.0)]));
+        left.insert(2, BTreeMap::from([(7, 8.0)]));
+        let mut same = BTreeMap::new();
+        same.insert(2, BTreeMap::from([(7, 8.0)]));
+        same.insert(7, BTreeMap::from([(5, 4.0), (3, 12.5)]));
+        let mut changed = same.clone();
+        changed.get_mut(&7).unwrap().insert(3, 12.75);
+
+        let mut left_checksum = Fnv64::new();
+        checksum_casualties_by_victim(&mut left_checksum, &left);
+        let mut same_checksum = Fnv64::new();
+        checksum_casualties_by_victim(&mut same_checksum, &same);
+        let mut changed_checksum = Fnv64::new();
+        checksum_casualties_by_victim(&mut changed_checksum, &changed);
+
+        assert_eq!(left_checksum.finish(), same_checksum.finish());
+        assert_ne!(left_checksum.finish(), changed_checksum.finish());
     }
 }

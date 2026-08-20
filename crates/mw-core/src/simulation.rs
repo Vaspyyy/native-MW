@@ -6,18 +6,22 @@
 //! executes units in reverse stable-storage order, commits combat immediately,
 //! defers removal until the end, and publishes an ID-sorted immutable snapshot.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use thiserror::Error;
 
 use crate::{
     combat::{
-        CombatConfig, CombatContext, CombatError, CombatEvent, CombatUnit, UnitKind,
+        CombatConfig, CombatContext, CombatError, CombatEvent, CombatUnit, UNIT_HEALTH, UnitKind,
         formation_strength, resolve_direct_engagement_prevalidated,
         resolve_proximity_contact_prevalidated, wrapped_longitude_delta,
     },
     direction::HostilityMatrix,
     movement::{MovementError, MovementFactors, MovementInput, MovementState, integrate_unit_step},
+    strategic::DesertionCommand,
     tactical::{
         NeighborOptions, SideKey, TacticalGrid, TacticalGridError, TacticalUnit,
         tactical_cell_coords,
@@ -172,6 +176,14 @@ pub struct TickCounters {
     pub abandoned_orders: usize,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DesertionOutcome {
+    /// Complete post-desertion unit storage, preserving stable runtime order.
+    pub updated_units: Arc<[SimulationUnit]>,
+    pub affected_ids: Arc<[u64]>,
+    pub removed_ids: Arc<[u64]>,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum SimulationError {
     #[error("invalid simulation config")]
@@ -184,6 +196,12 @@ pub enum SimulationError {
     InvalidInactiveUnits,
     #[error("invalid unit or order numeric data")]
     NonFiniteInput,
+    #[error("duplicate desertion command for country id {0}")]
+    DuplicateDesertionCountry(u16),
+    #[error("desertion rate must be finite and between zero and one")]
+    InvalidDesertionRate,
+    #[error("capitulated country ids must be positive and unique")]
+    InvalidCapitulatedCountries,
     #[error("invalid hostility matrix")]
     InvalidHostility,
     #[error("invalid side {0}")]
@@ -255,6 +273,113 @@ impl Simulation {
 
     pub fn latest_snapshot(&self) -> Option<&FrameSnapshot> {
         self.latest.as_ref()
+    }
+
+    /// Apply one browser pay-cycle's desertion commands as a single validated mutation.
+    ///
+    /// Every command and the complete resulting unit set are validated before
+    /// `self.units` changes, so an error cannot leak partial attrition.
+    pub fn apply_desertions_atomic(
+        &mut self,
+        commands: &[DesertionCommand],
+    ) -> Result<DesertionOutcome, SimulationError> {
+        self.apply_strategic_unit_consequences_atomic(commands, &[])
+    }
+
+    /// Atomically apply desertion first, then remove every unit belonging to a
+    /// capitulated country, matching the browser's strategic consequence order.
+    pub fn apply_strategic_unit_consequences_atomic(
+        &mut self,
+        commands: &[DesertionCommand],
+        capitulated_country_ids: &[u16],
+    ) -> Result<DesertionOutcome, SimulationError> {
+        let mut rate_by_country = BTreeMap::new();
+        for command in commands {
+            if command.country_id == 0
+                || !command.rate.is_finite()
+                || !(0.0..=1.0).contains(&command.rate)
+            {
+                return Err(SimulationError::InvalidDesertionRate);
+            }
+            if rate_by_country
+                .insert(command.country_id, command.rate)
+                .is_some()
+            {
+                return Err(SimulationError::DuplicateDesertionCountry(
+                    command.country_id,
+                ));
+            }
+        }
+        let capitulated = capitulated_country_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if capitulated.contains(&0) || capitulated.len() != capitulated_country_ids.len() {
+            return Err(SimulationError::InvalidCapitulatedCountries);
+        }
+
+        let mut next_units = Vec::with_capacity(self.units.len());
+        let mut affected_ids = Vec::new();
+        let mut removed_ids = Vec::new();
+        for current in &self.units {
+            let Ok(country_id) = u16::try_from(current.combat.sovereign) else {
+                next_units.push(current.clone());
+                continue;
+            };
+            let rate = rate_by_country.get(&country_id).copied().unwrap_or(0.0);
+            if rate <= 0.0 && !capitulated.contains(&country_id) {
+                next_units.push(current.clone());
+                continue;
+            }
+
+            let mut unit = current.clone();
+            if rate > 0.0 {
+                unit.combat.health -= (unit.combat.health * rate).max(0.0);
+                if unit.combat.kind == UnitKind::Armor {
+                    let before = unit.combat.equipment;
+                    let capacity = if unit.combat.max_equipment > 0 {
+                        unit.combat.max_equipment
+                    } else {
+                        before
+                    };
+                    let proportional = ((capacity as f64) * (unit.combat.health / UNIT_HEALTH))
+                        .ceil()
+                        .max(0.0) as u64;
+                    unit.combat.equipment = before.min(proportional);
+                } else {
+                    let before = unit.combat.personnel;
+                    let loss = (before as f64 * rate).min(before as f64);
+                    unit.combat.personnel = ((before as f64 - loss).round().max(0.0)) as u64;
+                }
+                affected_ids.push(unit.combat.id);
+            }
+            if unit.combat.health <= 1.0 || capitulated.contains(&country_id) {
+                unit.combat.personnel = 0;
+                unit.combat.equipment = 0;
+                removed_ids.push(unit.combat.id);
+            } else {
+                next_units.push(unit);
+            }
+        }
+
+        affected_ids.sort_unstable();
+        removed_ids.sort_unstable();
+        validate_unit_slice(&next_units, None)?;
+        self.units = next_units;
+        self.rebuild_unit_index()?;
+        self.tactical_units.clear();
+        self.candidates.clear();
+        self.accepted.clear();
+        self.order_by_unit.clear();
+        self.events.clear();
+        self.removed.clone_from(&removed_ids);
+        self.abandoned.clear();
+        self.latest = None;
+        Ok(DesertionOutcome {
+            updated_units: self.units.clone().into(),
+            affected_ids: affected_ids.into(),
+            removed_ids: removed_ids.into(),
+        })
     }
 
     pub fn step(
@@ -478,32 +603,7 @@ impl Simulation {
     }
 
     fn validate_units(&self, max_sides: Option<usize>) -> Result<(), SimulationError> {
-        for unit in &self.units {
-            let combat = &unit.combat;
-            if combat.side > u64::from(SideKey::MAX)
-                || max_sides.is_some_and(|count| combat.side as usize >= count)
-            {
-                return Err(SimulationError::InvalidSide(combat.side));
-            }
-            if ![
-                combat.lat,
-                combat.lng,
-                combat.health,
-                combat.max_health,
-                combat.quality,
-                unit.dir_lat,
-                unit.dir_lng,
-                unit.ally_weight,
-            ]
-            .into_iter()
-            .all(f64::is_finite)
-                || combat.max_health <= 0.0
-                || unit.ally_weight < 0.0
-            {
-                return Err(SimulationError::NonFiniteInput);
-            }
-        }
-        Ok(())
+        validate_unit_slice(&self.units, max_sides)
     }
 
     fn rebuild_tactical_snapshot(
@@ -597,6 +697,42 @@ impl Simulation {
             abandoned_ids: self.abandoned.clone().into(),
         }
     }
+}
+
+fn validate_unit_slice(
+    units: &[SimulationUnit],
+    max_sides: Option<usize>,
+) -> Result<(), SimulationError> {
+    let mut ids = BTreeSet::new();
+    for unit in units {
+        let combat = &unit.combat;
+        if !ids.insert(combat.id) {
+            return Err(SimulationError::DuplicateUnit(combat.id));
+        }
+        if combat.side > u64::from(SideKey::MAX)
+            || max_sides.is_some_and(|count| combat.side as usize >= count)
+        {
+            return Err(SimulationError::InvalidSide(combat.side));
+        }
+        if ![
+            combat.lat,
+            combat.lng,
+            combat.health,
+            combat.max_health,
+            combat.quality,
+            unit.dir_lat,
+            unit.dir_lng,
+            unit.ally_weight,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+            || combat.max_health <= 0.0
+            || unit.ally_weight < 0.0
+        {
+            return Err(SimulationError::NonFiniteInput);
+        }
+    }
+    Ok(())
 }
 
 fn two_simulation_units_mut(
@@ -1194,5 +1330,103 @@ mod tests {
         assert_eq!(snapshot.units[0].id, 2);
         assert_eq!(snapshot.units[0].personnel, 1_000);
         assert_eq!(snapshot.units[0].victory_boost_ticks, 240);
+    }
+
+    #[test]
+    fn desertion_matches_browser_health_personnel_equipment_and_removal_rules() {
+        let mut infantry = army(1, 0, 0.0, 0.0);
+        infantry.combat.health = 80.0;
+        let mut armor = army(2, 0, 0.0, 1.0);
+        armor.combat.kind = UnitKind::Armor;
+        armor.combat.health = 80.0;
+        armor.combat.personnel = 0;
+        armor.combat.personnel_capacity = 0;
+        armor.combat.equipment = 9;
+        armor.combat.max_equipment = 10;
+        let mut removed = army(3, 0, 0.0, 2.0);
+        removed.combat.health = 2.0;
+        let unaffected = army(4, 1, 0.0, 3.0);
+        let mut simulation = Simulation::new(
+            SimulationConfig::default(),
+            vec![infantry, armor, removed, unaffected.clone()],
+        )
+        .unwrap();
+
+        let outcome = simulation
+            .apply_desertions_atomic(&[DesertionCommand {
+                country_id: 10,
+                rate: 0.5,
+            }])
+            .unwrap();
+
+        assert_eq!(&*outcome.affected_ids, &[1, 2, 3]);
+        assert_eq!(&*outcome.removed_ids, &[3]);
+        assert_eq!(&*outcome.updated_units, simulation.units);
+        assert_eq!(simulation.units.len(), 3);
+        assert_eq!(simulation.units[0].combat.health, 40.0);
+        assert_eq!(simulation.units[0].combat.personnel, 500);
+        assert_eq!(simulation.units[1].combat.health, 40.0);
+        assert_eq!(simulation.units[1].combat.equipment, 4);
+        assert_eq!(simulation.units[2], unaffected);
+        assert!(simulation.latest_snapshot().is_none());
+    }
+
+    #[test]
+    fn invalid_desertion_batch_is_atomic() {
+        let units = vec![army(1, 0, 0.0, 0.0), army(2, 1, 0.0, 1.0)];
+        let mut simulation = Simulation::new(SimulationConfig::default(), units.clone()).unwrap();
+
+        assert!(matches!(
+            simulation.apply_desertions_atomic(&[
+                DesertionCommand {
+                    country_id: 10,
+                    rate: 0.25,
+                },
+                DesertionCommand {
+                    country_id: 10,
+                    rate: 0.5,
+                },
+            ]),
+            Err(SimulationError::DuplicateDesertionCountry(10))
+        ));
+        assert_eq!(simulation.units, units);
+        assert!(matches!(
+            simulation.apply_desertions_atomic(&[DesertionCommand {
+                country_id: 10,
+                rate: f64::NAN,
+            }]),
+            Err(SimulationError::InvalidDesertionRate)
+        ));
+        assert_eq!(simulation.units, units);
+    }
+
+    #[test]
+    fn combined_strategic_unit_application_deserts_before_capitulation_removal() {
+        let mut simulation = Simulation::new(
+            SimulationConfig::default(),
+            vec![army(1, 0, 0.0, 0.0), army(2, 1, 0.0, 1.0)],
+        )
+        .unwrap();
+
+        let outcome = simulation
+            .apply_strategic_unit_consequences_atomic(
+                &[DesertionCommand {
+                    country_id: 10,
+                    rate: 0.25,
+                }],
+                &[10],
+            )
+            .unwrap();
+        assert_eq!(&*outcome.affected_ids, &[1]);
+        assert_eq!(&*outcome.removed_ids, &[1]);
+        assert_eq!(simulation.units.len(), 1);
+        assert_eq!(simulation.units[0].combat.id, 2);
+
+        let before = simulation.units.clone();
+        assert!(matches!(
+            simulation.apply_strategic_unit_consequences_atomic(&[], &[11, 11]),
+            Err(SimulationError::InvalidCapitulatedCountries)
+        ));
+        assert_eq!(simulation.units, before);
     }
 }

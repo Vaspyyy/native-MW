@@ -148,59 +148,57 @@ impl App {
     fn initialize(&mut self, window: Arc<Window>) -> Result<()> {
         let load_started = Instant::now();
         let checkpoint_path = self.runtime_checkpoint_path.clone();
-        let (decoded, mut pending_runtime, demo_border, runtime_label) = if let Some(
-            checkpoint_path,
-        ) =
-            checkpoint_path.as_ref()
-        {
-            let loaded = load_runtime_checkpoint(&self.scenario_path, checkpoint_path)
-                .with_context(|| {
-                    format!(
-                        "failed to load native runtime checkpoint {}",
-                        checkpoint_path.display()
-                    )
-                })?;
-            anyhow::ensure!(
-                loaded.resumable && loaded.checkpoint_boundary == "postStartWar",
-                "mw-native only renders resumable postStartWar checkpoints; {:?} is a synthetic replay boundary",
-                loaded.checkpoint_boundary
-            );
-            anyhow::ensure!(
-                loaded.exact_geography_supplied,
-                "production runtime checkpoint is missing exact geography"
-            );
-            let label = format!(
-                "checkpoint {} ({} units)",
-                checkpoint_path.display(),
-                loaded.unit_count
-            );
-            (loaded.decoded, Some(loaded.runtime), None, Some(label))
-        } else {
-            let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
-            let decoded = decode_mwsc_gzip_file(&self.scenario_path, Some(target))
-                .with_context(|| format!("failed to decode {}", self.scenario_path.display()))?;
-            if self.demo_units_requested {
-                let border = find_demo_border(
-                    &decoded.world_control,
-                    &decoded.land,
-                    decoded.target.width,
-                    decoded.target.height,
-                    decoded.target.grid_res,
-                )
-                .context("--demo-units requires an adjacent-country land border")?;
-                let production = derive_scenario_production(&decoded, &ProductionConfig::default())
-                    .context("failed to derive scenario production data for native runtime")?;
-                let runtime = create_demo_runtime(border, &decoded, production)?;
-                (
-                    decoded,
-                    Some(runtime),
-                    Some(border),
-                    Some("scenario-derived demo".to_owned()),
-                )
+        let (decoded, mut pending_runtime, demo_border, runtime_label) =
+            if let Some(checkpoint_path) = checkpoint_path.as_ref() {
+                let loaded = load_runtime_checkpoint(&self.scenario_path, checkpoint_path)
+                    .with_context(|| {
+                        format!(
+                            "failed to load native runtime checkpoint {}",
+                            checkpoint_path.display()
+                        )
+                    })?;
+                validate_production_checkpoint(
+                    loaded.checkpoint_boundary,
+                    loaded.resumable,
+                    loaded.exact_geography_supplied,
+                )?;
+                let label = format!(
+                    "checkpoint {} ({} units)",
+                    checkpoint_path.display(),
+                    loaded.unit_count
+                );
+                (loaded.decoded, Some(loaded.runtime), None, Some(label))
             } else {
-                (decoded, None, None, None)
-            }
-        };
+                let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
+                let decoded = decode_mwsc_gzip_file(&self.scenario_path, Some(target))
+                    .with_context(|| {
+                        format!("failed to decode {}", self.scenario_path.display())
+                    })?;
+                if self.demo_units_requested {
+                    let border = find_demo_border(
+                        &decoded.world_control,
+                        &decoded.land,
+                        decoded.target.width,
+                        decoded.target.height,
+                        decoded.target.grid_res,
+                    )
+                    .context("--demo-units requires an adjacent-country land border")?;
+                    let production =
+                        derive_scenario_production(&decoded, &ProductionConfig::default())
+                            .context(
+                                "failed to derive scenario production data for native runtime",
+                            )?;
+                    let runtime = create_demo_runtime(border, &decoded, production)?;
+                    (
+                        decoded,
+                        Some(runtime),
+                        Some(border),
+                        Some("scenario-derived demo".to_owned()),
+                    )
+                } else {
+                    (decoded, None, None, None)
+                }
+            };
         log::info!(
             "loaded {} entries into {}x{} in {:.1} ms",
             decoded.entry_count,
@@ -1233,9 +1231,29 @@ fn create_demo_runtime(
             objectives: Vec::new(),
             prior_objective_by_unit: BTreeMap::new(),
             casualties: BTreeMap::new(),
+            casualties_by_victim: BTreeMap::new(),
         },
     )?;
     Ok(runtime)
+}
+
+fn validate_production_checkpoint(
+    checkpoint_boundary: &str,
+    resumable: bool,
+    exact_geography_supplied: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        resumable && matches!(checkpoint_boundary, "postStartWar" | "midWar"),
+        "mw-native only renders resumable postStartWar or midWar checkpoints; {checkpoint_boundary:?} is not a production continuation boundary"
+    );
+    // The strict shared loader requires immutable exact geography for postStartWar and both
+    // immutable geography plus committed live territory for midWar. This flag is the final
+    // handoff assertion that the renderer will never fall back to an approximate scenario map.
+    anyhow::ensure!(
+        exact_geography_supplied,
+        "production runtime checkpoint is missing exact geography or live territory"
+    );
+    Ok(())
 }
 
 fn apply_territory_update_to_grid(
@@ -1653,6 +1671,25 @@ mod tests {
         let next = runtime.step().unwrap();
         assert!(next.counters.front_refreshed);
         assert_eq!(next.counters.front_objectives, 4);
+    }
+
+    #[test]
+    fn production_checkpoint_policy_accepts_both_resumable_boundaries() {
+        validate_production_checkpoint("postStartWar", true, true).unwrap();
+        validate_production_checkpoint("midWar", true, true).unwrap();
+    }
+
+    #[test]
+    fn production_checkpoint_policy_rejects_replays_and_inexact_maps() {
+        let replay = validate_production_checkpoint("baselineReplay", false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(replay.contains("not a production continuation boundary"));
+
+        let inexact = validate_production_checkpoint("midWar", true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(inexact.contains("missing exact geography or live territory"));
     }
 
     #[test]

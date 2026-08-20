@@ -24,6 +24,7 @@ use crate::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
         derive_front_layout,
     },
+    occupation::{OccupationState, required_garrison},
     production::{
         ProductionConfig, ProductionError, ScenarioProduction, StrategicDerivationCounters,
         StrategicDerivationInput, TerritoryCommitMarker, derive_strategic_cycle_input,
@@ -33,16 +34,21 @@ use crate::{
         FrameSnapshot, ResolvedCombatOrder, ResolvedUnitOrder, Simulation, SimulationError,
         TickCounters, TickInput,
     },
-    strategic::{StrategicCounters, StrategicError, StrategicSimulation, StrategicSnapshot},
+    strategic::{
+        ConflictResolutionPlan, PreparedStrategicCycle, StrategicCounters, StrategicError,
+        StrategicSimulation, StrategicSnapshot, SurrenderAllocationInput, SurrenderUnitPosition,
+        plan_surrender_allocation,
+    },
+    surrender::evaluate_global_conflict,
     tactical::SideKey,
     territory::{
-        CensusStepResult, InfluenceApplyResult, InfluenceSource, TerritoryControl, TerritoryError,
-        TerritoryRenderUpdate, TerritorySnapshot,
+        CensusStepResult, InfluenceApplyResult, InfluenceSource, TerritoryCommittedState,
+        TerritoryControl, TerritoryError, TerritoryRenderUpdate, TerritorySnapshot,
     },
     world::WorldGridView,
 };
 
-pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v1";
+pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v2";
 pub const DEFAULT_FRONT_REFRESH_TICKS: u64 = 30;
 pub const DEFAULT_CENSUS_BUDGET: usize = 16_384;
 pub const DEFAULT_CENSUS_FLUSH_CHUNK: usize = 65_536;
@@ -212,6 +218,13 @@ pub enum RuntimeState {
         surrender_commands: usize,
         conflict_resolution: bool,
     },
+    /// The strategic layer resolved the war. The final immutable publication remains renderable,
+    /// but no later simulation step is valid.
+    ConflictResolved {
+        cycle: u64,
+        tick: u64,
+        resolution: ConflictResolutionPlan,
+    },
     /// A post-mutation invariant failed. No new snapshot was published and stepping is blocked.
     Poisoned,
 }
@@ -229,6 +242,9 @@ pub struct RuntimeSnapshot {
     pub counters: RuntimeStepCounters,
     pub pending_render_updates: usize,
     pub casualty_totals: Arc<BTreeMap<u16, f64>>,
+    /// Exact victim -> attacker personnel-loss attribution used by deterministic surrender
+    /// allocation and persisted by mid-war checkpoints.
+    pub casualties_by_victim: Arc<BTreeMap<u16, BTreeMap<u16, f64>>>,
 }
 
 #[derive(Debug, Error)]
@@ -243,6 +259,8 @@ pub enum RuntimeError {
     ClockOverflow,
     #[error("runtime is waiting for strategic effects from cycle {cycle} at tick {tick}")]
     AwaitingStrategicEffects { cycle: u64, tick: u64 },
+    #[error("runtime conflict was resolved in cycle {cycle} at tick {tick}")]
+    ConflictResolved { cycle: u64, tick: u64 },
     #[error("runtime is poisoned after a post-mutation invariant failure")]
     Poisoned,
     #[error("AI planning: {0}")]
@@ -300,6 +318,45 @@ fn next_casualties(
         {
             let country = sovereign_by_unit[index].1;
             *casualties.entry(country).or_default() += event.attacker_personnel_loss as f64;
+        }
+    }
+    casualties
+}
+
+fn next_casualties_by_victim(
+    previous: &BTreeMap<u16, BTreeMap<u16, f64>>,
+    sovereign_by_unit: &[(u64, u16)],
+    after: &FrameSnapshot,
+) -> BTreeMap<u16, BTreeMap<u16, f64>> {
+    let mut casualties = previous.clone();
+    for event in after.events.iter() {
+        let attacker = sovereign_by_unit
+            .binary_search_by_key(&event.attacker_id, |entry| entry.0)
+            .ok()
+            .map(|index| sovereign_by_unit[index].1);
+        let target = sovereign_by_unit
+            .binary_search_by_key(&event.target_id, |entry| entry.0)
+            .ok()
+            .map(|index| sovereign_by_unit[index].1);
+        let Some((attacker, target)) = attacker.zip(target) else {
+            continue;
+        };
+        if attacker == target {
+            continue;
+        }
+        if event.target_personnel_loss > 0 {
+            *casualties
+                .entry(target)
+                .or_default()
+                .entry(attacker)
+                .or_default() += event.target_personnel_loss as f64;
+        }
+        if event.attacker_personnel_loss > 0 {
+            *casualties
+                .entry(attacker)
+                .or_default()
+                .entry(target)
+                .or_default() += event.attacker_personnel_loss as f64;
         }
     }
     casualties
@@ -519,6 +576,7 @@ pub struct RuntimeCheckpoint {
     pub objectives: Vec<FrontObjective>,
     pub prior_objective_by_unit: BTreeMap<u64, u64>,
     pub casualties: BTreeMap<u16, f64>,
+    pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
 }
 
 /// Shared native simulation owner. No mutable kernel state is exposed to renderers.
@@ -539,9 +597,18 @@ pub struct NativeRuntime {
     last_front_refresh_tick: Option<u64>,
     prior_objective_by_unit: BTreeMap<u64, u64>,
     casualties: BTreeMap<u16, f64>,
+    casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     state: RuntimeState,
     latest: Arc<RuntimeSnapshot>,
     render_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
+}
+
+struct StagedStrategicEffects {
+    simulation: Option<Simulation>,
+    territory: Option<TerritoryControl>,
+    removed_ids: Vec<u64>,
+    state: RuntimeState,
+    fronts_invalidated: bool,
 }
 
 impl NativeRuntime {
@@ -577,6 +644,7 @@ impl NativeRuntime {
             &checkpoint.prior_objective_by_unit,
         )?;
         validate_casualties(&checkpoint.casualties, &checkpoint.scenario)?;
+        validate_casualties_by_victim(&checkpoint.casualties_by_victim, &checkpoint.scenario)?;
 
         // A checkpoint may have an in-progress bounded census. Construction finishes it before
         // exposing the first cross-kernel publication.
@@ -624,10 +692,13 @@ impl NativeRuntime {
         let initial_state = strategic_snapshot
             .as_ref()
             .map_or(RuntimeState::Running, |snapshot| {
-                if snapshot.desertions.is_empty()
-                    && snapshot.surrenders.is_empty()
-                    && snapshot.conflict_resolution.is_none()
-                {
+                if let Some(resolution) = snapshot.conflict_resolution {
+                    RuntimeState::ConflictResolved {
+                        cycle: snapshot.cycle,
+                        tick: snapshot.tick,
+                        resolution: resolution.into(),
+                    }
+                } else if snapshot.desertions.is_empty() && snapshot.surrenders.is_empty() {
                     RuntimeState::Running
                 } else {
                     RuntimeState::AwaitingStrategicEffects {
@@ -650,6 +721,7 @@ impl NativeRuntime {
             counters: RuntimeStepCounters::default(),
             pending_render_updates: render_updates.len(),
             casualty_totals: Arc::new(checkpoint.casualties.clone()),
+            casualties_by_victim: Arc::new(checkpoint.casualties_by_victim.clone()),
         });
 
         Ok(Self {
@@ -669,6 +741,7 @@ impl NativeRuntime {
             last_front_refresh_tick: None,
             prior_objective_by_unit: checkpoint.prior_objective_by_unit,
             casualties: checkpoint.casualties,
+            casualties_by_victim: checkpoint.casualties_by_victim,
             state: initial_state,
             latest,
             render_updates,
@@ -706,12 +779,238 @@ impl NativeRuntime {
             .flatten()
     }
 
+    fn stage_strategic_effects(
+        &self,
+        prepared: &mut PreparedStrategicCycle,
+        casualties_by_victim: &BTreeMap<u16, BTreeMap<u16, f64>>,
+    ) -> Result<StagedStrategicEffects, RuntimeError> {
+        let evaluated = prepared.snapshot();
+        if evaluated.surrenders.len() > 1 {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "strategic cycle produced more than one capitulation",
+            ));
+        }
+        let capitulated = evaluated
+            .surrenders
+            .iter()
+            .map(|command| command.country_id)
+            .collect::<Vec<_>>();
+        let mut staged_simulation = if evaluated.desertions.is_empty() && capitulated.is_empty() {
+            None
+        } else {
+            Some(Simulation::new(
+                self.simulation.config(),
+                self.simulation.units.clone(),
+            )?)
+        };
+        let removed_ids = if let Some(simulation) = &mut staged_simulation {
+            simulation
+                .apply_strategic_unit_consequences_atomic(&evaluated.desertions, &capitulated)?
+                .removed_ids
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let mut staged_territory = None;
+        if let Some(command) = evaluated.surrenders.first() {
+            let victim_side = usize::from(command.side);
+            if self.territory.country_to_side().get(&command.country_id) != Some(&victim_side) {
+                return Err(RuntimeError::InvalidCheckpoint(
+                    "capitulating country does not belong to its strategic side",
+                ));
+            }
+            let hostile_attacker_ids = self
+                .territory
+                .country_to_side()
+                .iter()
+                .filter_map(|(&country_id, &side)| {
+                    let hostile = side != victim_side
+                        && self.diplomacy.hostility
+                            [victim_side * self.territory.max_sides() + side]
+                            == 1;
+                    let side_is_active = self
+                        .diplomacy
+                        .active_sides
+                        .contains(&u16::try_from(side).ok()?);
+                    let active = prepared
+                        .economy(country_id)
+                        .is_some_and(|economy| !economy.capitulated);
+                    (hostile && side_is_active && active).then_some(country_id)
+                })
+                .collect::<Vec<_>>();
+            let simulation = staged_simulation.as_ref().unwrap_or(&self.simulation);
+            let unit_positions = simulation
+                .units
+                .iter()
+                .filter_map(|unit| {
+                    u16::try_from(unit.combat.sovereign).ok().map(|country_id| {
+                        SurrenderUnitPosition {
+                            country_id,
+                            lat: unit.combat.lat,
+                            lng: unit.combat.lng,
+                            health: unit.combat.health,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let plan = plan_surrender_allocation(SurrenderAllocationInput {
+                victim_country_id: command.country_id,
+                hostile_attacker_ids: &hostile_attacker_ids,
+                casualties_by_victim,
+                width: self.territory.width(),
+                height: self.territory.height(),
+                grid_resolution: self.territory.grid_resolution(),
+                land: self.territory.land(),
+                world_control: self.territory.world_control(),
+                de_jure: self.territory.de_jure(),
+                primary_occupier: self.territory.primary_occupier(),
+                units: &unit_positions,
+            })?;
+
+            let mut config = self.territory.checkpoint_config();
+            for transfer in &plan.transfers {
+                if config.maps.world_control.get(transfer.cell) != Some(&transfer.original_owner)
+                    || transfer.original_owner != command.country_id
+                {
+                    return Err(RuntimeError::InvalidCheckpoint(
+                        "surrender transfer does not match live territory",
+                    ));
+                }
+                let recipient_side = *config.country_to_side.get(&transfer.new_owner).ok_or(
+                    RuntimeError::InvalidCheckpoint("surrender recipient has no declared side"),
+                )?;
+                config.maps.world_control[transfer.cell] = transfer.new_owner;
+                config.maps.primary_occupier[transfer.cell] = transfer.new_owner;
+                config.maps.land[transfer.cell] = 2;
+                for influence in &mut config.maps.side_influence {
+                    influence[transfer.cell] = 0.0;
+                }
+                config.maps.side_influence[recipient_side][transfer.cell] = 1.0;
+                config.maps.dominant_side[transfer.cell] = i16::try_from(recipient_side)
+                    .map_err(|_| RuntimeError::InvalidCheckpoint("side index exceeds i16"))?;
+                config.maps.occupation[transfer.cell] =
+                    if recipient_side % 2 == 0 { 1.0 } else { -1.0 };
+            }
+            config.world_revision = config
+                .world_revision
+                .checked_add(1)
+                .ok_or(RuntimeError::ClockOverflow)?;
+
+            let prior = self
+                .territory
+                .committed_state()
+                .ok_or(RuntimeError::InvalidCheckpoint(
+                    "strategic effects require a committed territory boundary",
+                ))?;
+            let committed = TerritoryCommittedState {
+                generation: prior
+                    .generation
+                    .checked_add(1)
+                    .ok_or(RuntimeError::ClockOverflow)?,
+                commit_sequence: prior
+                    .commit_sequence
+                    .checked_add(1)
+                    .ok_or(RuntimeError::ClockOverflow)?,
+                mutation_sequence: prior
+                    .mutation_sequence
+                    .checked_add(1)
+                    .ok_or(RuntimeError::ClockOverflow)?,
+                processed_tiles: config.width.div_ceil(config.tile_size)
+                    * config.height.div_ceil(config.tile_size),
+                processed_items: config.maps.land.len() + config.cities.len(),
+            };
+            staged_territory = Some(TerritoryControl::restore(config, committed)?);
+
+            let country = self
+                .scenario
+                .countries
+                .iter()
+                .find(|country| country.country_id == command.country_id)
+                .ok_or(RuntimeError::InvalidCheckpoint(
+                    "capitulating country is absent from scenario production",
+                ))?;
+            let economy =
+                prepared
+                    .economy(command.country_id)
+                    .ok_or(RuntimeError::InvalidCheckpoint(
+                        "capitulating country has no prepared economy",
+                    ))?;
+            let expected_army_units = country.expected_army_units.max(3.0);
+            prepared.register_occupation(OccupationState {
+                victim_id: command.country_id,
+                annexer_id: plan.primary_annexer_id,
+                base_income: economy.base_income,
+                core_cells: country.initial_core_cells.max(1),
+                expected_army_units,
+                resistance: 0.0,
+                occupation_coverage: 1.0,
+                garrison_coverage: 0.0,
+                garrison_assigned: 0.0,
+                required_garrison: required_garrison(expected_army_units)
+                    .map_err(StrategicError::from)?,
+                held_ratio: 1.0,
+                active_rebellion: false,
+                queued_at_cycle: 0,
+                cooldown_until_cycle: 0,
+            })?;
+        }
+
+        if !evaluated.surrenders.is_empty() {
+            let allowed = self
+                .diplomacy
+                .active_sides
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let post_capitulation_sides = evaluated
+                .countries
+                .iter()
+                .filter(|country| allowed.contains(&country.side) && !country.economy.capitulated)
+                .map(|country| country.side)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let hostile_pairs = canonical_hostile_pairs(
+                &post_capitulation_sides,
+                &self.diplomacy.hostility,
+                self.territory.max_sides(),
+            );
+            if let Some(resolution) =
+                evaluate_global_conflict(&post_capitulation_sides, &hostile_pairs)
+            {
+                prepared.register_conflict_resolution(resolution);
+            }
+        }
+
+        let finalized = prepared.snapshot();
+        let state = finalized
+            .conflict_resolution
+            .map_or(RuntimeState::Running, |resolution| {
+                RuntimeState::ConflictResolved {
+                    cycle: finalized.cycle,
+                    tick: finalized.tick,
+                    resolution: resolution.into(),
+                }
+            });
+        Ok(StagedStrategicEffects {
+            simulation: staged_simulation,
+            territory: staged_territory,
+            removed_ids,
+            state,
+            fronts_invalidated: !evaluated.surrenders.is_empty(),
+        })
+    }
+
     /// Advance one owned tick and frame. Publication is the final operation.
     pub fn step(&mut self) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
         match self.state {
             RuntimeState::Running => {}
             RuntimeState::AwaitingStrategicEffects { cycle, tick, .. } => {
                 return Err(RuntimeError::AwaitingStrategicEffects { cycle, tick });
+            }
+            RuntimeState::ConflictResolved { cycle, tick, .. } => {
+                return Err(RuntimeError::ConflictResolved { cycle, tick });
             }
             RuntimeState::Poisoned => return Err(RuntimeError::Poisoned),
         }
@@ -829,7 +1128,7 @@ impl NativeRuntime {
             orders: &planning.orders,
             inactive_unit_ids: &inactive_unit_ids,
         });
-        let (frame_snapshot, simulation_counters) = match simulation_result {
+        let (mut frame_snapshot, mut simulation_counters) = match simulation_result {
             Ok(result) => result,
             Err(error) => {
                 self.simulation = Simulation::new(simulation_config, simulation_backup)
@@ -839,6 +1138,11 @@ impl NativeRuntime {
         };
         let next_casualties = next_casualties(
             &self.casualties,
+            &self.unit_sovereign_by_id,
+            &frame_snapshot,
+        );
+        let next_casualties_by_victim = next_casualties_by_victim(
+            &self.casualties_by_victim,
             &self.unit_sovereign_by_id,
             &frame_snapshot,
         );
@@ -861,7 +1165,7 @@ impl NativeRuntime {
         };
 
         let strategic_due = next_tick.is_multiple_of(PAY_CYCLE_TICKS);
-        let (territory_snapshot, census) = advance_census(
+        let (mut territory_snapshot, mut census) = advance_census(
             &mut self.territory,
             self.config.census_budget,
             self.config.census_flush_chunk,
@@ -871,6 +1175,7 @@ impl NativeRuntime {
         let mut strategic_counters = None;
         let mut derivation_counters = None;
         let mut next_state = RuntimeState::Running;
+        let mut strategic_fronts_invalidated = false;
         if strategic_due {
             let derived = match derive_production_input(
                 next_tick,
@@ -890,30 +1195,70 @@ impl NativeRuntime {
                 }
             };
             let mut strategic_input = derived.input;
-            restrict_to_explicit_active_sides(&mut strategic_input, &self.diplomacy.active_sides);
+            restrict_to_explicit_active_sides(
+                &mut strategic_input,
+                &self.diplomacy.active_sides,
+                &self.diplomacy.hostility,
+                self.territory.max_sides(),
+            );
             let mut counters = derived.counters;
             counters.active_sides = strategic_input.active_sides.len();
             counters.hostile_pairs = strategic_input.active_hostile_pairs.len();
             derivation_counters = Some(counters);
-            let (published, counters) = match self.strategic.run_cycle(&strategic_input) {
+            let mut prepared = match self.strategic.prepare_cycle(&strategic_input) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.state = RuntimeState::Poisoned;
+                    return Err(RuntimeError::Strategic(error));
+                }
+            };
+            let effects =
+                match self.stage_strategic_effects(&mut prepared, &next_casualties_by_victim) {
+                    Ok(effects) => effects,
+                    Err(error) => {
+                        self.state = RuntimeState::Poisoned;
+                        return Err(error);
+                    }
+                };
+            let (published, counters) = match self.strategic.commit_cycle(prepared) {
                 Ok(result) => result,
                 Err(error) => {
                     self.state = RuntimeState::Poisoned;
                     return Err(RuntimeError::Strategic(error));
                 }
             };
-            if !published.desertions.is_empty()
-                || !published.surrenders.is_empty()
-                || published.conflict_resolution.is_some()
-            {
-                next_state = RuntimeState::AwaitingStrategicEffects {
-                    cycle: published.cycle,
-                    tick: published.tick,
-                    desertion_commands: published.desertions.len(),
-                    surrender_commands: published.surrenders.len(),
-                    conflict_resolution: published.conflict_resolution.is_some(),
-                };
+            let active_sides = published
+                .countries
+                .iter()
+                .filter(|country| !country.economy.capitulated)
+                .map(|country| country.side)
+                .collect::<BTreeSet<_>>();
+            self.diplomacy
+                .active_sides
+                .retain(|side| active_sides.contains(side));
+            if let Some(simulation) = effects.simulation {
+                let consequence_snapshot = simulation.initial_snapshot(next_tick, next_frame);
+                let mut removed_ids = frame_snapshot.removed_ids.to_vec();
+                removed_ids.extend(effects.removed_ids);
+                removed_ids.sort_unstable();
+                removed_ids.dedup();
+                simulation_counters.removed_units = removed_ids.len();
+                frame_snapshot.units = consequence_snapshot.units;
+                frame_snapshot.removed_ids = removed_ids.into();
+                self.simulation = simulation;
             }
+            if let Some(territory) = effects.territory {
+                territory_snapshot = territory
+                    .snapshot()
+                    .expect("restored surrender territory has a committed snapshot");
+                census.territory_generation = territory_snapshot.generation;
+                census.territory_commit_sequence = territory_snapshot.commit_sequence;
+                census.committed = true;
+                census.flushed_for_strategic_cycle = true;
+                self.territory = territory;
+            }
+            strategic_fronts_invalidated = effects.fronts_invalidated;
+            next_state = effects.state;
             strategic_snapshot = Some(published);
             strategic_counters = Some(counters);
         }
@@ -928,7 +1273,12 @@ impl NativeRuntime {
             .retain(|unit_id, _| surviving_ids.contains(unit_id));
         self.unit_sovereign_by_id
             .retain(|(unit_id, _)| surviving_ids.contains(unit_id));
-        if let Some(layout) = &refreshed_layout {
+        if strategic_fronts_invalidated {
+            self.objectives.clear();
+            self.front_prior_by_unit.clear();
+            next_prior.clear();
+            self.last_front_refresh_tick = None;
+        } else if let Some(layout) = &refreshed_layout {
             self.objectives.clone_from(&layout.objectives);
             self.front_prior_by_unit = front_prior_by_unit(&layout.next_prior);
             self.last_front_refresh_tick = Some(next_tick);
@@ -938,6 +1288,7 @@ impl NativeRuntime {
         next_prior.retain(|unit_id, _| surviving_ids.contains(unit_id));
         self.prior_objective_by_unit = next_prior;
         self.casualties = next_casualties;
+        self.casualties_by_victim = next_casualties_by_victim;
         self.tick = next_tick;
         self.frame = next_frame;
         self.state = next_state;
@@ -946,16 +1297,20 @@ impl NativeRuntime {
         if let Some(update) = self.territory.drain_render_update() {
             self.render_updates.push_back(update);
         }
-        let segments = refreshed_layout.as_ref().map_or_else(
-            || {
-                self.objectives
-                    .iter()
-                    .map(|objective| objective.segment_id)
-                    .collect::<BTreeSet<_>>()
-                    .len()
-            },
-            |layout| layout.counters.segments,
-        );
+        let segments = if strategic_fronts_invalidated {
+            0
+        } else {
+            refreshed_layout.as_ref().map_or_else(
+                || {
+                    self.objectives
+                        .iter()
+                        .map(|objective| objective.segment_id)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                },
+                |layout| layout.counters.segments,
+            )
+        };
         let counters = RuntimeStepCounters {
             front_refreshed: refresh_fronts,
             front_segments: segments,
@@ -979,6 +1334,7 @@ impl NativeRuntime {
             counters,
             pending_render_updates: self.render_updates.len(),
             casualty_totals: Arc::new(self.casualties.clone()),
+            casualties_by_victim: Arc::new(self.casualties_by_victim.clone()),
         });
         self.latest = published.clone();
         Ok(published)
@@ -1198,6 +1554,31 @@ fn validate_casualties(
     Ok(())
 }
 
+fn validate_casualties_by_victim(
+    casualties: &BTreeMap<u16, BTreeMap<u16, f64>>,
+    scenario: &ScenarioProduction,
+) -> Result<(), RuntimeError> {
+    let countries = scenario
+        .countries
+        .iter()
+        .map(|country| country.country_id)
+        .collect::<BTreeSet<_>>();
+    if casualties.iter().any(|(victim, attackers)| {
+        !countries.contains(victim)
+            || attackers.iter().any(|(attacker, value)| {
+                attacker == victim
+                    || !countries.contains(attacker)
+                    || !value.is_finite()
+                    || *value < 0.0
+            })
+    }) {
+        return Err(RuntimeError::InvalidCheckpoint(
+            "invalid victim-to-attacker casualty ledger",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_production_boundary(
     tick: u64,
@@ -1330,15 +1711,52 @@ fn advance_census(
 fn restrict_to_explicit_active_sides(
     input: &mut crate::strategic::StrategicCycleInput,
     explicit: &[u16],
+    hostility: &[u8],
+    side_count: usize,
 ) {
     let allowed = explicit.iter().copied().collect::<BTreeSet<_>>();
     input.active_sides.retain(|side| allowed.contains(side));
     input
         .active_hostile_pairs
         .retain(|(left, right)| allowed.contains(left) && allowed.contains(right));
+    input.capitulation_active_sides = Some(
+        input
+            .active_sides
+            .iter()
+            .copied()
+            .filter(|&left| {
+                input.active_sides.iter().copied().any(|right| {
+                    left != right
+                        && hostility[usize::from(left) * side_count + usize::from(right)] == 1
+                })
+            })
+            .collect(),
+    );
     for country in &mut input.countries {
         country.active &= allowed.contains(&country.side);
     }
+}
+
+fn canonical_hostile_pairs(
+    active_sides: &[u16],
+    hostility: &[u8],
+    side_count: usize,
+) -> Vec<(u16, u16)> {
+    let active = active_sides.iter().copied().collect::<BTreeSet<_>>();
+    let active = active.into_iter().collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+    for (position, &left) in active.iter().enumerate() {
+        for &right in &active[position + 1..] {
+            let left_index = usize::from(left);
+            let right_index = usize::from(right);
+            if hostility[left_index * side_count + right_index] == 1
+                || hostility[right_index * side_count + left_index] == 1
+            {
+                pairs.push((left, right));
+            }
+        }
+    }
+    pairs
 }
 
 #[cfg(test)]
@@ -1561,6 +1979,7 @@ mod tests {
                 objectives,
                 prior_objective_by_unit: BTreeMap::new(),
                 casualties: BTreeMap::new(),
+                casualties_by_victim: BTreeMap::new(),
             },
         )
         .unwrap()
@@ -1664,20 +2083,123 @@ mod tests {
     }
 
     #[test]
-    fn strategic_commands_block_until_an_authoritative_replacement_checkpoint() {
+    fn surrender_and_last_side_resolution_are_published_atomically() {
         let mut runtime = fixture(PAY_CYCLE_TICKS - 1, true);
-        let pending = runtime.step().unwrap();
-        let RuntimeState::AwaitingStrategicEffects {
-            surrender_commands, ..
-        } = pending.state
-        else {
-            panic!("expected pending strategic effects");
-        };
-        assert_eq!(surrender_commands, 1);
+        let published = runtime.step().unwrap();
+        assert!(matches!(
+            published.state,
+            RuntimeState::ConflictResolved { .. }
+        ));
+        assert_eq!(
+            published
+                .strategic_snapshot
+                .as_ref()
+                .unwrap()
+                .surrenders
+                .len(),
+            1
+        );
+        assert!(
+            published
+                .strategic_snapshot
+                .as_ref()
+                .unwrap()
+                .conflict_resolution
+                .is_some()
+        );
+        assert_eq!(
+            published
+                .strategic_snapshot
+                .as_ref()
+                .unwrap()
+                .events
+                .last()
+                .map(|event| event.kind),
+            Some(crate::strategic::StrategicEventKind::TreatyResolved)
+        );
+        assert_eq!(runtime.strategic.occupations().len(), 1);
+        assert!(
+            runtime
+                .territory
+                .world_control()
+                .iter()
+                .all(|owner| *owner == 1)
+        );
+        assert!(
+            runtime
+                .territory
+                .primary_occupier()
+                .iter()
+                .all(|owner| *owner == 1)
+        );
+        assert!(published.counters.census.committed);
+        assert_eq!(
+            published.territory_snapshot,
+            runtime.territory.snapshot().unwrap()
+        );
+
         assert!(matches!(
             runtime.step(),
-            Err(RuntimeError::AwaitingStrategicEffects { .. })
+            Err(RuntimeError::ConflictResolved { .. })
         ));
+    }
+
+    #[test]
+    fn reverse_only_hostility_cannot_poison_surrender_application() {
+        let mut runtime = fixture(PAY_CYCLE_TICKS - 1, true);
+        let directed = vec![0, 1, 0, 0];
+        runtime
+            .territory
+            .set_topology(
+                runtime.territory.country_to_side().clone(),
+                directed.clone(),
+                2,
+            )
+            .unwrap();
+        runtime.diplomacy.hostility = directed;
+
+        let published = runtime.step().unwrap();
+        assert_eq!(published.state, RuntimeState::Running);
+        assert!(
+            published
+                .strategic_snapshot
+                .as_ref()
+                .unwrap()
+                .surrenders
+                .is_empty()
+        );
+        assert!(!runtime.strategic.economies()[&2].capitulated);
+    }
+
+    #[test]
+    fn explicit_single_active_side_cannot_surrender_to_an_inactive_side() {
+        let mut runtime = fixture(PAY_CYCLE_TICKS - 1, true);
+        let directed = vec![0, 0, 1, 0];
+        runtime
+            .territory
+            .set_topology(
+                runtime.territory.country_to_side().clone(),
+                directed.clone(),
+                2,
+            )
+            .unwrap();
+        runtime.diplomacy.hostility = directed;
+        runtime.diplomacy.active_sides = vec![1];
+
+        let published = runtime.step().unwrap();
+        assert!(matches!(
+            published.state,
+            RuntimeState::ConflictResolved { .. }
+        ));
+        assert!(
+            published
+                .strategic_snapshot
+                .as_ref()
+                .unwrap()
+                .surrenders
+                .is_empty()
+        );
+        assert!(!runtime.strategic.economies()[&2].capitulated);
     }
 
     #[test]
@@ -1818,26 +2340,18 @@ mod tests {
     }
 
     #[test]
-    fn conflict_resolution_alone_blocks_until_checkpoint_replacement() {
+    fn conflict_resolution_is_a_clean_terminal_publication() {
         let mut runtime = fixture(PAY_CYCLE_TICKS - 1, false);
         runtime.diplomacy.active_sides = vec![0];
 
-        let pending = runtime.step().unwrap();
-        let RuntimeState::AwaitingStrategicEffects {
-            desertion_commands,
-            surrender_commands,
-            conflict_resolution,
-            ..
-        } = pending.state
-        else {
-            panic!("expected pending conflict resolution");
+        let terminal = runtime.step().unwrap();
+        let RuntimeState::ConflictResolved { resolution, .. } = terminal.state else {
+            panic!("expected resolved conflict");
         };
-        assert_eq!(desertion_commands, 0);
-        assert_eq!(surrender_commands, 0);
-        assert!(conflict_resolution);
+        assert!(resolution.stop_simulation);
         assert!(matches!(
             runtime.step(),
-            Err(RuntimeError::AwaitingStrategicEffects { .. })
+            Err(RuntimeError::ConflictResolved { .. })
         ));
     }
 }

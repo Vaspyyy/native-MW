@@ -402,6 +402,7 @@ fn cycle_input(source: &Cycle) -> StrategicCycleInput {
         occupations: source.occupations.clone(),
         active_sides: source.active_sides.clone(),
         active_hostile_pairs: source.active_hostile_pairs.clone(),
+        capitulation_active_sides: None,
     }
 }
 fn state_json(simulation: &StrategicSimulation) -> Value {

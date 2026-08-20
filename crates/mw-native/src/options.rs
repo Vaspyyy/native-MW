@@ -112,7 +112,7 @@ pub fn help_text() -> &'static str {
     "mw-native [OPTIONS] [SCENARIO.mwsc.gz]\n\
      \n\
      Options:\n\
-       --runtime-checkpoint PATH  Load a strict browser postStartWar checkpoint\n\
+       --runtime-checkpoint PATH  Load a strict browser postStartWar or midWar checkpoint\n\
        --demo-units               Run the small scenario-derived demo runtime\n\
        --tick-ms N                Runtime tick interval in milliseconds (default 33)\n\
        --update-queue N           Bounded lossless publication queue (default 8)\n\

@@ -24,7 +24,7 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub enum RuntimeWorkerStatus {
     /// The caller requested shutdown before the worker reached a runtime terminal state.
     Stopped,
-    /// The runtime published a state that cannot be stepped again without outside input.
+    /// The runtime published a clean or gated terminal state and will not be stepped again.
     Terminal(RuntimeState),
     /// The optional deterministic step limit was reached exactly.
     Completed { steps: u64 },
@@ -214,7 +214,7 @@ fn run_worker(
         let _ = statuses.send(RuntimeWorkerStatus::Stopped);
         return;
     }
-    if !matches!(runtime.state(), RuntimeState::Running) {
+    if is_terminal_state(runtime.state()) {
         let _ = statuses.send(RuntimeWorkerStatus::Terminal(runtime.state()));
         return;
     }
@@ -244,12 +244,21 @@ fn run_worker(
             });
             return;
         }
-        if !matches!(snapshot.state, RuntimeState::Running) {
+        if is_terminal_state(snapshot.state) {
             let _ = statuses.send(RuntimeWorkerStatus::Terminal(snapshot.state));
             return;
         }
 
         due_at = next_due(due_at, tick_interval, Instant::now());
+    }
+}
+
+fn is_terminal_state(state: RuntimeState) -> bool {
+    match state {
+        RuntimeState::Running => false,
+        RuntimeState::AwaitingStrategicEffects { .. }
+        | RuntimeState::ConflictResolved { .. }
+        | RuntimeState::Poisoned => true,
     }
 }
 
@@ -364,6 +373,7 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mw_core::{ConflictResolutionKind, ConflictResolutionPlan};
 
     #[test]
     fn native_runtime_is_send_for_dedicated_worker_ownership() {
@@ -435,5 +445,21 @@ mod tests {
             RuntimeWorkerError::ZeroStepLimit.to_string(),
             "runtime worker step limit must be nonzero"
         );
+    }
+
+    #[test]
+    fn resolved_conflict_is_a_clean_worker_terminal() {
+        let state = RuntimeState::ConflictResolved {
+            cycle: 4,
+            tick: 2_400,
+            resolution: ConflictResolutionPlan {
+                kind: ConflictResolutionKind::FullCapitulation,
+                winner_side: Some(1),
+                stop_simulation: true,
+            },
+        };
+
+        assert!(is_terminal_state(state));
+        assert!(!is_terminal_state(RuntimeState::Running));
     }
 }

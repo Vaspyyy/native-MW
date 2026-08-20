@@ -16,16 +16,19 @@ reference while systems move into the renderer-independent `mw-core` crate.
 - Float32 territory influence, controller attribution, dirty-tile rendering, and
   incremental census publication
 - atomic economy, occupation, resistance, capitulation, desertion, and treaty cycles
+- in-process desertion, capitulation transfer, occupation seeding, and clean
+  terminal conflict-resolution consequences
 - one `NativeRuntime` owner connecting front layout -> AI -> simulation ->
   territory -> strategic settlement
 - reference-counted immutable snapshots, FIFO territory render deltas, and a
   native `wgpu` unit overlay
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
-- a versioned browser-to-native checkpoint contract with exact active-grid RLE
-  geography for the post-`startWar()` boundary
-- production checkpoint loading in the native viewer plus an exact-step,
-  window-free worker validation mode
+- versioned browser-to-native checkpoints: strict v1 post-`startWar()`
+  compatibility plus v2 quiescent mid-war continuation with exact live
+  influence, control, census, and nested casualty-attribution state
+- production checkpoint loading in the native viewer plus bounded-step,
+  window-free worker validation with clean terminal-conflict completion
 - optimized full-cap territory and combat hot paths using dense lookup tables,
   reusable cell tracking, and in-place prevalidated pair dispatch
 - headless JavaScript parity fixtures and timing for every migrated slice
@@ -59,12 +62,25 @@ cargo run --release -p mw-tools -- native-runtime-fixture ../modern-wars/assets/
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
-`native-runtime-fixture` accepts two deliberately different checkpoint
-boundaries. `postStartWar` is production-resumable only at tick, frame, and
-strategic cycle zero. It carries exact binary-land, world-control, and de-jure
-RLE maps plus the live unit/economy handoff. `baselineReplay` exists for
-deterministic fixtures and benchmarks; it is synthetic and must not be treated
-as a saved game or mid-war resume point.
+`native-runtime-fixture` accepts three deliberately different checkpoint
+boundaries. Checkpoint v1 retains `postStartWar`, which is
+production-resumable only at tick, frame, and strategic cycle zero, and the
+synthetic non-resumable `baselineReplay` fixture/benchmark boundary.
+Checkpoint v2 adds `midWar`: a production-resumable save barrier carrying live
+units, economies, occupations, total and victim-by-attacker casualties, every
+territory plane, revision markers, and the last fully committed census.
+
+The browser exports v1 by default for compatibility. After a war has advanced,
+request v2 explicitly from its console:
+
+```js
+await window.downloadNativeRuntimeCheckpoint({ version: 2, steps: 5 });
+```
+
+The v2 exporter synchronously flushes territory work and refuses to save if a
+census remains active or dirty. It retains immutable baseline geography for
+scenario production derivation; the loader derives those immutable baselines
+first and only then overlays the committed live territory maps.
 
 Run a browser-exported production checkpoint in the native viewer, or exercise
 the same dedicated runtime worker without creating a window or GPU device:
@@ -76,10 +92,10 @@ cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" "$scenari
 cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
 ```
 
-Both production paths accept only the exact-geography `postStartWar` boundary.
-They reject the synthetic, non-resumable `baselineReplay` boundary. Normal
-startup remains a map-only viewer, and `--demo-units` remains available as the
-small scenario-derived runtime.
+Both production paths accept exact-state v1 `postStartWar` and v2 `midWar`
+checkpoints. They reject the synthetic, non-resumable `baselineReplay`
+boundary. Normal startup remains a map-only viewer, and `--demo-units` remains
+available as the small scenario-derived runtime.
 
 For an automated three-frame GPU/window smoke test:
 
@@ -180,10 +196,22 @@ target/release/mw-tools native-runtime-fixture ../modern-wars/assets/maps/compil
 target/release/mw-tools native-runtime-bench ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz /tmp/mw-native-runtime-stress.json --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-If a strategic cycle publishes any desertion, surrender, or conflict-resolution
-command, `NativeRuntime` stops. Continuing requires a new authoritative
-checkpoint with those consequences already applied; there is no unsafe
-acknowledge-and-continue path in this slice.
+At a strategic boundary, `NativeRuntime` now prepares settlement privately,
+applies desertion first, then removes a capitulated country's surviving units,
+allocates and transfers its live territory, seeds the resulting occupation,
+and commits only after those staged consequences validate. A surrender
+invalidates native front priors so the next tick rebuilds them from the new
+map. Conflict resolution publishes a final immutable result and enters a clean
+terminal state instead of requiring an external acknowledge-and-continue
+step.
+
+This remains a bounded simulation port. Mid-war v2 does not serialize a
+partial census, render queues, or private front-assignment history; those are
+rebuilt at the save/load boundary. The surrender path does not yet include the
+browser's releasables, province-border smoothing, equipment-reserve or air
+cleanup, or treaty/UI presentation. Frontier diffusion, active-combat source
+exclusion, air/naval simulation, and the full gameplay UI remain outside this
+slice.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the migration boundary.
 Measured Rust-versus-JavaScript results are recorded in

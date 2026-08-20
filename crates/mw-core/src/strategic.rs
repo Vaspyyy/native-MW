@@ -17,8 +17,9 @@ use crate::{
         OccupationAssessment, OccupationError, OccupationState, required_garrison, resistance_delta,
     },
     surrender::{
-        CapitulationDecision, CapitulationInput, ConflictResolution, SurrenderError,
-        evaluate_capitulation, evaluate_global_conflict,
+        CapitulationDecision, CapitulationInput, CasualtyEntry, ConflictResolution,
+        ConflictResolutionKind, SurrenderError, eligible_casualty_attackers, evaluate_capitulation,
+        evaluate_global_conflict, largest_remainder_quotas,
     },
 };
 
@@ -66,6 +67,11 @@ pub struct StrategicCycleInput {
     pub active_sides: Vec<u16>,
     #[serde(default)]
     pub active_hostile_pairs: Vec<(u16, u16)>,
+    /// Sides with at least one outgoing active hostility edge. `None` preserves the
+    /// legacy symmetric-pair contract for standalone fixtures; production derivation
+    /// always supplies `Some`, including an explicitly empty set.
+    #[serde(default)]
+    pub capitulation_active_sides: Option<Vec<u16>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -129,6 +135,164 @@ pub struct StrategicSnapshot {
     pub conflict_resolution: Option<ConflictResolution>,
 }
 
+/// A completely evaluated pay cycle that has not yet changed authoritative state.
+///
+/// Runtime orchestration may apply the published strategic consequences to its
+/// other kernels and only commit this transaction once every boundary succeeds.
+#[derive(Clone, Debug)]
+pub struct PreparedStrategicCycle {
+    base_cycle: u64,
+    next_economies: BTreeMap<u16, EconomyState>,
+    next_occupations: BTreeMap<u16, OccupationState>,
+    snapshot: Arc<StrategicSnapshot>,
+    counters: StrategicCounters,
+}
+
+impl PreparedStrategicCycle {
+    pub fn snapshot(&self) -> Arc<StrategicSnapshot> {
+        self.snapshot.clone()
+    }
+
+    pub const fn counters(&self) -> StrategicCounters {
+        self.counters
+    }
+
+    pub fn economy(&self, country_id: u16) -> Option<&EconomyState> {
+        self.next_economies.get(&country_id)
+    }
+
+    /// Add the occupation created by this cycle's capitulation consequence.
+    /// Existing victims are rejected: changing an ongoing occupation requires
+    /// an explicit future policy rather than an accidental overwrite.
+    pub fn register_occupation(
+        &mut self,
+        occupation: OccupationState,
+    ) -> Result<(), StrategicError> {
+        if occupation.victim_id == 0
+            || occupation.annexer_id == 0
+            || occupation.victim_id == occupation.annexer_id
+        {
+            return Err(OccupationError::InvalidCountries.into());
+        }
+        if ![
+            occupation.base_income,
+            occupation.expected_army_units,
+            occupation.resistance,
+            occupation.occupation_coverage,
+            occupation.garrison_coverage,
+            occupation.garrison_assigned,
+            occupation.held_ratio,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+        {
+            return Err(OccupationError::NonFinite.into());
+        }
+        if !self.next_economies.contains_key(&occupation.victim_id) {
+            return Err(StrategicError::UnknownCountry(occupation.victim_id));
+        }
+        if !self.next_economies.contains_key(&occupation.annexer_id) {
+            return Err(StrategicError::UnknownCountry(occupation.annexer_id));
+        }
+        if self.next_occupations.contains_key(&occupation.victim_id) {
+            return Err(StrategicError::DuplicateOccupation(occupation.victim_id));
+        }
+        self.next_occupations
+            .insert(occupation.victim_id, occupation);
+        Arc::make_mut(&mut self.snapshot).occupations = self
+            .next_occupations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        Ok(())
+    }
+
+    /// Fold the post-capitulation global result into the same immutable cycle
+    /// publication. Re-registering an already published result is idempotent.
+    pub fn register_conflict_resolution(&mut self, resolution: ConflictResolution) {
+        let snapshot = Arc::make_mut(&mut self.snapshot);
+        if snapshot.conflict_resolution.is_some() {
+            return;
+        }
+        let mut events = snapshot.events.to_vec();
+        events.push(StrategicEvent {
+            kind: StrategicEventKind::TreatyResolved,
+            country_id: None,
+            related_country_id: None,
+            previous_band: None,
+            next_band: None,
+            value: None,
+        });
+        snapshot.events = events.into();
+        snapshot.conflict_resolution = Some(resolution);
+        self.counters.events = snapshot.events.len();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SurrenderUnitPosition {
+    pub country_id: u16,
+    pub lat: f64,
+    pub lng: f64,
+    pub health: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SurrenderAllocationInput<'a> {
+    pub victim_country_id: u16,
+    pub hostile_attacker_ids: &'a [u16],
+    /// Complete victim -> attacker casualty ledger. Only the victim row is read.
+    pub casualties_by_victim: &'a BTreeMap<u16, BTreeMap<u16, f64>>,
+    pub width: usize,
+    pub height: usize,
+    pub grid_resolution: f64,
+    pub land: &'a [u8],
+    pub world_control: &'a [u16],
+    pub de_jure: &'a [u16],
+    pub primary_occupier: &'a [u16],
+    pub units: &'a [SurrenderUnitPosition],
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SurrenderCellTransfer {
+    pub cell: usize,
+    pub original_owner: u16,
+    pub new_owner: u16,
+}
+
+/// Fully bounded, deterministic mutations for one capitulating country.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SurrenderAllocationPlan {
+    pub victim_country_id: u16,
+    pub primary_annexer_id: u16,
+    pub transfers: Vec<SurrenderCellTransfer>,
+}
+
+/// Terminal conflict effects are deliberately bounded to stopping the runtime
+/// and publishing the already-decided result. UI/treaty presentation stays out
+/// of the simulation core.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictResolutionPlan {
+    pub kind: ConflictResolutionKind,
+    pub winner_side: Option<u16>,
+    pub stop_simulation: bool,
+}
+
+impl From<ConflictResolution> for ConflictResolutionPlan {
+    fn from(value: ConflictResolution) -> Self {
+        Self {
+            kind: value.kind,
+            winner_side: value.winner_side,
+            stop_simulation: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StrategicCounters {
@@ -161,6 +325,16 @@ pub enum StrategicError {
     UnknownCountry(u16),
     #[error("country input contains invalid numeric data")]
     InvalidCountryInput,
+    #[error("prepared strategic cycle was based on cycle {prepared}, current cycle is {current}")]
+    StalePreparedCycle { prepared: u64, current: u64 },
+    #[error("surrender allocation input is invalid: {0}")]
+    InvalidSurrenderAllocation(&'static str),
+    #[error("capitulation has no active hostile recipient")]
+    NoHostileRecipient,
+    #[error("capitulation has no deterministic recipient")]
+    NoDeterministicRecipient,
+    #[error("capitulation allocation could not satisfy its bounded quotas")]
+    IncompleteSurrenderAllocation,
     #[error("economy: {0}")]
     Economy(#[from] EconomyError),
     #[error("occupation: {0}")]
@@ -244,6 +418,15 @@ impl StrategicSimulation {
         &mut self,
         input: &StrategicCycleInput,
     ) -> Result<(Arc<StrategicSnapshot>, StrategicCounters), StrategicError> {
+        let prepared = self.prepare_cycle(input)?;
+        self.commit_cycle(prepared)
+    }
+
+    /// Evaluate a complete cycle without mutating authoritative strategic state.
+    pub fn prepare_cycle(
+        &self,
+        input: &StrategicCycleInput,
+    ) -> Result<PreparedStrategicCycle, StrategicError> {
         if !input.force && !input.tick.is_multiple_of(PAY_CYCLE_TICKS) {
             return Err(StrategicError::NotDue);
         }
@@ -405,6 +588,17 @@ impl StrategicSimulation {
             .iter()
             .flat_map(|&(left, right)| [left, right])
             .collect::<BTreeSet<_>>();
+        let capitulation_active_sides = input
+            .capitulation_active_sides
+            .as_ref()
+            .map(|sides| {
+                sides
+                    .iter()
+                    .copied()
+                    .filter(|side| active_sides.contains(side))
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_else(|| hostile_sides.clone());
         let mut decisions = BTreeMap::new();
         for (&country_id, country) in &countries {
             let decision = evaluate_capitulation(CapitulationInput {
@@ -433,7 +627,7 @@ impl StrategicSimulation {
             .find(|(_, country)| {
                 country.active
                     && active_sides.contains(&country.side)
-                    && hostile_sides.contains(&country.side)
+                    && capitulation_active_sides.contains(&country.side)
                     && next_economies
                         .get(&country.country_id)
                         .is_some_and(|economy| !economy.capitulated)
@@ -498,18 +692,14 @@ impl StrategicSimulation {
             });
         }
 
-        self.cycle = next_cycle;
-        self.economies = next_economies;
-        self.occupations = next_occupations;
         let snapshot = Arc::new(StrategicSnapshot {
             schema_version: STRATEGIC_SCHEMA_VERSION.to_owned(),
-            cycle: self.cycle,
+            cycle: next_cycle,
             tick: input.tick,
             territory_generation: input.territory_generation,
             territory_commit_sequence: input.territory_commit_sequence,
             countries: country_snapshots.into(),
-            occupations: self
-                .occupations
+            occupations: next_occupations
                 .values()
                 .cloned()
                 .collect::<Vec<_>>()
@@ -527,8 +717,31 @@ impl StrategicSimulation {
             desertion_commands: snapshot.desertions.len(),
             events: snapshot.events.len(),
         };
-        self.latest = Some(snapshot.clone());
-        Ok((snapshot, counters))
+        Ok(PreparedStrategicCycle {
+            base_cycle: self.cycle,
+            next_economies,
+            next_occupations,
+            snapshot,
+            counters,
+        })
+    }
+
+    /// Atomically publish a previously evaluated cycle.
+    pub fn commit_cycle(
+        &mut self,
+        prepared: PreparedStrategicCycle,
+    ) -> Result<(Arc<StrategicSnapshot>, StrategicCounters), StrategicError> {
+        if prepared.base_cycle != self.cycle {
+            return Err(StrategicError::StalePreparedCycle {
+                prepared: prepared.base_cycle,
+                current: self.cycle,
+            });
+        }
+        self.cycle = prepared.snapshot.cycle;
+        self.economies = prepared.next_economies;
+        self.occupations = prepared.next_occupations;
+        self.latest = Some(prepared.snapshot.clone());
+        Ok((prepared.snapshot, prepared.counters))
     }
 
     fn validate_progress(&self, input: &StrategicCycleInput) -> Result<(), StrategicError> {
@@ -555,6 +768,269 @@ impl StrategicSimulation {
         }
         Ok(())
     }
+}
+
+/// Reproduce the browser capitulation allocator without mutating territory.
+/// Existing hostile primary occupation always wins its cell; only remaining
+/// victim-owned cells consume casualty-weighted quotas.
+pub fn plan_surrender_allocation(
+    input: SurrenderAllocationInput<'_>,
+) -> Result<SurrenderAllocationPlan, StrategicError> {
+    let total_cells =
+        input
+            .width
+            .checked_mul(input.height)
+            .ok_or(StrategicError::InvalidSurrenderAllocation(
+                "grid dimensions overflow",
+            ))?;
+    if input.victim_country_id == 0
+        || input.width == 0
+        || input.height == 0
+        || !input.grid_resolution.is_finite()
+        || input.grid_resolution <= 0.0
+        || input.land.len() != total_cells
+        || input.world_control.len() != total_cells
+        || input.de_jure.len() != total_cells
+        || input.primary_occupier.len() != total_cells
+    {
+        return Err(StrategicError::InvalidSurrenderAllocation(
+            "map dimensions or victim are invalid",
+        ));
+    }
+    if input.units.iter().any(|unit| {
+        unit.country_id == 0
+            || ![unit.lat, unit.lng, unit.health]
+                .into_iter()
+                .all(f64::is_finite)
+    }) {
+        return Err(StrategicError::InvalidSurrenderAllocation(
+            "unit position is invalid",
+        ));
+    }
+
+    let hostile = input
+        .hostile_attacker_ids
+        .iter()
+        .copied()
+        .filter(|country_id| *country_id > 0 && *country_id != input.victim_country_id)
+        .collect::<BTreeSet<_>>();
+    if hostile.is_empty() {
+        return Err(StrategicError::NoHostileRecipient);
+    }
+    let casualty_row = input.casualties_by_victim.get(&input.victim_country_id);
+    if casualty_row.is_some_and(|row| {
+        row.iter()
+            .any(|(&country_id, &loss)| country_id == 0 || !loss.is_finite() || loss < 0.0)
+    }) {
+        return Err(StrategicError::InvalidSurrenderAllocation(
+            "casualty row is invalid",
+        ));
+    }
+    let casualty = |country_id: u16| {
+        casualty_row
+            .and_then(|row| row.get(&country_id))
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let entries = hostile
+        .iter()
+        .copied()
+        .map(|country_id| CasualtyEntry {
+            country_id,
+            casualties: casualty(country_id),
+        })
+        .collect::<Vec<_>>();
+    let mut selected = eligible_casualty_attackers(&entries, 0.25)?;
+
+    let mut victim_owned_cells = Vec::new();
+    let mut physical_control_counts = BTreeMap::<u16, u64>::new();
+    let mut victim_lat_sum = 0.0;
+    let mut victim_lng_sum = 0.0;
+    let mut victim_core_count = 0_u64;
+    let mut unoccupied_count = 0_u64;
+    for cell in 0..total_cells {
+        if input.de_jure[cell] == input.victim_country_id && input.land[cell] > 0 {
+            let (lat, lng) = cell_position(cell, input.width, input.grid_resolution);
+            victim_lat_sum += lat;
+            victim_lng_sum += lng;
+            victim_core_count += 1;
+            let controller = if input.primary_occupier[cell] > 0 {
+                input.primary_occupier[cell]
+            } else {
+                input.world_control[cell]
+            };
+            if hostile.contains(&controller) {
+                *physical_control_counts.entry(controller).or_default() += 1;
+            }
+        }
+        if input.world_control[cell] == input.victim_country_id && input.land[cell] > 0 {
+            victim_owned_cells.push(cell);
+            if !hostile.contains(&input.primary_occupier[cell]) {
+                unoccupied_count += 1;
+            }
+        }
+    }
+    let victim_center = if victim_core_count > 0 {
+        (
+            victim_lat_sum / victim_core_count as f64,
+            victim_lng_sum / victim_core_count as f64,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+
+    if selected.is_empty() {
+        let physical = physical_control_counts
+            .iter()
+            .max_by(|(left_id, left_count), (right_id, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| casualty(**left_id).total_cmp(&casualty(**right_id)))
+                    .then_with(|| right_id.cmp(left_id))
+            })
+            .map(|(&country_id, _)| country_id);
+        let fallback = physical.or_else(|| {
+            input
+                .units
+                .iter()
+                .filter(|unit| hostile.contains(&unit.country_id) && unit.health > 0.0)
+                .min_by(|left, right| {
+                    distance_to_center(left, victim_center)
+                        .total_cmp(&distance_to_center(right, victim_center))
+                        .then_with(|| left.country_id.cmp(&right.country_id))
+                })
+                .map(|unit| unit.country_id)
+        });
+        let country_id = fallback.ok_or(StrategicError::NoDeterministicRecipient)?;
+        selected.push(crate::surrender::CasualtyShare {
+            country_id,
+            casualties: casualty(country_id),
+            share: 1.0,
+        });
+    }
+
+    let quotas = largest_remainder_quotas(&selected, unoccupied_count)?;
+    let selected_ids = selected
+        .iter()
+        .map(|entry| entry.country_id)
+        .collect::<BTreeSet<_>>();
+    let mut centroids = BTreeMap::<u16, (f64, f64, u64)>::new();
+    for country_id in &selected_ids {
+        centroids.insert(*country_id, (0.0, 0.0, 0));
+    }
+    for cell in 0..total_cells {
+        if let Some(centroid) = centroids.get_mut(&input.world_control[cell]) {
+            let (lat, lng) = cell_position(cell, input.width, input.grid_resolution);
+            centroid.0 += lat;
+            centroid.1 += lng;
+            centroid.2 += 1;
+        }
+    }
+    let centroids = centroids
+        .into_iter()
+        .map(|(country_id, (lat_sum, lng_sum, count))| {
+            let center = if count > 0 {
+                (lat_sum / count as f64, lng_sum / count as f64)
+            } else {
+                victim_center
+            };
+            (country_id, center)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let quota_by_country = quotas
+        .iter()
+        .map(|quota| (quota.country_id, quota.quota))
+        .collect::<BTreeMap<_, _>>();
+    let mut used_by_country = BTreeMap::<u16, u32>::new();
+    let mut assignments = BTreeMap::<usize, u16>::new();
+    for &cell in &victim_owned_cells {
+        let physical = input.primary_occupier[cell];
+        if hostile.contains(&physical) {
+            assignments.insert(cell, physical);
+            continue;
+        }
+        let cell_center = cell_position(cell, input.width, input.grid_resolution);
+        let recipient = selected
+            .iter()
+            .filter(|entry| {
+                used_by_country.get(&entry.country_id).copied().unwrap_or(0)
+                    < quota_by_country
+                        .get(&entry.country_id)
+                        .copied()
+                        .unwrap_or(0)
+            })
+            .min_by(|left, right| {
+                wrapped_distance_squared(cell_center, centroids[&left.country_id])
+                    .total_cmp(&wrapped_distance_squared(
+                        cell_center,
+                        centroids[&right.country_id],
+                    ))
+                    .then_with(|| left.country_id.cmp(&right.country_id))
+            })
+            .map(|entry| entry.country_id)
+            .ok_or(StrategicError::IncompleteSurrenderAllocation)?;
+        assignments.insert(cell, recipient);
+        *used_by_country.entry(recipient).or_default() += 1;
+    }
+
+    let mut final_control_counts = BTreeMap::<u16, u64>::new();
+    for cell in 0..total_cells {
+        if input.de_jure[cell] != input.victim_country_id || input.land[cell] == 0 {
+            continue;
+        }
+        let controller = assignments
+            .get(&cell)
+            .copied()
+            .unwrap_or(input.world_control[cell]);
+        if hostile.contains(&controller) {
+            *final_control_counts.entry(controller).or_default() += 1;
+        }
+    }
+    let primary_annexer_id = final_control_counts
+        .iter()
+        .max_by(|(left_id, left_count), (right_id, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| casualty(**left_id).total_cmp(&casualty(**right_id)))
+                .then_with(|| right_id.cmp(left_id))
+        })
+        .map(|(&country_id, _)| country_id)
+        .or_else(|| selected.first().map(|entry| entry.country_id))
+        .ok_or(StrategicError::NoDeterministicRecipient)?;
+    let transfers = victim_owned_cells
+        .into_iter()
+        .map(|cell| SurrenderCellTransfer {
+            cell,
+            original_owner: input.victim_country_id,
+            new_owner: assignments[&cell],
+        })
+        .collect();
+    Ok(SurrenderAllocationPlan {
+        victim_country_id: input.victim_country_id,
+        primary_annexer_id,
+        transfers,
+    })
+}
+
+fn cell_position(cell: usize, width: usize, resolution: f64) -> (f64, f64) {
+    let y = cell / width;
+    let x = cell % width;
+    (y as f64 * resolution - 90.0, x as f64 * resolution - 180.0)
+}
+
+fn distance_to_center(unit: &SurrenderUnitPosition, center: (f64, f64)) -> f64 {
+    wrapped_distance_squared((unit.lat, unit.lng), center)
+}
+
+fn wrapped_distance_squared(left: (f64, f64), right: (f64, f64)) -> f64 {
+    let dlat = left.0 - right.0;
+    let mut dlng = left.1 - right.1;
+    if dlng > 180.0 {
+        dlng -= 360.0;
+    } else if dlng < -180.0 {
+        dlng += 360.0;
+    }
+    dlat * dlat + dlng * dlng
 }
 
 fn validate_country_inputs(
@@ -687,6 +1163,7 @@ mod tests {
             }],
             active_sides: vec![0, 1],
             active_hostile_pairs: vec![(0, 1)],
+            capitulation_active_sides: None,
         }
     }
 
@@ -876,6 +1353,22 @@ mod tests {
     }
 
     #[test]
+    fn directed_capitulation_eligibility_requires_outgoing_hostility() {
+        let mut simulation =
+            StrategicSimulation::new([economy(1), economy(2)], [occupation()]).unwrap();
+        let mut cycle = input();
+        // The canonical pair keeps the war active, but only side 0 has an
+        // outgoing hostility edge. Side 1 therefore cannot capitulate.
+        cycle.capitulation_active_sides = Some(vec![0]);
+
+        let (snapshot, counters) = simulation.run_cycle(&cycle).unwrap();
+        assert!(snapshot.surrenders.is_empty());
+        assert_eq!(counters.capitulations, 0);
+        assert!(!simulation.economies()[&2].capitulated);
+        assert!(snapshot.conflict_resolution.is_none());
+    }
+
+    #[test]
     fn inactive_country_cannot_emit_desertion_commands() {
         let mut inactive_economy = economy(2);
         inactive_economy.treasury = 0.0;
@@ -940,6 +1433,169 @@ mod tests {
         assert!(snapshot.conflict_resolution.is_none());
         assert!(!simulation.economies()[&1].capitulated);
         assert!(simulation.economies()[&3].capitulated);
+    }
+
+    #[test]
+    fn prepared_cycle_is_inert_until_committed() {
+        let mut simulation =
+            StrategicSimulation::new([economy(1), economy(2)], [occupation()]).unwrap();
+        let before_economies = simulation.economies().clone();
+        let prepared = simulation.prepare_cycle(&input()).unwrap();
+
+        assert_eq!(prepared.snapshot().cycle, 1);
+        assert_eq!(prepared.counters().capitulations, 1);
+        assert_eq!(simulation.cycle(), 0);
+        assert_eq!(simulation.economies(), &before_economies);
+        assert!(simulation.latest_snapshot().is_none());
+
+        let (published, counters) = simulation.commit_cycle(prepared).unwrap();
+        assert_eq!(published.cycle, 1);
+        assert_eq!(counters.capitulations, 1);
+        assert!(simulation.economies()[&2].capitulated);
+    }
+
+    #[test]
+    fn stale_prepared_cycle_cannot_overwrite_a_committed_cycle() {
+        let mut simulation =
+            StrategicSimulation::new([economy(1), economy(2)], [occupation()]).unwrap();
+        let first = simulation.prepare_cycle(&input()).unwrap();
+        let stale = simulation.prepare_cycle(&input()).unwrap();
+        simulation.commit_cycle(first).unwrap();
+        let economies = simulation.economies().clone();
+        let published = simulation.latest_snapshot().unwrap();
+
+        assert!(matches!(
+            simulation.commit_cycle(stale),
+            Err(StrategicError::StalePreparedCycle {
+                prepared: 0,
+                current: 1
+            })
+        ));
+        assert_eq!(simulation.economies(), &economies);
+        assert!(Arc::ptr_eq(
+            &simulation.latest_snapshot().unwrap(),
+            &published
+        ));
+    }
+
+    #[test]
+    fn prepared_cycle_registers_new_occupation_in_state_and_publication() {
+        let simulation = StrategicSimulation::new([economy(1), economy(2)], []).unwrap();
+        let mut cycle = input();
+        cycle.occupations.clear();
+        let mut prepared = simulation.prepare_cycle(&cycle).unwrap();
+        let mut state = occupation();
+        state.queued_at_cycle = prepared.snapshot().cycle;
+
+        assert!(prepared.economy(1).is_some());
+        prepared.register_occupation(state.clone()).unwrap();
+        assert_eq!(&*prepared.snapshot().occupations, &[state.clone()]);
+        assert!(matches!(
+            prepared.register_occupation(state),
+            Err(StrategicError::DuplicateOccupation(2))
+        ));
+    }
+
+    #[test]
+    fn surrender_plan_preserves_physical_occupation_then_uses_quotas_and_centroids() {
+        let land = vec![1; 10];
+        let mut world_control = vec![2; 10];
+        world_control[0] = 1;
+        world_control[9] = 3;
+        let de_jure = vec![2; 10];
+        let mut primary_occupier = vec![0; 10];
+        primary_occupier[2] = 3;
+        let ledger = BTreeMap::from([(2, BTreeMap::from([(1, 75.0), (3, 25.0)]))]);
+        let plan = plan_surrender_allocation(SurrenderAllocationInput {
+            victim_country_id: 2,
+            hostile_attacker_ids: &[3, 1, 3],
+            casualties_by_victim: &ledger,
+            width: 10,
+            height: 1,
+            grid_resolution: 1.0,
+            land: &land,
+            world_control: &world_control,
+            de_jure: &de_jure,
+            primary_occupier: &primary_occupier,
+            units: &[],
+        })
+        .unwrap();
+
+        assert_eq!(plan.victim_country_id, 2);
+        assert_eq!(plan.primary_annexer_id, 1);
+        assert_eq!(plan.transfers.len(), 8);
+        let recipients = plan
+            .transfers
+            .iter()
+            .map(|transfer| (transfer.cell, transfer.new_owner))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(recipients[&2], 3);
+        assert_eq!(recipients.values().filter(|&&id| id == 1).count(), 5);
+        assert_eq!(recipients.values().filter(|&&id| id == 3).count(), 3);
+    }
+
+    #[test]
+    fn surrender_fallback_prefers_physical_control_then_nearest_live_unit() {
+        let land = vec![1; 4];
+        let world_control = vec![2; 4];
+        let de_jure = vec![2; 4];
+        let mut occupied = vec![0; 4];
+        occupied[0] = 4;
+        occupied[1] = 4;
+        occupied[2] = 3;
+        let empty_ledger = BTreeMap::new();
+        let physical = plan_surrender_allocation(SurrenderAllocationInput {
+            victim_country_id: 2,
+            hostile_attacker_ids: &[3, 4],
+            casualties_by_victim: &empty_ledger,
+            width: 4,
+            height: 1,
+            grid_resolution: 1.0,
+            land: &land,
+            world_control: &world_control,
+            de_jure: &de_jure,
+            primary_occupier: &occupied,
+            units: &[],
+        })
+        .unwrap();
+        assert_eq!(physical.primary_annexer_id, 4);
+
+        let clear = vec![0; 4];
+        let units = [
+            SurrenderUnitPosition {
+                country_id: 4,
+                lat: -90.0,
+                lng: -178.5,
+                health: 100.0,
+            },
+            SurrenderUnitPosition {
+                country_id: 3,
+                lat: -90.0,
+                lng: -178.5,
+                health: 100.0,
+            },
+        ];
+        let nearest = plan_surrender_allocation(SurrenderAllocationInput {
+            victim_country_id: 2,
+            hostile_attacker_ids: &[4, 3],
+            casualties_by_victim: &empty_ledger,
+            width: 4,
+            height: 1,
+            grid_resolution: 1.0,
+            land: &land,
+            world_control: &world_control,
+            de_jure: &de_jure,
+            primary_occupier: &clear,
+            units: &units,
+        })
+        .unwrap();
+        assert_eq!(nearest.primary_annexer_id, 3);
+        assert!(
+            nearest
+                .transfers
+                .iter()
+                .all(|transfer| transfer.new_owner == 3)
+        );
     }
 
     #[test]

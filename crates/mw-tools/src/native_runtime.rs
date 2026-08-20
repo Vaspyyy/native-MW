@@ -16,18 +16,19 @@ use std::{
 use anyhow::{Context, Result, bail};
 use mw_core::{
     ARMOR_PAYROLL_PER_100, CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand,
-    DecodedScenario, EconomyState, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
-    OccupationState, PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers,
+    ConflictResolutionPlan, DecodedScenario, EconomyState, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION,
+    NativeRuntime, OccupationState, PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers,
     ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot,
     RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation,
     SimulationConfig, SimulationUnit, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE,
-    TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps, UnitAiPolicy,
-    UnitInfluencePolicy, UnitKind, decode_mwsc_gzip, derive_scenario_production,
+    TerritoryCity, TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps,
+    UnitAiPolicy, UnitInfluencePolicy, UnitKind, decode_mwsc_gzip, derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const NATIVE_RUNTIME_CHECKPOINT_SCHEMA: &str = "native-runtime-checkpoint-v1";
+pub const NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA: &str = "native-runtime-checkpoint-v2";
 
 const DEFAULT_GRID_RESOLUTION: f64 = 0.15;
 const DEFAULT_BENCH_REPEAT: usize = 7;
@@ -72,7 +73,7 @@ pub fn run_fixture_command(args: Vec<String>) -> Result<()> {
     let requested_steps = options.ticks.unwrap_or(prepared.checkpoint.steps);
     let execution = execute_fixture(&prepared, requested_steps)?;
     let body = RuntimeFixtureReportBody {
-        schema: NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+        schema: prepared.schema(),
         runtime_schema: NATIVE_RUNTIME_SCHEMA_VERSION,
         checkpoint_boundary: prepared.boundary_report(),
         scenario: prepared.identity_report(),
@@ -146,7 +147,7 @@ pub fn run_bench_command(args: Vec<String>) -> Result<()> {
     // gate remains clear; callers must never silently acknowledge commands.
     let persistent = execute_persistent_benchmark(&prepared, &options, ticks)?;
     let body = RuntimeBenchReportBody {
-        schema: NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+        schema: prepared.schema(),
         runtime_schema: NATIVE_RUNTIME_SCHEMA_VERSION,
         mode: "bench",
         checkpoint_boundary: prepared.boundary_report(),
@@ -375,6 +376,8 @@ struct RuntimeCheckpointFixture {
     scenario: ScenarioExpectation,
     #[serde(default)]
     geography: Option<GeographyFixture>,
+    #[serde(default)]
+    territory: Option<TerritoryV2Fixture>,
     sides: Vec<SideFixture>,
     active_sides: Vec<u16>,
     hostility_matrix: Vec<u8>,
@@ -389,6 +392,8 @@ struct RuntimeCheckpointFixture {
     occupations: Vec<OccupationFixture>,
     #[serde(default)]
     casualties: BTreeMap<u16, f64>,
+    #[serde(default)]
+    casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -399,11 +404,51 @@ struct GeographyFixture {
     de_jure_runs: Vec<(u64, u16)>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerritoryV2Fixture {
+    encoding: String,
+    maps: TerritoryV2MapsFixture,
+    revisions: TerritoryRevisionFixture,
+    committed_census: TerritoryCommittedCensusFixture,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerritoryV2MapsFixture {
+    land_runs: Vec<(u64, u8)>,
+    world_control_runs: Vec<(u64, u16)>,
+    de_jure_runs: Vec<(u64, u16)>,
+    primary_occupier_runs: Vec<(u64, u16)>,
+    dominant_side_runs: Vec<(u64, i16)>,
+    occupation_bits_runs: Vec<(u64, u32)>,
+    side_influence_bits_runs: Vec<Vec<(u64, u32)>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerritoryRevisionFixture {
+    topology_revision: u64,
+    world_revision: u64,
+    city_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerritoryCommittedCensusFixture {
+    generation: u64,
+    commit_sequence: u64,
+    mutation_sequence: u64,
+    processed_tiles: usize,
+    processed_items: usize,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum CheckpointBoundary {
     PostStartWar,
     BaselineReplay,
+    MidWar,
 }
 
 impl CheckpointBoundary {
@@ -411,11 +456,12 @@ impl CheckpointBoundary {
         match self {
             Self::PostStartWar => "postStartWar",
             Self::BaselineReplay => "baselineReplay",
+            Self::MidWar => "midWar",
         }
     }
 
     const fn resumable(self) -> bool {
-        matches!(self, Self::PostStartWar)
+        matches!(self, Self::PostStartWar | Self::MidWar)
     }
 
     const fn description(self) -> &'static str {
@@ -425,6 +471,9 @@ impl CheckpointBoundary {
             }
             Self::BaselineReplay => {
                 "synthetic baseline replay for fixtures and benchmarks; not resumable game state"
+            }
+            Self::MidWar => {
+                "production-resumable quiescent mid-war checkpoint with committed live territory"
             }
         }
     }
@@ -631,6 +680,7 @@ struct PreparedRuntime {
     checkpoint: RuntimeCheckpointFixture,
     country_to_side: BTreeMap<u16, usize>,
     coalition_by_side: Vec<BTreeSet<u16>>,
+    live_territory_maps: Option<TerritoryMaps>,
 }
 
 /// Fully validated production handoff for native rendering and simulation.
@@ -660,7 +710,8 @@ pub fn load_runtime_checkpoint(
     let runtime = build_runtime(&prepared)?;
     let checkpoint_boundary = prepared.checkpoint.checkpoint_boundary.as_str();
     let resumable = prepared.checkpoint.checkpoint_boundary.resumable();
-    let exact_geography_supplied = prepared.checkpoint.geography.is_some();
+    let exact_geography_supplied =
+        prepared.checkpoint.geography.is_some() || prepared.checkpoint.territory.is_some();
     let unit_count = prepared.checkpoint.units.len();
     Ok(LoadedRuntime {
         decoded: prepared.decoded,
@@ -717,6 +768,25 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         validate_exact_geography_owners(&decoded, &production)?;
     }
     let (country_to_side, coalition_by_side) = topology(&checkpoint)?;
+    let live_territory_maps = checkpoint
+        .territory
+        .as_ref()
+        .map(|territory| {
+            decode_territory_v2(
+                territory,
+                decoded.target.cell_count()?,
+                checkpoint.sides.len(),
+            )
+        })
+        .transpose()?;
+    if let Some(maps) = live_territory_maps.as_ref() {
+        validate_live_territory_owners(maps, &production)?;
+        // The viewer must receive the same live geography that seeds the
+        // runtime rather than the immutable scenario baseline.
+        decoded.land.clone_from(&maps.land);
+        decoded.world_control.clone_from(&maps.world_control);
+        decoded.de_jure.clone_from(&maps.de_jure);
+    }
     validate_checkpoint_against_scenario(&checkpoint, &production, &country_to_side)?;
 
     Ok(PreparedRuntime {
@@ -727,7 +797,124 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         checkpoint,
         country_to_side,
         coalition_by_side,
+        live_territory_maps,
     })
+}
+
+fn decode_territory_v2(
+    territory: &TerritoryV2Fixture,
+    cell_count: usize,
+    side_count: usize,
+) -> Result<TerritoryMaps> {
+    if territory.encoding != "rle-bits-v1" {
+        bail!(
+            "unsupported territory encoding {:?}; expected \"rle-bits-v1\"",
+            territory.encoding
+        );
+    }
+    if territory.maps.side_influence_bits_runs.len() != side_count {
+        bail!("territory side influence rows must exactly match the checkpoint side count");
+    }
+    let land = decode_runs(
+        &territory.maps.land_runs,
+        cell_count,
+        "territory.maps.landRuns",
+        |value| (*value <= 2).then_some(*value),
+    )?;
+    let world_control = decode_runs(
+        &territory.maps.world_control_runs,
+        cell_count,
+        "territory.maps.worldControlRuns",
+        |value| Some(*value),
+    )?;
+    let de_jure = decode_runs(
+        &territory.maps.de_jure_runs,
+        cell_count,
+        "territory.maps.deJureRuns",
+        |value| Some(*value),
+    )?;
+    let primary_occupier = decode_runs(
+        &territory.maps.primary_occupier_runs,
+        cell_count,
+        "territory.maps.primaryOccupierRuns",
+        |value| Some(*value),
+    )?;
+    let dominant_side = decode_runs(
+        &territory.maps.dominant_side_runs,
+        cell_count,
+        "territory.maps.dominantSideRuns",
+        |value| match *value {
+            -1 => Some(-1),
+            side if usize::try_from(side).is_ok_and(|side| side < side_count) => Some(side),
+            _ => None,
+        },
+    )?;
+    let occupation = decode_runs(
+        &territory.maps.occupation_bits_runs,
+        cell_count,
+        "territory.maps.occupationBitsRuns",
+        |bits| {
+            let value = f32::from_bits(*bits);
+            value.is_finite().then_some(value)
+        },
+    )?;
+    let side_influence = territory
+        .maps
+        .side_influence_bits_runs
+        .iter()
+        .enumerate()
+        .map(|(side, runs)| {
+            decode_runs(
+                runs,
+                cell_count,
+                &format!("territory.maps.sideInfluenceBitsRuns[{side}]"),
+                |bits| {
+                    let value = f32::from_bits(*bits);
+                    (value.is_finite() && value >= 0.0).then_some(value)
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TerritoryMaps {
+        land,
+        world_control,
+        de_jure,
+        primary_occupier,
+        dominant_side,
+        occupation,
+        side_influence,
+    })
+}
+
+fn validate_live_territory_owners(
+    maps: &TerritoryMaps,
+    production: &ScenarioProduction,
+) -> Result<()> {
+    let known = production
+        .countries
+        .iter()
+        .map(|country| country.country_id)
+        .collect::<BTreeSet<_>>();
+    for (label, owners) in [
+        (
+            "territory.maps.worldControlRuns",
+            maps.world_control.as_slice(),
+        ),
+        ("territory.maps.deJureRuns", maps.de_jure.as_slice()),
+        (
+            "territory.maps.primaryOccupierRuns",
+            maps.primary_occupier.as_slice(),
+        ),
+    ] {
+        if let Some(owner) = owners
+            .iter()
+            .copied()
+            .find(|owner| *owner != 0 && !known.contains(owner))
+        {
+            bail!("{label} references country {owner}, which is absent from scenario metadata");
+        }
+    }
+    Ok(())
 }
 
 fn decode_geography(geography: &GeographyFixture, cell_count: usize) -> Result<DecodedGeography> {
@@ -825,12 +1012,34 @@ fn validate_exact_geography_owner_ids(
 }
 
 fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()> {
-    if checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_SCHEMA {
-        bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}",
+    match checkpoint.schema.as_str() {
+        NATIVE_RUNTIME_CHECKPOINT_SCHEMA => {
+            if checkpoint.checkpoint_boundary == CheckpointBoundary::MidWar
+                || checkpoint.territory.is_some()
+                || !checkpoint.casualties_by_victim.is_empty()
+            {
+                bail!("checkpoint-v1 cannot contain checkpoint-v2 live state");
+            }
+        }
+        NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+            {
+                bail!(
+                    "checkpoint-v2 requires boundary midWar, immutable baseline geography, and live territory"
+                );
+            }
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v2 strategicCycle must leave room for a later cycle");
+            }
+        }
+        _ => bail!(
+            "unsupported native runtime checkpoint schema {:?}; expected {:?} or {:?}",
             checkpoint.schema,
-            NATIVE_RUNTIME_CHECKPOINT_SCHEMA
-        );
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA
+        ),
     }
     if checkpoint.steps == 0 {
         bail!("native runtime checkpoint must request at least one step");
@@ -875,6 +1084,22 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
         checkpoint.checkpoint_boundary,
         checkpoint.geography.as_ref(),
     )?;
+    if let Some(territory) = checkpoint.territory.as_ref() {
+        validate_territory_markers(territory)?;
+    }
+    Ok(())
+}
+
+fn validate_territory_markers(territory: &TerritoryV2Fixture) -> Result<()> {
+    let census = territory.committed_census;
+    if census.generation == 0
+        || census.generation == u64::MAX
+        || census.commit_sequence == 0
+        || census.processed_tiles == 0
+        || census.processed_items == 0
+    {
+        bail!("midWar territory must contain a completed, advancing census commit");
+    }
     Ok(())
 }
 
@@ -884,6 +1109,9 @@ fn validate_geography_boundary(
 ) -> Result<()> {
     if boundary == CheckpointBoundary::PostStartWar && geography.is_none() {
         bail!("postStartWar checkpoint boundary requires exact geography");
+    }
+    if boundary == CheckpointBoundary::MidWar && geography.is_none() {
+        bail!("midWar checkpoint boundary requires immutable baseline geography");
     }
     Ok(())
 }
@@ -998,6 +1226,60 @@ fn validate_checkpoint_boundary(
     country_to_side: &BTreeMap<u16, usize>,
 ) -> Result<()> {
     if checkpoint.checkpoint_boundary == CheckpointBoundary::BaselineReplay {
+        return Ok(());
+    }
+    if checkpoint.checkpoint_boundary == CheckpointBoundary::MidWar {
+        let declared = country_to_side.keys().copied().collect::<BTreeSet<_>>();
+        if checkpoint
+            .casualties
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != declared
+        {
+            bail!("midWar casualties must exactly cover every declared country");
+        }
+        if checkpoint
+            .casualties_by_victim
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != declared
+        {
+            bail!("midWar casualtiesByVictim must exactly cover every declared country");
+        }
+        for (&victim, attackers) in &checkpoint.casualties_by_victim {
+            if !declared.contains(&victim) {
+                bail!("casualtiesByVictim references undeclared victim {victim}");
+            }
+            for (&attacker, value) in attackers {
+                if attacker == victim
+                    || !declared.contains(&attacker)
+                    || !value.is_finite()
+                    || *value < 0.0
+                {
+                    bail!(
+                        "casualtiesByVictim entries must use distinct declared countries and finite non-negative values"
+                    );
+                }
+            }
+        }
+        let active_from_economy = checkpoint
+            .economies
+            .iter()
+            .filter(|economy| !economy.capitulated)
+            .filter_map(|economy| country_to_side.get(&economy.country_id).copied())
+            .map(|side| side as u16)
+            .collect::<BTreeSet<_>>();
+        if checkpoint
+            .active_sides
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != active_from_economy
+        {
+            bail!("midWar activeSides must exactly match non-capitulated country economies");
+        }
         return Ok(());
     }
     if checkpoint.tick != 0 || checkpoint.frame != 0 || checkpoint.strategic_cycle != 0 {
@@ -1333,6 +1615,7 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         objectives: Vec::new(),
         prior_objective_by_unit: BTreeMap::new(),
         casualties: checkpoint.casualties.clone(),
+        casualties_by_victim: checkpoint.casualties_by_victim.clone(),
     };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
@@ -1344,31 +1627,67 @@ fn build_territory(prepared: &PreparedRuntime) -> Result<TerritoryControl> {
     let decoded = &prepared.decoded;
     let cell_count = decoded.target.cell_count()?;
     let side_count = prepared.checkpoint.sides.len();
-    let mut land = vec![0_u8; cell_count];
-    let mut primary_occupier = vec![0_u16; cell_count];
-    let mut dominant_side = vec![-1_i16; cell_count];
-    let mut occupation = vec![0.0_f32; cell_count];
-    let mut side_influence = (0..side_count)
-        .map(|_| vec![0.0_f32; cell_count])
-        .collect::<Vec<_>>();
+    let (maps, revisions, committed) = if let Some(maps) = prepared.live_territory_maps.as_ref() {
+        let territory = prepared
+            .checkpoint
+            .territory
+            .as_ref()
+            .context("live territory maps are missing their checkpoint markers")?;
+        (
+            maps.clone(),
+            territory.revisions,
+            Some(TerritoryCommittedState {
+                generation: territory.committed_census.generation,
+                commit_sequence: territory.committed_census.commit_sequence,
+                mutation_sequence: territory.committed_census.mutation_sequence,
+                processed_tiles: territory.committed_census.processed_tiles,
+                processed_items: territory.committed_census.processed_items,
+            }),
+        )
+    } else {
+        let mut land = vec![0_u8; cell_count];
+        let mut primary_occupier = vec![0_u16; cell_count];
+        let mut dominant_side = vec![-1_i16; cell_count];
+        let mut occupation = vec![0.0_f32; cell_count];
+        let mut side_influence = (0..side_count)
+            .map(|_| vec![0.0_f32; cell_count])
+            .collect::<Vec<_>>();
 
-    for cell in 0..cell_count {
-        if decoded.land[cell] == 0 {
-            continue;
+        for cell in 0..cell_count {
+            if decoded.land[cell] == 0 {
+                continue;
+            }
+            let owner = decoded.world_control[cell];
+            let Some(&side) = prepared.country_to_side.get(&owner) else {
+                // Non-theater land remains traversable, but is excluded from the
+                // active census and cannot fabricate a conflict or controller.
+                land[cell] = 1;
+                continue;
+            };
+            land[cell] = 2;
+            primary_occupier[cell] = owner;
+            dominant_side[cell] = i16::try_from(side).context("side exceeds territory width")?;
+            side_influence[side][cell] = 1.0;
+            occupation[cell] = if side.is_multiple_of(2) { 1.0 } else { -1.0 };
         }
-        let owner = decoded.world_control[cell];
-        let Some(&side) = prepared.country_to_side.get(&owner) else {
-            // Non-theater land remains traversable, but is excluded from the
-            // active census and cannot fabricate a conflict or controller.
-            land[cell] = 1;
-            continue;
-        };
-        land[cell] = 2;
-        primary_occupier[cell] = owner;
-        dominant_side[cell] = i16::try_from(side).context("side exceeds territory width")?;
-        side_influence[side][cell] = 1.0;
-        occupation[cell] = if side.is_multiple_of(2) { 1.0 } else { -1.0 };
-    }
+        (
+            TerritoryMaps {
+                land,
+                world_control: decoded.world_control.clone(),
+                de_jure: decoded.de_jure.clone(),
+                primary_occupier,
+                dominant_side,
+                occupation,
+                side_influence,
+            },
+            TerritoryRevisionFixture {
+                topology_revision: 1,
+                world_revision: 1,
+                city_revision: 1,
+            },
+            None,
+        )
+    };
 
     let cities = prepared
         .production
@@ -1383,29 +1702,26 @@ fn build_territory(prepared: &PreparedRuntime) -> Result<TerritoryControl> {
         })
         .collect::<Vec<_>>();
     let protected_owner_ids = prepared.country_to_side.keys().copied().collect();
-    Ok(TerritoryControl::new(TerritoryConfig {
+    let config = TerritoryConfig {
         width: decoded.target.width,
         height: decoded.target.height,
         grid_resolution: decoded.target.grid_res,
         max_sides: side_count,
         tile_size: TERRITORY_TILE_SIZE,
-        maps: TerritoryMaps {
-            land,
-            world_control: decoded.world_control.clone(),
-            de_jure: decoded.de_jure.clone(),
-            primary_occupier,
-            dominant_side,
-            occupation,
-            side_influence,
-        },
+        maps,
         country_to_side: prepared.country_to_side.clone(),
         hostility_matrix: prepared.checkpoint.hostility_matrix.clone(),
         cities,
         protected_owner_ids,
-        topology_revision: 1,
-        world_revision: 1,
-        city_revision: 1,
-    })?)
+        topology_revision: revisions.topology_revision,
+        world_revision: revisions.world_revision,
+        city_revision: revisions.city_revision,
+    };
+    Ok(if let Some(state) = committed {
+        TerritoryControl::restore(config, state)?
+    } else {
+        TerritoryControl::new(config)?
+    })
 }
 
 struct FixtureExecution {
@@ -1758,6 +2074,8 @@ struct PersistentModeReport {
 struct CheckpointReport {
     checkpoint_boundary: CheckpointBoundary,
     geography: GeographyReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    territory: Option<TerritoryCheckpointReport>,
     tick: u64,
     frame: u64,
     war_grace_end: u64,
@@ -1769,6 +2087,7 @@ struct CheckpointReport {
     economies: Vec<EconomyFixture>,
     occupations: usize,
     casualties: BTreeMap<u16, f64>,
+    casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1778,6 +2097,22 @@ struct GeographyReport {
     land_runs: usize,
     world_control_runs: usize,
     de_jure_runs: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerritoryCheckpointReport {
+    encoding: String,
+    land_runs: usize,
+    world_control_runs: usize,
+    de_jure_runs: usize,
+    primary_occupier_runs: usize,
+    dominant_side_runs: usize,
+    occupation_runs: usize,
+    side_influence_rows: usize,
+    side_influence_runs: usize,
+    revisions: TerritoryRevisionFixture,
+    committed_census: TerritoryCommittedCensusFixture,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1796,6 +2131,13 @@ struct RuntimeProductionReport {
 }
 
 impl PreparedRuntime {
+    fn schema(&self) -> &'static str {
+        match self.checkpoint.schema.as_str() {
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            _ => NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+        }
+    }
+
     fn boundary_report(&self) -> CheckpointBoundaryReport {
         CheckpointBoundaryReport {
             kind: self.checkpoint.checkpoint_boundary,
@@ -1815,26 +2157,54 @@ impl PreparedRuntime {
     }
 
     fn geography_report(&self) -> GeographyReport {
-        self.checkpoint.geography.as_ref().map_or(
+        if let Some(geography) = self.checkpoint.geography.as_ref() {
+            GeographyReport {
+                exact_geography_supplied: true,
+                land_runs: geography.land_runs.len(),
+                world_control_runs: geography.world_control_runs.len(),
+                de_jure_runs: geography.de_jure_runs.len(),
+            }
+        } else if let Some(territory) = self.checkpoint.territory.as_ref() {
+            GeographyReport {
+                exact_geography_supplied: true,
+                land_runs: territory.maps.land_runs.len(),
+                world_control_runs: territory.maps.world_control_runs.len(),
+                de_jure_runs: territory.maps.de_jure_runs.len(),
+            }
+        } else {
             GeographyReport {
                 exact_geography_supplied: false,
                 land_runs: 0,
                 world_control_runs: 0,
                 de_jure_runs: 0,
-            },
-            |geography| GeographyReport {
-                exact_geography_supplied: true,
-                land_runs: geography.land_runs.len(),
-                world_control_runs: geography.world_control_runs.len(),
-                de_jure_runs: geography.de_jure_runs.len(),
-            },
-        )
+            }
+        }
     }
 
     fn checkpoint_report(&self) -> CheckpointReport {
         CheckpointReport {
             checkpoint_boundary: self.checkpoint.checkpoint_boundary,
             geography: self.geography_report(),
+            territory: self.checkpoint.territory.as_ref().map(|territory| {
+                TerritoryCheckpointReport {
+                    encoding: territory.encoding.clone(),
+                    land_runs: territory.maps.land_runs.len(),
+                    world_control_runs: territory.maps.world_control_runs.len(),
+                    de_jure_runs: territory.maps.de_jure_runs.len(),
+                    primary_occupier_runs: territory.maps.primary_occupier_runs.len(),
+                    dominant_side_runs: territory.maps.dominant_side_runs.len(),
+                    occupation_runs: territory.maps.occupation_bits_runs.len(),
+                    side_influence_rows: territory.maps.side_influence_bits_runs.len(),
+                    side_influence_runs: territory
+                        .maps
+                        .side_influence_bits_runs
+                        .iter()
+                        .map(Vec::len)
+                        .sum(),
+                    revisions: territory.revisions,
+                    committed_census: territory.committed_census,
+                }
+            }),
             tick: self.checkpoint.tick,
             frame: self.checkpoint.frame,
             war_grace_end: self.checkpoint.war_grace_end,
@@ -1846,6 +2216,7 @@ impl PreparedRuntime {
             economies: self.checkpoint.economies.clone(),
             occupations: self.checkpoint.occupations.len(),
             casualties: self.checkpoint.casualties.clone(),
+            casualties_by_victim: self.checkpoint.casualties_by_victim.clone(),
         }
     }
 
@@ -1879,6 +2250,7 @@ struct RuntimeSnapshotReport {
     strategic: Option<StrategicSnapshotReport>,
     counters: Value,
     casualty_totals: BTreeMap<u16, f64>,
+    casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     pending_render_updates: usize,
     state_checksum: String,
 }
@@ -1897,6 +2269,8 @@ struct RuntimeStateReport {
     surrender_commands: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflict_resolution: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<ConflictResolutionPlan>,
 }
 
 impl From<RuntimeState> for RuntimeStateReport {
@@ -1909,6 +2283,7 @@ impl From<RuntimeState> for RuntimeStateReport {
                 desertion_commands: None,
                 surrender_commands: None,
                 conflict_resolution: None,
+                resolution: None,
             },
             RuntimeState::AwaitingStrategicEffects {
                 cycle,
@@ -1923,6 +2298,20 @@ impl From<RuntimeState> for RuntimeStateReport {
                 desertion_commands: Some(desertion_commands),
                 surrender_commands: Some(surrender_commands),
                 conflict_resolution: Some(conflict_resolution),
+                resolution: None,
+            },
+            RuntimeState::ConflictResolved {
+                cycle,
+                tick,
+                resolution,
+            } => Self {
+                kind: "conflictResolved",
+                cycle: Some(cycle),
+                tick: Some(tick),
+                desertion_commands: None,
+                surrender_commands: None,
+                conflict_resolution: Some(true),
+                resolution: Some(resolution),
             },
             RuntimeState::Poisoned => Self {
                 kind: "poisoned",
@@ -1931,6 +2320,7 @@ impl From<RuntimeState> for RuntimeStateReport {
                 desertion_commands: None,
                 surrender_commands: None,
                 conflict_resolution: None,
+                resolution: None,
             },
         }
     }
@@ -2099,6 +2489,7 @@ fn snapshot_report(
         strategic,
         counters: counters_json(snapshot),
         casualty_totals: snapshot.casualty_totals.as_ref().clone(),
+        casualties_by_victim: snapshot.casualties_by_victim.as_ref().clone(),
         pending_render_updates: snapshot.pending_render_updates,
         state_checksum: snapshot_checksum(snapshot)?,
     })
@@ -2189,6 +2580,16 @@ fn snapshot_checksum(snapshot: &RuntimeSnapshot) -> Result<String> {
             checksum.write_bool(conflict_resolution);
         }
         RuntimeState::Poisoned => checksum.write_u64(2),
+        RuntimeState::ConflictResolved {
+            cycle,
+            tick,
+            resolution,
+        } => {
+            checksum.write_u64(3);
+            checksum.write_u64(cycle);
+            checksum.write_u64(tick);
+            checksum.write_bytes(&serde_json::to_vec(&resolution)?);
+        }
     }
     checksum.write_usize(snapshot.frame_snapshot.units.len());
     for unit in snapshot.frame_snapshot.units.iter() {
@@ -2258,6 +2659,7 @@ fn snapshot_checksum(snapshot: &RuntimeSnapshot) -> Result<String> {
         checksum.write_bool(false);
     }
     checksum.write_bytes(&serde_json::to_vec(snapshot.casualty_totals.as_ref())?);
+    checksum.write_bytes(&serde_json::to_vec(snapshot.casualties_by_victim.as_ref())?);
     checksum.write_bytes(&serde_json::to_vec(&counters_json(snapshot))?);
     checksum.write_usize(snapshot.pending_render_updates);
     Ok(checksum.finish())
@@ -2496,6 +2898,74 @@ fn sha256_hex(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn valid_v2_territory() -> TerritoryV2Fixture {
+        TerritoryV2Fixture {
+            encoding: "rle-bits-v1".to_owned(),
+            maps: TerritoryV2MapsFixture {
+                land_runs: vec![(2, 1), (2, 2)],
+                world_control_runs: vec![(2, 1), (2, 2)],
+                de_jure_runs: vec![(1, 1), (3, 2)],
+                primary_occupier_runs: vec![(2, 1), (2, 2)],
+                dominant_side_runs: vec![(1, -1), (1, 0), (2, 1)],
+                occupation_bits_runs: vec![(2, 0.25_f32.to_bits()), (2, (-0.5_f32).to_bits())],
+                side_influence_bits_runs: vec![
+                    vec![(2, 1.0_f32.to_bits()), (2, 0.0_f32.to_bits())],
+                    vec![(2, 0.0_f32.to_bits()), (2, 1.0_f32.to_bits())],
+                ],
+            },
+            revisions: TerritoryRevisionFixture {
+                topology_revision: 7,
+                world_revision: 11,
+                city_revision: 13,
+            },
+            committed_census: TerritoryCommittedCensusFixture {
+                generation: 5,
+                commit_sequence: 4,
+                mutation_sequence: 9,
+                processed_tiles: 1,
+                processed_items: 4,
+            },
+        }
+    }
+
+    fn minimal_checkpoint(
+        schema: &str,
+        boundary: CheckpointBoundary,
+        territory: Option<TerritoryV2Fixture>,
+    ) -> RuntimeCheckpointFixture {
+        RuntimeCheckpointFixture {
+            schema: schema.to_owned(),
+            checkpoint_boundary: boundary,
+            scenario: ScenarioExpectation {
+                sha256: "0".repeat(64),
+                name: "test".to_owned(),
+                grid_res: 1.0,
+            },
+            geography: Some(GeographyFixture {
+                land_runs: vec![(4, 1)],
+                world_control_runs: vec![(4, 1)],
+                de_jure_runs: vec![(4, 1)],
+            }),
+            territory,
+            sides: vec![SideFixture {
+                side_index: 0,
+                country_ids: vec![1],
+            }],
+            active_sides: vec![0],
+            hostility_matrix: vec![0],
+            tick: 0,
+            frame: 0,
+            war_grace_end: 0,
+            strategic_cycle: 0,
+            steps: 1,
+            units: Vec::new(),
+            economies: Vec::new(),
+            occupations: Vec::new(),
+            casualties: BTreeMap::new(),
+            casualties_by_victim: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn sha256_matches_standard_vectors() {
         assert_eq!(
@@ -2519,10 +2989,134 @@ mod tests {
     fn checkpoint_boundaries_have_explicit_resume_semantics() {
         let production: CheckpointBoundary = serde_json::from_str("\"postStartWar\"").unwrap();
         let replay: CheckpointBoundary = serde_json::from_str("\"baselineReplay\"").unwrap();
+        let mid_war: CheckpointBoundary = serde_json::from_str("\"midWar\"").unwrap();
         assert!(production.resumable());
         assert!(!replay.resumable());
+        assert!(mid_war.resumable());
         assert!(replay.description().contains("not resumable"));
-        assert!(serde_json::from_str::<CheckpointBoundary>("\"midWar\"").is_err());
+        assert_eq!(mid_war.as_str(), "midWar");
+    }
+
+    #[test]
+    fn resolved_runtime_state_report_preserves_terminal_result() {
+        let resolution = ConflictResolutionPlan {
+            kind: mw_core::ConflictResolutionKind::FullCapitulation,
+            winner_side: Some(1),
+            stop_simulation: true,
+        };
+        let report = RuntimeStateReport::from(RuntimeState::ConflictResolved {
+            cycle: 8,
+            tick: 4_800,
+            resolution,
+        });
+        assert_eq!(report.kind, "conflictResolved");
+        assert_eq!(report.cycle, Some(8));
+        assert_eq!(report.tick, Some(4_800));
+        assert_eq!(report.conflict_resolution, Some(true));
+        assert_eq!(report.resolution, Some(resolution));
+    }
+
+    #[test]
+    fn checkpoint_v2_requires_its_mid_war_live_state_contract() {
+        let checkpoint = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            CheckpointBoundary::MidWar,
+            Some(valid_v2_territory()),
+        );
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut independently_advanced_cycle = checkpoint.clone();
+        independently_advanced_cycle.tick = 1;
+        independently_advanced_cycle.strategic_cycle = 7;
+        assert!(validate_checkpoint_shape(&independently_advanced_cycle).is_ok());
+
+        let mut exhausted_cycle = checkpoint.clone();
+        exhausted_cycle.strategic_cycle = u64::MAX;
+        assert!(validate_checkpoint_shape(&exhausted_cycle).is_err());
+
+        let mut wrong_boundary = checkpoint.clone();
+        wrong_boundary.checkpoint_boundary = CheckpointBoundary::PostStartWar;
+        assert!(validate_checkpoint_shape(&wrong_boundary).is_err());
+
+        let mut missing_geography = checkpoint.clone();
+        missing_geography.geography = None;
+        assert!(validate_checkpoint_shape(&missing_geography).is_err());
+
+        let mut missing_territory = checkpoint.clone();
+        missing_territory.territory = None;
+        assert!(validate_checkpoint_shape(&missing_territory).is_err());
+
+        let legacy_with_v2_state = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            CheckpointBoundary::PostStartWar,
+            Some(valid_v2_territory()),
+        );
+        assert!(validate_checkpoint_shape(&legacy_with_v2_state).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v2_decodes_exact_rle_and_float_bits() {
+        let decoded = decode_territory_v2(&valid_v2_territory(), 4, 2).unwrap();
+        assert_eq!(decoded.land, [1, 1, 2, 2]);
+        assert_eq!(decoded.world_control, [1, 1, 2, 2]);
+        assert_eq!(decoded.de_jure, [1, 2, 2, 2]);
+        assert_eq!(decoded.primary_occupier, [1, 1, 2, 2]);
+        assert_eq!(decoded.dominant_side, [-1, 0, 1, 1]);
+        assert_eq!(decoded.occupation, [0.25, 0.25, -0.5, -0.5]);
+        assert_eq!(decoded.side_influence[0], [1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(decoded.side_influence[1], [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn checkpoint_v2_rejects_corrupt_rle_and_float_maps() {
+        let mut invalid = valid_v2_territory();
+        invalid.maps.land_runs = vec![(0, 1), (4, 0)];
+        assert!(decode_territory_v2(&invalid, 4, 2).is_err());
+
+        invalid = valid_v2_territory();
+        invalid.maps.world_control_runs = vec![(3, 1)];
+        assert!(decode_territory_v2(&invalid, 4, 2).is_err());
+
+        invalid = valid_v2_territory();
+        invalid.maps.dominant_side_runs = vec![(4, 2)];
+        assert!(decode_territory_v2(&invalid, 4, 2).is_err());
+
+        invalid = valid_v2_territory();
+        invalid.maps.occupation_bits_runs = vec![(4, f32::NAN.to_bits())];
+        assert!(decode_territory_v2(&invalid, 4, 2).is_err());
+
+        invalid = valid_v2_territory();
+        invalid.maps.side_influence_bits_runs[0] = vec![(4, (-1.0_f32).to_bits())];
+        assert!(decode_territory_v2(&invalid, 4, 2).is_err());
+
+        invalid = valid_v2_territory();
+        invalid.maps.side_influence_bits_runs.pop();
+        assert!(decode_territory_v2(&invalid, 4, 2).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v2_requires_committed_advancing_census_markers() {
+        assert!(validate_territory_markers(&valid_v2_territory()).is_ok());
+
+        for mutate in [
+            |territory: &mut TerritoryV2Fixture| territory.committed_census.generation = 0,
+            |territory: &mut TerritoryV2Fixture| {
+                territory.committed_census.generation = u64::MAX;
+            },
+            |territory: &mut TerritoryV2Fixture| {
+                territory.committed_census.commit_sequence = 0;
+            },
+            |territory: &mut TerritoryV2Fixture| {
+                territory.committed_census.processed_tiles = 0;
+            },
+            |territory: &mut TerritoryV2Fixture| {
+                territory.committed_census.processed_items = 0;
+            },
+        ] {
+            let mut invalid = valid_v2_territory();
+            mutate(&mut invalid);
+            assert!(validate_territory_markers(&invalid).is_err());
+        }
     }
 
     #[test]

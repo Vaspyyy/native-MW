@@ -78,13 +78,16 @@ pub use scenario::{
     DecodedScenario, GridSpec, ScenarioError, decode_mwsc, decode_mwsc_gzip, decode_mwsc_gzip_file,
 };
 pub use simulation::{
-    FrameSnapshot, NATIVE_TICK_SCHEMA_VERSION, ResolvedCombatOrder, ResolvedUnitOrder, Simulation,
-    SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput, UnitSnapshot,
+    DesertionOutcome, FrameSnapshot, NATIVE_TICK_SCHEMA_VERSION, ResolvedCombatOrder,
+    ResolvedUnitOrder, Simulation, SimulationConfig, SimulationError, SimulationUnit, TickCounters,
+    TickInput, UnitSnapshot,
 };
 pub use strategic::{
-    CountryCycleInput, CountryStrategicSnapshot, DesertionCommand, OccupationCycleRecord,
-    STRATEGIC_SCHEMA_VERSION, StrategicCounters, StrategicCycleInput, StrategicError,
-    StrategicEvent, StrategicEventKind, StrategicSimulation, StrategicSnapshot, SurrenderCommand,
+    ConflictResolutionPlan, CountryCycleInput, CountryStrategicSnapshot, DesertionCommand,
+    OccupationCycleRecord, PreparedStrategicCycle, STRATEGIC_SCHEMA_VERSION, StrategicCounters,
+    StrategicCycleInput, StrategicError, StrategicEvent, StrategicEventKind, StrategicSimulation,
+    StrategicSnapshot, SurrenderAllocationInput, SurrenderAllocationPlan, SurrenderCellTransfer,
+    SurrenderCommand, SurrenderUnitPosition, plan_surrender_allocation,
 };
 pub use surrender::{
     CapitulationDecision, CapitulationInput, CapitulationReason, CasualtyEntry, CasualtyShare,
@@ -103,7 +106,7 @@ pub use tactical::{
 pub use territory::{
     CellStateUpdate, CensusStatus, CensusStepResult, CountryAggregate, DEFAULT_TERRITORY_TILE_SIZE,
     InfluenceApplyResult, InfluenceSource, SideAggregate, TERRITORY_SCHEMA_VERSION, TerritoryCity,
-    TerritoryConfig, TerritoryControl, TerritoryError, TerritoryMaps, TerritoryRenderUpdate,
-    TerritorySnapshot, TerritoryTilePixels, TileBounds,
+    TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryError, TerritoryMaps,
+    TerritoryRenderUpdate, TerritorySnapshot, TerritoryTilePixels, TileBounds,
 };
 pub use world::{WorldGridError, WorldGridView};

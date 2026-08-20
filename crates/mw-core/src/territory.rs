@@ -45,6 +45,8 @@ pub enum TerritoryError {
     InvalidSource { id: u64, reason: &'static str },
     #[error("cell or tile index {0} is outside the grid")]
     InvalidCell(usize),
+    #[error("invalid committed territory state: {0}")]
+    InvalidCommittedState(&'static str),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -88,7 +90,8 @@ pub struct TerritoryCity {
     pub capital: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct TerritoryMaps {
     pub land: Vec<u8>,
     pub world_control: Vec<u16>,
@@ -98,6 +101,19 @@ pub struct TerritoryMaps {
     pub occupation: Vec<f32>,
     /// One Float32 row per side.
     pub side_influence: Vec<Vec<f32>>,
+}
+
+/// Stable census markers paired with the exact live maps returned by
+/// [`TerritoryControl::checkpoint_maps`]. Private tile summaries are rebuilt
+/// deterministically during restore instead of becoming checkpoint authority.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TerritoryCommittedState {
+    pub generation: u64,
+    pub commit_sequence: u64,
+    pub mutation_sequence: u64,
+    pub processed_tiles: usize,
+    pub processed_items: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -467,6 +483,76 @@ impl TerritoryControl {
         })
     }
 
+    /// Restore an atomically committed territory boundary. The map arrays in
+    /// `config` remain the sole serialized map authority; census aggregates and
+    /// per-tile summaries are rebuilt from them before the supplied markers are
+    /// installed. Restore itself does not consume a generation or commit.
+    pub fn restore(
+        config: TerritoryConfig,
+        state: TerritoryCommittedState,
+    ) -> Result<Self, TerritoryError> {
+        if state.generation == 0 {
+            return Err(TerritoryError::InvalidCommittedState(
+                "generation must be positive",
+            ));
+        }
+        let next_generation =
+            state
+                .generation
+                .checked_add(1)
+                .ok_or(TerritoryError::InvalidCommittedState(
+                    "generation cannot advance",
+                ))?;
+        if state.commit_sequence == 0 {
+            return Err(TerritoryError::InvalidCommittedState(
+                "commit sequence must be positive",
+            ));
+        }
+
+        let mut control = Self::new(config)?;
+        let mut aggregate = Aggregate::default();
+        let mut committed_tiles = Vec::with_capacity(control.total_tiles());
+        for tile in 0..control.total_tiles() {
+            let mut work = control.create_tile_work(tile);
+            let tile_width = work.bounds.max_x - work.bounds.min_x;
+            while work.cell_offset < work.cell_count {
+                let x = work.bounds.min_x + work.cell_offset % tile_width;
+                let y = work.bounds.min_y + work.cell_offset / tile_width;
+                control.process_cell(&mut work.summary, y * control.width + x, x, y);
+                work.cell_offset += 1;
+            }
+            while work.city_offset < work.cities.len() {
+                control.process_city(&mut work.summary, &work.cities[work.city_offset]);
+                work.city_offset += 1;
+            }
+            apply_summary(&mut aggregate, &work.summary, 1);
+            committed_tiles.push(Some(Arc::new(work.summary)));
+        }
+
+        control.next_generation = next_generation;
+        control.commit_sequence = state.commit_sequence;
+        control.mutation_sequence = state.mutation_sequence;
+        let snapshot = Arc::new(control.build_snapshot(
+            &aggregate,
+            state.generation,
+            state.processed_tiles,
+            state.processed_items,
+            0,
+        ));
+        control.committed_tiles = committed_tiles;
+        control.committed_aggregate = aggregate;
+        control.snapshot = Some(snapshot);
+        control.active_generation = None;
+        control.census_dirty.clear();
+        control.pending_full_rebuild = false;
+        // A renderer connected after restore has no prior ownership texture.
+        control.render_dirty.clear();
+        control.render_dirty.extend(0..control.total_tiles());
+        control.full_render_pending = true;
+        control.latest_render_update = None;
+        Ok(control)
+    }
+
     pub fn width(&self) -> usize {
         self.width
     }
@@ -517,6 +603,56 @@ impl TerritoryControl {
     }
     pub fn all_side_influence(&self) -> &[Vec<f32>] {
         &self.maps.side_influence
+    }
+    /// Clone the exact live map arrays for a checkpoint. Cloning `f32` values
+    /// preserves their stored bit patterns.
+    pub fn checkpoint_maps(&self) -> TerritoryMaps {
+        self.maps.clone()
+    }
+    /// Clone the complete validated static topology plus live maps needed to
+    /// rebuild this territory owner at a save barrier or strategic consequence.
+    pub fn checkpoint_config(&self) -> TerritoryConfig {
+        TerritoryConfig {
+            width: self.width,
+            height: self.height,
+            grid_resolution: self.grid_resolution,
+            max_sides: self.max_sides,
+            tile_size: self.tile_size,
+            maps: self.maps.clone(),
+            country_to_side: self.country_to_side.clone(),
+            hostility_matrix: self.hostility_matrix.clone(),
+            cities: self
+                .cities
+                .iter()
+                .map(|city| TerritoryCity {
+                    id: city.id,
+                    cell: city.cell,
+                    owner: city.owner,
+                    population: city.population,
+                    capital: city.capital,
+                })
+                .collect(),
+            protected_owner_ids: self.protected_owner_ids.clone(),
+            topology_revision: self.topology_revision,
+            world_revision: self.world_revision,
+            city_revision: self.city_revision,
+        }
+    }
+    /// Return stable committed markers only when the live maps and visible
+    /// census snapshot form one coherent checkpoint boundary.
+    pub fn committed_state(&self) -> Option<TerritoryCommittedState> {
+        if self.active_generation.is_some() || !self.census_dirty.is_empty() {
+            return None;
+        }
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| TerritoryCommittedState {
+                generation: snapshot.generation,
+                commit_sequence: snapshot.commit_sequence,
+                mutation_sequence: self.mutation_sequence,
+                processed_tiles: snapshot.processed_tiles,
+                processed_items: snapshot.processed_items,
+            })
     }
     pub fn country_to_side(&self) -> &BTreeMap<u16, usize> {
         &self.country_to_side
@@ -2618,5 +2754,186 @@ mod tests {
         let json = serde_json::to_string(&*s).unwrap();
         let decoded: TerritorySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.schema_version, TERRITORY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn committed_state_restore_preserves_generation_and_rebuilds_census() {
+        let mut c = config(3, 2, 2, 2);
+        c.maps.world_control = vec![1, 1, 2, 2, 1, 2];
+        c.maps.de_jure = vec![1, 1, 2, 2, 1, 2];
+        c.maps.primary_occupier = vec![1, 0, 2, 2, 1, 0];
+        c.maps.dominant_side = vec![0, 0, 1, 1, 0, 1];
+        c.maps.occupation = vec![0.5, 0.25, -0.75, -0.5, 0.1, -0.2];
+        c.maps.side_influence = vec![
+            vec![0.5, 0.25, 0.0, 0.0, 0.1, 0.0],
+            vec![0.0, 0.0, 0.75, 0.5, 0.0, 0.2],
+        ];
+        c.cities.push(TerritoryCity {
+            id: 8,
+            cell: 2,
+            owner: 2,
+            population: 12.5,
+            capital: true,
+        });
+        let mut original = TerritoryControl::new(c).unwrap();
+        let before = original.flush_census(3);
+        let maps = original.checkpoint_maps();
+        let state = original.committed_state().unwrap();
+
+        let mut restored_config = config(3, 2, 2, 2);
+        restored_config.maps = maps;
+        restored_config.cities.push(TerritoryCity {
+            id: 8,
+            cell: 2,
+            owner: 2,
+            population: 12.5,
+            capital: true,
+        });
+        let restored = TerritoryControl::restore(restored_config, state).unwrap();
+        assert_eq!(restored.snapshot().as_deref(), Some(before.as_ref()));
+        assert_eq!(restored.committed_state(), Some(state));
+        assert!(restored.dirty_tiles().is_empty());
+        assert_eq!(restored.census_status().active_generation, None);
+    }
+
+    #[test]
+    fn restored_census_uses_the_next_generation_for_incremental_commit() {
+        let mut original = TerritoryControl::new(config(4, 1, 2, 2)).unwrap();
+        original.flush_census(32);
+        let state = original.committed_state().unwrap();
+        let mut restored_config = config(4, 1, 2, 2);
+        restored_config.maps = original.checkpoint_maps();
+        let mut restored = TerritoryControl::restore(restored_config, state).unwrap();
+
+        restored
+            .set_cell_state(
+                3,
+                CellStateUpdate {
+                    dominant_side: Some(1),
+                    occupation: Some(-0.75),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(restored.committed_state().is_none());
+        let next = restored.flush_census(32);
+        assert_eq!(next.generation, state.generation + 1);
+        assert_eq!(next.commit_sequence, state.commit_sequence + 1);
+        assert_eq!(next.negative_occupation_cells, 1);
+        assert_eq!(
+            restored.census_status().mutation_sequence,
+            state.mutation_sequence + 1
+        );
+    }
+
+    #[test]
+    fn restore_rejects_invalid_markers_and_maps() {
+        let c = config(1, 1, 1, 1);
+        let valid = TerritoryCommittedState {
+            generation: 1,
+            commit_sequence: 1,
+            mutation_sequence: 0,
+            processed_tiles: 1,
+            processed_items: 1,
+        };
+        assert!(matches!(
+            TerritoryControl::restore(
+                c.clone(),
+                TerritoryCommittedState {
+                    generation: 0,
+                    ..valid
+                }
+            ),
+            Err(TerritoryError::InvalidCommittedState(_))
+        ));
+        assert!(matches!(
+            TerritoryControl::restore(
+                c.clone(),
+                TerritoryCommittedState {
+                    generation: u64::MAX,
+                    ..valid
+                }
+            ),
+            Err(TerritoryError::InvalidCommittedState(_))
+        ));
+        assert!(matches!(
+            TerritoryControl::restore(
+                c.clone(),
+                TerritoryCommittedState {
+                    commit_sequence: 0,
+                    ..valid
+                }
+            ),
+            Err(TerritoryError::InvalidCommittedState(_))
+        ));
+        let mut invalid = c;
+        invalid.maps.side_influence[0].push(0.0);
+        assert!(matches!(
+            TerritoryControl::restore(invalid, valid),
+            Err(TerritoryError::Length {
+                name: "side_influence_row",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn restore_requests_full_render_replacement() {
+        let mut original = TerritoryControl::new(config(3, 2, 2, 2)).unwrap();
+        original.flush_census(32);
+        let state = original.committed_state().unwrap();
+        let mut restored_config = config(3, 2, 2, 2);
+        restored_config.maps = original.checkpoint_maps();
+        let mut restored = TerritoryControl::restore(restored_config, state).unwrap();
+        let update = restored.drain_render_update().unwrap();
+        assert!(update.full_update);
+        assert_eq!(update.tiles.len(), restored.total_tiles());
+        assert!(restored.drain_render_update().is_none());
+    }
+
+    #[test]
+    fn checkpoint_maps_round_trip_exact_f32_bits() {
+        let mut c = config(2, 1, 2, 1);
+        c.maps.occupation = vec![f32::from_bits(0x8000_0000), f32::from_bits(0x3eaa_aaab)];
+        c.maps.side_influence = vec![
+            vec![f32::from_bits(0x0000_0001), f32::from_bits(0x3f7f_ffff)],
+            vec![f32::from_bits(0x8000_0000), f32::from_bits(0x3d00_0001)],
+        ];
+        let mut original = TerritoryControl::new(c).unwrap();
+        original.flush_census(16);
+        let state = original.committed_state().unwrap();
+        let encoded = serde_json::to_vec(&original.checkpoint_maps()).unwrap();
+        let maps: TerritoryMaps = serde_json::from_slice(&encoded).unwrap();
+        let occupation_bits = maps
+            .occupation
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let influence_bits = maps
+            .side_influence
+            .iter()
+            .flatten()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let mut restored_config = config(2, 1, 2, 1);
+        restored_config.maps = maps;
+        let restored = TerritoryControl::restore(restored_config, state).unwrap();
+        assert_eq!(
+            restored
+                .occupation()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            occupation_bits
+        );
+        assert_eq!(
+            restored
+                .all_side_influence()
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            influence_bits
+        );
     }
 }
