@@ -46,6 +46,12 @@ for resolution in "${resolutions[@]}"; do
 	printf 'direction parity ok: Russia vs China at %s degrees\n' "$resolution"
 done
 
+node "$native_root/scripts/compare-front-layout-parity.mjs" \
+	<("$native_root/target/debug/mw-tools" front-layout-fixture \
+		"$native_root/fixtures/front-layout-v1.json" --json) \
+	<(node "$native_root/scripts/js-front-layout-reference.mjs" report \
+		"$web_root" "$native_root/fixtures/front-layout-v1.json")
+
 node "$native_root/scripts/compare-tactical-parity.mjs" \
 	<("$native_root/target/debug/mw-tools" tactical-fixture \
 		"$native_root/fixtures/tactical-grid-v1.json" --json) \
@@ -81,3 +87,36 @@ node "$native_root/scripts/compare-strategic-cycle-parity.mjs" \
 		"$native_root/fixtures/strategic-cycle-v1.json" report) \
 	<("$native_root/target/debug/mw-tools" strategic-cycle-fixture \
 		"$native_root/fixtures/strategic-cycle-v1.json" --json)
+
+runtime_checkpoint="$native_root/fixtures/native-runtime-checkpoint-v1.json"
+runtime_output_a=$("$native_root/target/debug/mw-tools" native-runtime-fixture \
+	"$modern_path" "$runtime_checkpoint" --json)
+runtime_output_b=$("$native_root/target/debug/mw-tools" native-runtime-fixture \
+	"$modern_path" "$runtime_checkpoint" --json)
+
+if ! diff -u \
+	<(jq --sort-keys . <<<"$runtime_output_a") \
+	<(jq --sort-keys . <<<"$runtime_output_b"); then
+	printf 'Native runtime fixture is not deterministic\n' >&2
+	exit 1
+fi
+
+if ! jq -e '
+	.schema == "native-runtime-checkpoint-v1"
+	and .runtimeSchema == "native-runtime-v1"
+	and .checkpointBoundary.kind == "baselineReplay"
+	and .checkpointBoundary.resumable == false
+	and .requestedSteps == 3
+	and .completedSteps == 3
+	and (.steps | length) == 3
+	and .initial.tick == 598
+	and ([.steps[].tick] == [599, 600, 601])
+	and ([.initial.state.kind, .steps[].state.kind] | all(. == "running"))
+	and (.steps[1].strategic.cycle == 1)
+	and (.checksum | type == "string" and length == 16)
+' >/dev/null <<<"$runtime_output_a"; then
+	printf 'Native runtime fixture contract assertion failed\n' >&2
+	exit 1
+fi
+
+printf 'native runtime deterministic fixture ok: ticks 598 through 601\n'

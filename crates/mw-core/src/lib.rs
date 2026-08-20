@@ -7,8 +7,11 @@ pub mod ai;
 pub mod combat;
 pub mod direction;
 pub mod economy;
+pub mod front;
 pub mod movement;
 pub mod occupation;
+pub mod production;
+pub mod runtime;
 pub mod scenario;
 pub mod simulation;
 pub mod strategic;
@@ -42,6 +45,11 @@ pub use economy::{
     compute_current_income, compute_economic_strength, create_economy_state, desertion_rate,
     settle_economy_cycle,
 };
+pub use front::{
+    FRONT_LAYOUT_SCHEMA_VERSION, FrontLayout, FrontLayoutConfig, FrontLayoutCounters,
+    FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit, FrontPoint,
+    FrontSegment, FrontSlotAssignment, derive_front_layout,
+};
 pub use movement::{
     MOVEMENT_SCHEMA_VERSION, MovementError, MovementFactors, MovementInput, MovementOutput,
     MovementState, integrate_unit_step,
@@ -51,6 +59,20 @@ pub use occupation::{
     OccupationCycleInput, OccupationError, OccupationState, RebellionCandidate, assess_occupation,
     garrison_priority, required_garrison, resistance_delta, select_occupation_controller,
     select_rebellion_candidates,
+};
+pub use production::{
+    ARMOR_PAYROLL_PER_100, PRODUCTION_SCHEMA_VERSION, ProductionCity, ProductionConfig,
+    ProductionCountry, ProductionError, ScenarioProduction, ScenarioProductionCounters,
+    StrategicDerivationCounters, StrategicDerivationInput, StrategicDerivationOutput,
+    TerritoryCommitMarker, derive_scenario_production, derive_strategic_cycle_input,
+    estimate_territory_army_units,
+};
+pub use runtime::{
+    DEFAULT_CENSUS_BUDGET, DEFAULT_CENSUS_FLUSH_CHUNK, DEFAULT_FRONT_REFRESH_TICKS,
+    DEFAULT_RUNTIME_FRONT_STICKINESS, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
+    RuntimeCensusCounters, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeError,
+    RuntimeInfluenceCounters, RuntimeSnapshot, RuntimeState, RuntimeStepCounters,
+    RuntimeUnitPolicy, UnitAiPolicy, UnitInfluencePolicy,
 };
 pub use scenario::{
     DecodedScenario, GridSpec, ScenarioError, decode_mwsc, decode_mwsc_gzip, decode_mwsc_gzip_file,

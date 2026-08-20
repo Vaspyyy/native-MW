@@ -320,7 +320,10 @@ pub fn resolve_ai_orders(
         &mut occupancy,
         &mut counters,
     );
+    let mut assignment_edges = 0;
     assign_main_fronts(
+        config.max_assignment_edges,
+        &mut assignment_edges,
         &sorted_units,
         world,
         &contacts,
@@ -328,8 +331,10 @@ pub fn resolve_ai_orders(
         &mut assigned_objective,
         &mut occupancy,
         &mut counters,
-    );
+    )?;
     assign_reinforcements(
+        config.max_assignment_edges,
+        &mut assignment_edges,
         &sorted_units,
         world,
         &contacts,
@@ -337,7 +342,7 @@ pub fn resolve_ai_orders(
         &mut assigned_objective,
         &mut occupancy,
         &mut counters,
-    );
+    )?;
 
     let world_grid = WorldGridView {
         grid_res: world.grid_res,
@@ -493,13 +498,6 @@ fn validate_all(
         .checked_mul(world.grid_height)
         .ok_or(AiOrderError::InvalidWorld)?;
     if cell_count > config.max_grid_cells {
-        return Err(AiOrderError::PlanningLimitExceeded);
-    }
-    let edge_count = units
-        .len()
-        .checked_mul(world.objectives.len())
-        .ok_or(AiOrderError::PlanningLimitExceeded)?;
-    if edge_count > config.max_assignment_edges {
         return Err(AiOrderError::PlanningLimitExceeded);
     }
     WorldGridView::new(
@@ -762,6 +760,8 @@ fn preserve_sticky_assignments(
 
 #[allow(clippy::too_many_arguments)]
 fn assign_main_fronts(
+    max_assignment_edges: usize,
+    assignment_edges: &mut usize,
     units: &[AiUnitInput],
     world: AiWorldInput<'_>,
     contacts: &[ContactState],
@@ -769,7 +769,7 @@ fn assign_main_fronts(
     assigned: &mut [Option<usize>],
     occupancy: &mut [usize],
     counters: &mut AiPlanningCounters,
-) {
+) -> Result<(), AiOrderError> {
     let mut edges = Vec::new();
     for (unit_index, unit) in units.iter().enumerate() {
         if contacts[unit_index].retreat
@@ -779,7 +779,14 @@ fn assign_main_fronts(
             continue;
         }
         for (objective_index, objective) in world.objectives.iter().enumerate() {
+            if occupancy[objective_index] >= objective.capacity {
+                continue;
+            }
             if objective_applies(*unit, *objective, world.hostility) {
+                if *assignment_edges == max_assignment_edges {
+                    return Err(AiOrderError::PlanningLimitExceeded);
+                }
+                *assignment_edges += 1;
                 edges.push(AssignmentEdge {
                     unit_index,
                     objective_index,
@@ -808,10 +815,13 @@ fn assign_main_fronts(
             counters.front_assignments += 1;
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn assign_reinforcements(
+    max_assignment_edges: usize,
+    assignment_edges: &mut usize,
     units: &[AiUnitInput],
     world: AiWorldInput<'_>,
     contacts: &[ContactState],
@@ -819,7 +829,7 @@ fn assign_reinforcements(
     assigned: &mut [Option<usize>],
     occupancy: &mut [usize],
     counters: &mut AiPlanningCounters,
-) {
+) -> Result<(), AiOrderError> {
     let mut unit_indices = (0..units.len())
         .filter(|index| reinforcement[*index] && !contacts[*index].retreat)
         .collect::<Vec<_>>();
@@ -831,35 +841,45 @@ fn assign_reinforcements(
     });
     for unit_index in unit_indices {
         let unit = units[unit_index];
-        let best = world
-            .objectives
-            .iter()
-            .enumerate()
-            .filter(|(index, objective)| {
-                occupancy[*index] < objective.capacity
-                    && objective_applies(unit, **objective, world.hostility)
-            })
-            .min_by(|(left_index, left), (right_index, right)| {
+        let mut best: Option<usize> = None;
+        for (objective_index, objective) in world.objectives.iter().enumerate() {
+            if occupancy[objective_index] >= objective.capacity {
+                continue;
+            }
+            if !objective_applies(unit, *objective, world.hostility) {
+                continue;
+            }
+            if *assignment_edges == max_assignment_edges {
+                return Err(AiOrderError::PlanningLimitExceeded);
+            }
+            *assignment_edges += 1;
+            let better = best.is_none_or(|best_index| {
+                let best_objective = world.objectives[best_index];
                 underfill_cmp(
-                    occupancy[*left_index],
-                    left.capacity,
-                    occupancy[*right_index],
-                    right.capacity,
+                    occupancy[objective_index],
+                    objective.capacity,
+                    occupancy[best_index],
+                    best_objective.capacity,
                 )
-                .then_with(|| right.priority.cmp(&left.priority))
+                .then_with(|| best_objective.priority.cmp(&objective.priority))
                 .then_with(|| {
-                    objective_distance_sq(unit, **left)
-                        .total_cmp(&objective_distance_sq(unit, **right))
+                    objective_distance_sq(unit, *objective)
+                        .total_cmp(&objective_distance_sq(unit, best_objective))
                 })
-                .then_with(|| left.id.cmp(&right.id))
-            })
-            .map(|(index, _)| index);
+                .then_with(|| objective.id.cmp(&best_objective.id))
+                .is_lt()
+            });
+            if better {
+                best = Some(objective_index);
+            }
+        }
         if let Some(objective_index) = best {
             assigned[unit_index] = Some(objective_index);
             occupancy[objective_index] += 1;
             counters.reinforcement_assignments += 1;
         }
     }
+    Ok(())
 }
 
 fn choose_direction(
@@ -1287,6 +1307,51 @@ mod tests {
     }
 
     #[test]
+    fn assignment_edge_limit_counts_only_work_left_after_sticky_slots() {
+        let land = [1; 8];
+        let dominant = [-1; 8];
+        let objectives = [
+            objective(10, 0.0, -1.0, 1, 1),
+            objective(20, 0.0, 0.0, 1, 1),
+            objective(30, 0.0, 1.0, 1, 1),
+        ];
+        let mut units = [
+            unit(1, 0, 0.0, -1.0),
+            unit(2, 0, 0.0, 0.0),
+            unit(3, 0, 0.0, 1.0),
+        ];
+        for (unit, objective) in units.iter_mut().zip(objectives.iter()) {
+            unit.prior_front_objective_id = Some(objective.id);
+        }
+        let config = AiOrderConfig {
+            max_assignment_edges: 1,
+            ..AiOrderConfig::default()
+        };
+
+        let result = resolve_ai_orders(
+            config,
+            &units,
+            standard_world(&land, &dominant, &objectives),
+        )
+        .unwrap();
+        assert_eq!(result.counters.sticky_assignments, 3);
+        assert_eq!(result.counters.front_assignments, 0);
+
+        let mut without_priors = units;
+        for unit in &mut without_priors {
+            unit.prior_front_objective_id = None;
+        }
+        assert!(matches!(
+            resolve_ai_orders(
+                config,
+                &without_priors,
+                standard_world(&land, &dominant, &objectives),
+            ),
+            Err(AiOrderError::PlanningLimitExceeded)
+        ));
+    }
+
+    #[test]
     fn capacity_assignment_is_deterministic_by_distance_then_id() {
         let land = [1; 8];
         let dominant = [-1; 8];
@@ -1332,6 +1397,30 @@ mod tests {
         assert_eq!(result.assignments[1].objective_id, Some(20));
         assert_eq!(result.assignments[1].reason, AssignmentReason::Reinforce);
         assert_eq!(result.counters.reinforcement_assignments, 1);
+    }
+
+    #[test]
+    fn reinforcement_edges_share_the_global_planning_limit() {
+        let land = [1; 8];
+        let dominant = [-1; 8];
+        let objectives = [
+            objective(10, 0.0, -1.0, 1, 1),
+            objective(20, 0.0, 1.0, 1, 1),
+        ];
+        let mut reserve = unit(1, 0, 0.0, 0.0);
+        reserve.is_reserve = true;
+
+        assert!(matches!(
+            resolve_ai_orders(
+                AiOrderConfig {
+                    max_assignment_edges: 1,
+                    ..AiOrderConfig::default()
+                },
+                &[reserve],
+                standard_world(&land, &dominant, &objectives),
+            ),
+            Err(AiOrderError::PlanningLimitExceeded)
+        ));
     }
 
     #[test]

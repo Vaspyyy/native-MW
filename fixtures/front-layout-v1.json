@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "front-layout-v1",
+  "grid": {
+    "width": 12,
+    "height": 6,
+    "gridRes": 1,
+    "landMask": [
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2
+    ],
+    "dominantSideMap": [
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+      -1,  0,  0,  1,  1, -1, -1,  1,  1,  2,  2, -1,
+      -1,  0,  0,  1,  1, -1, -1,  1,  1,  2,  2, -1,
+      -1,  0,  0,  1,  1, -1, -1,  1,  1,  2,  2, -1,
+      -1,  0,  0,  1,  1, -1, -1,  1,  1,  2,  2, -1,
+      -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+    ]
+  },
+  "maxSides": 3,
+  "hostilityMatrix": [
+    0, 1, 0,
+    1, 0, 1,
+    0, 1, 0
+  ],
+  "units": [
+    { "id": 1, "sideIndex": 0, "lat": -87.5, "lng": -178.5 },
+    {
+      "id": 2,
+      "sideIndex": 0,
+      "lat": -87,
+      "lng": -177.5,
+      "previousPairKey": "0_1_-9_-18",
+      "previousSegmentIdx": 2
+    },
+    {
+      "id": 3,
+      "sideIndex": 1,
+      "lat": -87.5,
+      "lng": -176.5,
+      "previousPairKey": "0_1_-9_-18",
+      "previousSegmentIdx": 3
+    },
+    {
+      "id": 4,
+      "sideIndex": 1,
+      "lat": -87.5,
+      "lng": -171.5,
+      "previousPairKey": "1_2_-9_-18",
+      "previousSegmentIdx": 2
+    },
+    {
+      "id": 5,
+      "sideIndex": 1,
+      "lat": -87,
+      "lng": -174,
+      "garrisonExcluded": true
+    },
+    { "id": 6, "sideIndex": 2, "lat": -87.5, "lng": -170.5 },
+    {
+      "id": 7,
+      "sideIndex": 2,
+      "lat": -87,
+      "lng": -171,
+      "deployTicks": 3
+    }
+  ]
+}

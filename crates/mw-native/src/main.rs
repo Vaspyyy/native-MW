@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -8,11 +8,12 @@ use std::{
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use mw_core::{
-    AiOrderConfig, AiUnitInput, AiWorldInput, CombatConfig, CombatUnit, FrameSnapshot,
-    FrontObjective, GridSpec, HostilityMatrix, InfluenceSource, ResolvedCombatModifiers,
-    ResolvedMovementModifiers, Simulation, SimulationConfig, SimulationUnit, TerritoryConfig,
-    TerritoryControl, TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels, TickInput,
-    UnitKind, WorldGridView, decode_mwsc_gzip_file, formation_strength, resolve_ai_orders,
+    CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
+    ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeState,
+    RuntimeUnitPolicy, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
+    StrategicSimulation, TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps,
+    TerritoryRenderUpdate, TerritoryTilePixels, UnitKind, decode_mwsc_gzip_file,
+    derive_scenario_production,
 };
 use serde_json::Value;
 use wgpu::util::DeviceExt;
@@ -57,12 +58,7 @@ struct GpuState {
 }
 
 struct DemoSimulation {
-    simulation: Simulation,
-    objectives: Vec<FrontObjective>,
-    prior_assignments: BTreeMap<u64, u64>,
-    territory: TerritoryControl,
-    max_sides: usize,
-    tick: u64,
+    runtime: NativeRuntime,
     next_step_at: Instant,
     finished: bool,
 }
@@ -99,9 +95,9 @@ struct App {
     smoke_frames: Option<u64>,
     demo: Option<DemoSimulation>,
     demo_center: Option<[f32; 2]>,
-    latest_snapshot: Option<FrameSnapshot>,
+    latest_snapshot: Option<Arc<FrameSnapshot>>,
     snapshot_dirty: bool,
-    territory_update: Option<Arc<TerritoryRenderUpdate>>,
+    territory_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
     fps_epoch: Instant,
     fps: f64,
 }
@@ -132,7 +128,7 @@ impl App {
             demo_center: None,
             latest_snapshot: None,
             snapshot_dirty: false,
-            territory_update: None,
+            territory_updates: VecDeque::new(),
             fps_epoch: Instant::now(),
             fps: 0.0,
         }
@@ -155,46 +151,52 @@ impl App {
         self.grid_height =
             u32::try_from(decoded.target.height).context("scenario height exceeds GPU limits")?;
         self.grid_res = decoded.target.grid_res as f32;
-        self.ownership = decoded.world_control;
-        self.land = decoded.land;
-        self.metadata = decoded.metadata;
-
         anyhow::ensure!(
-            self.ownership.len() == self.grid_width as usize * self.grid_height as usize,
+            decoded.world_control.len() == self.grid_width as usize * self.grid_height as usize,
             "ownership grid has {} cells, expected {}x{}",
-            self.ownership.len(),
+            decoded.world_control.len(),
             self.grid_width,
             self.grid_height
         );
         anyhow::ensure!(
-            self.land.len() == self.ownership.len(),
+            decoded.land.len() == decoded.world_control.len(),
             "land grid has {} cells, expected {}",
-            self.land.len(),
-            self.ownership.len()
+            decoded.land.len(),
+            decoded.world_control.len()
         );
 
+        let demo_initialization = if self.demo_units_requested {
+            let border = find_demo_border(
+                &decoded.world_control,
+                &decoded.land,
+                decoded.target.width,
+                decoded.target.height,
+                decoded.target.grid_res,
+            )
+            .context("--demo-units requires an adjacent-country land border")?;
+            let production = derive_scenario_production(&decoded, &ProductionConfig::default())
+                .context("failed to derive scenario production data for native runtime")?;
+            Some((
+                border,
+                create_demo_simulation(border, &decoded, production)?,
+            ))
+        } else {
+            None
+        };
+
+        self.ownership = decoded.world_control;
+        self.land = decoded.land;
+        self.metadata = decoded.metadata;
         self.palette = build_palette(&self.metadata, &self.ownership);
         let size = window.inner_size();
         self.zoom = reset_zoom(size);
-        if self.demo_units_requested {
-            let border = find_demo_border(
-                &self.ownership,
-                &self.land,
-                self.grid_width as usize,
-                self.grid_height as usize,
-                f64::from(self.grid_res),
-            )
-            .context("--demo-units requires an adjacent-country land border")?;
+        if let Some((border, mut demo)) = demo_initialization {
             let first_name = self.country_name(border.first_owner).to_owned();
             let second_name = self.country_name(border.second_owner).to_owned();
-            let (demo, snapshot) = create_demo_simulation(
-                border,
-                &self.ownership,
-                &self.land,
-                self.grid_width as usize,
-                self.grid_height as usize,
-                f64::from(self.grid_res),
-            )?;
+            let snapshot = demo.runtime.latest_snapshot().frame_snapshot.clone();
+            while let Some(update) = demo.runtime.pop_render_update() {
+                self.territory_updates.push_back(update);
+            }
             self.demo_center = Some(geographic_to_world(border.midpoint[0], border.midpoint[1]));
             self.center = self.demo_center.expect("demo center was just assigned");
             self.zoom = demo_zoom(size);
@@ -443,133 +445,49 @@ impl App {
             return Ok(());
         }
         let now = Instant::now();
-        if demo.tick > 0 && now < demo.next_step_at {
+        if demo.runtime.tick() > 0 && now < demo.next_step_at {
             return Ok(());
         }
         demo.next_step_at = now + DEMO_TICK_INTERVAL;
-
-        let world = WorldGridView::new(
-            f64::from(self.grid_res),
-            self.grid_width as usize,
-            self.grid_height as usize,
-            &self.land,
-        )
-        .context("invalid decoded land grid for demo simulation")?;
-        let next_tick = demo.tick.saturating_add(1);
-        let ai_units = demo
-            .simulation
-            .units
-            .iter()
-            .map(|unit| AiUnitInput {
-                id: unit.combat.id,
-                side: u16::try_from(unit.combat.side).unwrap_or(u16::MAX),
-                sovereign: unit.combat.sovereign,
-                kind: unit.combat.kind,
-                lat: unit.combat.lat,
-                lng: unit.combat.lng,
-                health: unit.combat.health,
-                max_health: unit.combat.max_health,
-                combat_power: formation_strength(&unit.combat),
-                ally_weight: unit.ally_weight,
-                at_sea: unit.combat.at_sea,
-                transport: unit.combat.transport,
-                base_speed: 0.003,
-                movement: ResolvedMovementModifiers::default(),
-                combat: ResolvedCombatModifiers::default(),
-                prior_front_objective_id: demo.prior_assignments.get(&unit.combat.id).copied(),
-                is_reserve: false,
-                reinforcement_eligible: false,
-                encircled: false,
-            })
-            .collect::<Vec<_>>();
-        let hostility = [0_u8, 1, 1, 0];
-        let planning = resolve_ai_orders(
-            AiOrderConfig::default(),
-            &ai_units,
-            AiWorldInput {
-                grid_width: self.grid_width as usize,
-                grid_height: self.grid_height as usize,
-                grid_res: f64::from(self.grid_res),
-                land_mask: &self.land,
-                dominant_side_map: demo.territory.dominant_side(),
-                hostility: HostilityMatrix::new(Some(&hostility), demo.max_sides),
-                frontline_latitude: None,
-                frontline_longitude: None,
-                objectives: &demo.objectives,
-            },
-        )?;
-        demo.prior_assignments.clear();
-        demo.prior_assignments
-            .extend(planning.assignments.iter().filter_map(|assignment| {
-                assignment
-                    .objective_id
-                    .map(|objective| (assignment.unit_id, objective))
-            }));
-        let input = TickInput {
-            tick: next_tick,
-            frame: next_tick,
-            war_grace_end: 0,
-            world,
-            hostility: HostilityMatrix::new(Some(&hostility), demo.max_sides),
-            orders: &planning.orders,
-        };
-        let (snapshot, counters) = demo.simulation.step(input)?;
-        demo.tick = next_tick;
-
-        let influence_sources = snapshot
-            .units
-            .iter()
-            .filter(|unit| unit.health > 0.0 && !unit.at_sea)
-            .map(|unit| {
-                let sovereign = u16::try_from(unit.sovereign)
-                    .context("demo sovereign id exceeds territory map width")?;
-                Ok(InfluenceSource {
-                    id: unit.id,
-                    side: usize::from(unit.side),
-                    sovereign,
-                    beneficiary: sovereign,
-                    lat: unit.lat,
-                    lng: unit.lng,
-                    radius: 0.45,
-                    delta: 0.04,
-                    concentration_bonus: 1.0,
-                    owner_ally_country_ids: BTreeSet::from([sovereign]),
-                    protected_owner_ids: BTreeSet::new(),
-                    rebel_de_jure: None,
-                    credit_de_jure: None,
-                    credit_de_jure_by_country: BTreeMap::new(),
-                    refuses_offense: false,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let influence = demo.territory.apply_influence_sources(&influence_sources)?;
-        let census = demo.territory.advance_census(16_384);
-        if let Some(update) = demo.territory.drain_render_update() {
+        let snapshot = demo.runtime.step()?;
+        while let Some(update) = demo.runtime.pop_render_update() {
+            self.territory_updates.push_back(update.clone());
             apply_territory_update_to_grid(
                 &mut self.ownership,
                 self.grid_width as usize,
                 self.grid_height as usize,
                 &update,
             )?;
-            self.territory_update = Some(update);
         }
 
-        demo.finished = snapshot.units.len() < 2
+        let units = &snapshot.frame_snapshot.units;
+        demo.finished = !matches!(snapshot.state, RuntimeState::Running)
+            || units.len() < 2
             || snapshot
+                .frame_snapshot
                 .units
                 .first()
-                .is_none_or(|first| snapshot.units.iter().all(|unit| unit.side == first.side));
+                .is_none_or(|first| units.iter().all(|unit| unit.side == first.side));
+        if matches!(
+            snapshot.state,
+            RuntimeState::AwaitingStrategicEffects { .. }
+        ) {
+            log::warn!(
+                "demo runtime paused at tick {} for explicit strategic-effects application",
+                snapshot.tick
+            );
+        }
         log::trace!(
             "demo tick {}: {} units, {} contacts, {} direct engagements, {} moves, {} influence cells, territory commit {}",
-            demo.tick,
-            snapshot.units.len(),
-            counters.accepted_contacts,
-            counters.direct_events,
-            counters.moved_units,
-            influence.touched_influence_cells.len(),
-            census.committed,
+            snapshot.tick,
+            units.len(),
+            snapshot.counters.simulation.accepted_contacts,
+            snapshot.counters.simulation.direct_events,
+            snapshot.counters.simulation.moved_units,
+            snapshot.counters.influence.touched_influence_cells,
+            snapshot.counters.census.committed,
         );
-        self.latest_snapshot = Some(snapshot);
+        self.latest_snapshot = Some(snapshot.frame_snapshot.clone());
         self.snapshot_dirty = true;
         Ok(())
     }
@@ -628,15 +546,17 @@ impl App {
         let size = window.inner_size();
         let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
-        let territory_update = self.territory_update.take();
         let Some(gpu) = &mut self.gpu else { return };
         gpu.queue
             .write_buffer(&gpu.view_buffer, 0, bytemuck::bytes_of(&uniform));
-        if let Some(update) = territory_update
-            && let Err(error) = upload_territory_update(&gpu.queue, &gpu.ownership_texture, &update)
-        {
-            log::error!("territory texture update failed: {error:#}");
-            self.demo = None;
+        while let Some(update) = self.territory_updates.pop_front() {
+            if let Err(error) = upload_territory_update(&gpu.queue, &gpu.ownership_texture, &update)
+            {
+                log::error!("territory texture update failed: {error:#}");
+                self.territory_updates.push_front(update);
+                self.demo = None;
+                break;
+            }
         }
         if self.snapshot_dirty
             && let Some(snapshot) = &self.latest_snapshot
@@ -961,12 +881,9 @@ fn cell_geographic_center(cell: [usize; 2], grid_res: f64) -> [f64; 2] {
 
 fn create_demo_simulation(
     border: DemoBorder,
-    ownership: &[u16],
-    land: &[u8],
-    grid_width: usize,
-    grid_height: usize,
-    grid_resolution: f64,
-) -> Result<(DemoSimulation, FrameSnapshot)> {
+    decoded: &DecodedScenario,
+    production: ScenarioProduction,
+) -> Result<DemoSimulation> {
     let normal = border.toward_second;
     let tangent = [-normal[1], normal[0]];
     let half_separation = 0.018;
@@ -1031,92 +948,127 @@ fn create_demo_simulation(
         },
         units,
     )?;
-    let snapshot = simulation.initial_snapshot(0, 0);
-    let objectives = vec![
-        FrontObjective::new(1, [0, 1], 1, second_base[0], second_base[1], 2, 10)?,
-        FrontObjective::new(2, [1, 0], 1, first_base[0], first_base[1], 2, 10)?,
-    ];
-    let cell_count = grid_width
-        .checked_mul(grid_height)
-        .context("demo territory dimensions overflow")?;
+    let cell_count = decoded.target.cell_count()?;
     anyhow::ensure!(
-        ownership.len() == cell_count,
+        decoded.world_control.len() == cell_count,
         "demo ownership grid has {} cells, expected {cell_count}",
-        ownership.len()
+        decoded.world_control.len()
     );
     anyhow::ensure!(
-        land.len() == cell_count,
+        decoded.land.len() == cell_count,
         "demo land grid has {} cells, expected {cell_count}",
-        land.len()
+        decoded.land.len()
     );
-    let dominant_side = ownership
-        .iter()
-        .map(|owner| {
-            if *owner == border.first_owner {
-                0
-            } else if *owner == border.second_owner {
-                1
-            } else {
-                -1
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut side_influence = vec![vec![0.0_f32; cell_count]; 2];
-    let mut occupation = vec![0.0_f32; cell_count];
-    for (cell, owner) in ownership.iter().copied().enumerate() {
-        if owner == border.first_owner {
-            side_influence[0][cell] = 1.0;
-            occupation[cell] = 1.0;
-        } else if owner == border.second_owner {
-            side_influence[1][cell] = 1.0;
-            occupation[cell] = -1.0;
-        }
-    }
+
     let country_to_side = BTreeMap::from([
         (border.first_owner, 0_usize),
         (border.second_owner, 1_usize),
     ]);
-    let mut territory = TerritoryControl::new(TerritoryConfig {
-        width: grid_width,
-        height: grid_height,
-        grid_resolution,
+    let mut runtime_land = vec![0_u8; cell_count];
+    let mut primary_occupier = vec![0_u16; cell_count];
+    let mut dominant_side = vec![-1_i16; cell_count];
+    let mut side_influence = vec![vec![0.0_f32; cell_count]; 2];
+    let mut occupation = vec![0.0_f32; cell_count];
+    for cell in 0..cell_count {
+        if decoded.land[cell] == 0 {
+            continue;
+        }
+        let owner = decoded.world_control[cell];
+        let Some(&side) = country_to_side.get(&owner) else {
+            // Scenario land outside the explicit demo theater stays traversable,
+            // but receives no controller, primary credit, or influence state.
+            runtime_land[cell] = 1;
+            continue;
+        };
+        runtime_land[cell] = 2;
+        primary_occupier[cell] = owner;
+        dominant_side[cell] = side as i16;
+        side_influence[side][cell] = 1.0;
+        occupation[cell] = if side == 0 { 1.0 } else { -1.0 };
+    }
+
+    let cities = production
+        .cities
+        .iter()
+        .map(|city| TerritoryCity {
+            id: city.city_id,
+            cell: city.cell,
+            owner: city.owner_id,
+            population: city.population,
+            capital: city.capital,
+        })
+        .collect();
+    let territory = TerritoryControl::new(TerritoryConfig {
+        width: decoded.target.width,
+        height: decoded.target.height,
+        grid_resolution: decoded.target.grid_res,
         max_sides: 2,
         tile_size: 32,
         maps: TerritoryMaps {
-            land: land
-                .iter()
-                .map(|value| if *value == 0 { 0 } else { 2 })
-                .collect(),
-            world_control: ownership.to_vec(),
-            de_jure: ownership.to_vec(),
-            primary_occupier: ownership.to_vec(),
+            land: runtime_land,
+            world_control: decoded.world_control.clone(),
+            de_jure: decoded.de_jure.clone(),
+            primary_occupier,
             dominant_side,
             occupation,
             side_influence,
         },
-        country_to_side,
+        country_to_side: country_to_side.clone(),
         hostility_matrix: vec![0, 1, 1, 0],
-        cities: Vec::new(),
-        protected_owner_ids: BTreeSet::new(),
-        topology_revision: 0,
-        world_revision: 0,
-        city_revision: 0,
+        cities,
+        protected_owner_ids: country_to_side.keys().copied().collect(),
+        topology_revision: 1,
+        world_revision: 1,
+        city_revision: 1,
     })?;
-    territory.flush_census(65_536);
-    let _ = territory.drain_render_update();
-    Ok((
-        DemoSimulation {
-            simulation,
-            objectives,
-            prior_assignments: BTreeMap::new(),
-            territory,
-            max_sides: 2,
+
+    let economies = production
+        .economy_states
+        .iter()
+        .filter(|economy| country_to_side.contains_key(&economy.country_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        economies.len() == country_to_side.len(),
+        "demo theater countries are missing derived economy state"
+    );
+    let strategic = StrategicSimulation::new(economies, Vec::new())?;
+    let unit_policies = simulation
+        .units
+        .iter()
+        .map(|unit| {
+            RuntimeUnitPolicy::standard(
+                unit.combat.id,
+                u16::try_from(unit.combat.sovereign).expect("demo sovereigns originate as u16"),
+            )
+        })
+        .collect();
+    let runtime = NativeRuntime::new(
+        RuntimeConfig::default(),
+        RuntimeCheckpoint {
             tick: 0,
-            next_step_at: Instant::now(),
-            finished: false,
+            frame: 0,
+            war_grace_end: 0,
+            simulation,
+            territory,
+            strategic,
+            scenario: production,
+            diplomacy: RuntimeDiplomacy {
+                hostility: vec![0, 1, 1, 0],
+                active_sides: vec![0, 1],
+            },
+            unit_policies,
+            // Front objectives are derived by the runtime on its first step.
+            objectives: Vec::new(),
+            prior_objective_by_unit: BTreeMap::new(),
+            casualties: BTreeMap::new(),
         },
-        snapshot,
-    ))
+    )?;
+    Ok(DemoSimulation {
+        runtime,
+        next_step_at: Instant::now(),
+        finished: false,
+    })
 }
 
 fn apply_territory_update_to_grid(
@@ -1456,33 +1408,68 @@ mod tests {
     }
 
     #[test]
-    fn demo_simulation_publishes_country_colored_units() {
+    fn demo_runtime_derives_fronts_and_publishes_country_colored_units() {
+        let grid = GridSpec {
+            grid_res: 90.0,
+            width: 4,
+            height: 2,
+        };
+        let decoded = DecodedScenario {
+            metadata: serde_json::json!({
+                "metadata": [
+                    {"id": 7, "name": "Seven", "gdp": 100, "population": 1_000_000},
+                    {"id": 11, "name": "Eleven", "gdp": 80, "population": 800_000},
+                    {"id": 13, "name": "Passive", "gdp": 40, "population": 400_000}
+                ],
+                "cities": [
+                    {"id": 70, "name": "Seven City", "ownerId": 7, "lat": -45,
+                     "lng": -135, "population": 100_000, "isCapital": true},
+                    {"id": 110, "name": "Eleven City", "ownerId": 11, "lat": -45,
+                     "lng": -45, "population": 80_000, "isCapital": true}
+                ]
+            }),
+            source: grid,
+            target: grid,
+            entry_count: 6,
+            world_control: vec![7, 11, 13, 0, 7, 11, 13, 0],
+            de_jure: vec![7, 11, 13, 0, 7, 11, 13, 0],
+            land: vec![1, 1, 1, 0, 1, 1, 1, 0],
+            biome: vec![0; 8],
+            province: vec![0; 8],
+        };
         let border = DemoBorder {
             first_owner: 7,
             second_owner: 11,
-            first_cell: [10, 10],
-            second_cell: [11, 10],
-            midpoint: [45.0, 8.0],
+            first_cell: [0, 0],
+            second_cell: [1, 0],
+            midpoint: [-45.0, -90.0],
             toward_second: [0.0, 1.0],
         };
-        let (demo, snapshot) =
-            create_demo_simulation(border, &[7, 11], &[1, 1], 2, 1, 180.0).unwrap();
-        assert_eq!(snapshot.units.len(), 4);
+        let production =
+            derive_scenario_production(&decoded, &ProductionConfig::default()).unwrap();
+        let mut demo = create_demo_simulation(border, &decoded, production).unwrap();
+        let snapshot = demo.runtime.latest_snapshot();
+        assert_eq!(snapshot.frame_snapshot.units.len(), 4);
         assert!(
             snapshot
+                .frame_snapshot
                 .units
                 .iter()
                 .any(|unit| unit.side == 0 && unit.sovereign == 7)
         );
         assert!(
             snapshot
+                .frame_snapshot
                 .units
                 .iter()
                 .any(|unit| unit.side == 1 && unit.sovereign == 11)
         );
-        assert_eq!(demo.objectives.len(), 2);
-        assert_eq!(demo.max_sides, 2);
-        assert!(demo.territory.snapshot().is_some());
+        assert_eq!(snapshot.territory_snapshot.land_cells, 4);
+        assert_eq!(demo.runtime.pending_render_updates(), 1);
+
+        let next = demo.runtime.step().unwrap();
+        assert!(next.counters.front_refreshed);
+        assert_eq!(next.counters.front_objectives, 4);
     }
 
     #[test]

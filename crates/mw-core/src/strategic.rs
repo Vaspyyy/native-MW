@@ -143,6 +143,8 @@ pub struct StrategicCounters {
 pub enum StrategicError {
     #[error("strategic cycle is not due")]
     NotDue,
+    #[error("strategic cycle counter overflowed")]
+    CycleOverflow,
     #[error("strategic tick {received} must be greater than previous tick {previous}")]
     NonMonotonicTick { previous: u64, received: u64 },
     #[error("territory generation {received} must not be less than previous generation {previous}")]
@@ -179,6 +181,19 @@ impl StrategicSimulation {
         economies: impl IntoIterator<Item = EconomyState>,
         occupations: impl IntoIterator<Item = OccupationState>,
     ) -> Result<Self, StrategicError> {
+        Self::restore(0, economies, occupations)
+    }
+
+    /// Restore a checkpoint at an already completed browser pay-cycle.
+    ///
+    /// The cycle is gameplay state: occupation queue and cooldown fields are
+    /// expressed in this coordinate system, so a mid-war hand-off must not
+    /// silently reset it to zero.
+    pub fn restore(
+        cycle: u64,
+        economies: impl IntoIterator<Item = EconomyState>,
+        occupations: impl IntoIterator<Item = OccupationState>,
+    ) -> Result<Self, StrategicError> {
         let mut economy_map = BTreeMap::new();
         for economy in economies {
             let country_id = economy.country_id;
@@ -202,7 +217,7 @@ impl StrategicSimulation {
             }
         }
         Ok(Self {
-            cycle: 0,
+            cycle,
             economies: economy_map,
             occupations: occupation_map,
             latest: None,
@@ -232,6 +247,10 @@ impl StrategicSimulation {
         if !input.force && !input.tick.is_multiple_of(PAY_CYCLE_TICKS) {
             return Err(StrategicError::NotDue);
         }
+        let next_cycle = self
+            .cycle
+            .checked_add(1)
+            .ok_or(StrategicError::CycleOverflow)?;
         self.validate_progress(input)?;
         let countries = validate_country_inputs(&input.countries, &self.economies)?;
         let occupation_inputs = validate_occupation_inputs(&input.occupations, &self.occupations)?;
@@ -451,7 +470,7 @@ impl StrategicSimulation {
                 });
             }
             let rate = desertion_rate(economy.command_band);
-            if rate > 0.0 && country.unit_count > 0 {
+            if country.active && rate > 0.0 && country.unit_count > 0 {
                 desertions.push(DesertionCommand { country_id, rate });
             }
             country_snapshots.push(CountryStrategicSnapshot {
@@ -479,7 +498,7 @@ impl StrategicSimulation {
             });
         }
 
-        self.cycle += 1;
+        self.cycle = next_cycle;
         self.economies = next_economies;
         self.occupations = next_occupations;
         let snapshot = Arc::new(StrategicSnapshot {
@@ -725,6 +744,35 @@ mod tests {
     }
 
     #[test]
+    fn restore_preserves_the_browser_pay_cycle_coordinate() {
+        let mut simulation =
+            StrategicSimulation::restore(37, [economy(1), economy(2)], [occupation()]).unwrap();
+        assert_eq!(simulation.cycle(), 37);
+
+        let (snapshot, _) = simulation.run_cycle(&input()).unwrap();
+        assert_eq!(snapshot.cycle, 38);
+        assert_eq!(simulation.cycle(), 38);
+    }
+
+    #[test]
+    fn cycle_overflow_is_rejected_before_mutation() {
+        let mut simulation =
+            StrategicSimulation::restore(u64::MAX, [economy(1), economy(2)], [occupation()])
+                .unwrap();
+        let economies = simulation.economies().clone();
+        let occupations = simulation.occupations().clone();
+
+        assert!(matches!(
+            simulation.run_cycle(&input()),
+            Err(StrategicError::CycleOverflow)
+        ));
+        assert_eq!(simulation.cycle(), u64::MAX);
+        assert_eq!(simulation.economies(), &economies);
+        assert_eq!(simulation.occupations(), &occupations);
+        assert!(simulation.latest_snapshot().is_none());
+    }
+
+    #[test]
     fn duplicate_and_regressing_ticks_are_rejected_atomically() {
         let mut simulation =
             StrategicSimulation::new([economy(1), economy(2)], [occupation()]).unwrap();
@@ -825,6 +873,25 @@ mod tests {
             snapshot.conflict_resolution.map(|value| value.kind),
             Some(crate::surrender::ConflictResolutionKind::WhitePeace)
         );
+    }
+
+    #[test]
+    fn inactive_country_cannot_emit_desertion_commands() {
+        let mut inactive_economy = economy(2);
+        inactive_economy.treasury = 0.0;
+        inactive_economy.arrears_cycles = 5.0;
+        inactive_economy.command_band = crate::economy::CommandBand::Mutiny;
+        let mut simulation =
+            StrategicSimulation::new([economy(1), inactive_economy], [occupation()]).unwrap();
+        let mut cycle = input();
+        cycle.countries[1].active = false;
+
+        let (snapshot, _) = simulation.run_cycle(&cycle).unwrap();
+        assert_eq!(
+            simulation.economies()[&2].command_band,
+            crate::economy::CommandBand::Mutiny
+        );
+        assert!(snapshot.desertions.is_empty());
     }
 
     #[test]

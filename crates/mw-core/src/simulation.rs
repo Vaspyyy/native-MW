@@ -116,6 +116,9 @@ pub struct TickInput<'a> {
     pub world: WorldGridView<'a>,
     pub hostility: HostilityMatrix<'a>,
     pub orders: &'a [ResolvedUnitOrder],
+    /// Sorted stable IDs that remain visible in snapshots but do not
+    /// participate in tactical contact, combat, or movement this tick.
+    pub inactive_unit_ids: &'a [u64],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,7 +133,9 @@ pub struct UnitSnapshot {
     pub max_health: f64,
     pub health_fraction: f32,
     pub personnel: u64,
+    pub personnel_capacity: u64,
     pub equipment: u64,
+    pub max_equipment: u64,
     pub dir_lat: f64,
     pub dir_lng: f64,
     pub coast_stuck_ticks: u32,
@@ -175,6 +180,8 @@ pub enum SimulationError {
     DuplicateUnit(u64),
     #[error("duplicate order for unit id {0}")]
     DuplicateOrder(u64),
+    #[error("inactive unit ids must be sorted, unique, and reference live units")]
+    InvalidInactiveUnits,
     #[error("invalid unit or order numeric data")]
     NonFiniteInput,
     #[error("invalid hostility matrix")]
@@ -260,6 +267,7 @@ impl Simulation {
         self.rebuild_unit_index()?;
         self.validate_units(Some(input.hostility.max_sides))?;
         self.prepare_orders(input.orders)?;
+        self.validate_inactive_units(input.inactive_unit_ids)?;
 
         self.events.clear();
         self.removed.clear();
@@ -267,7 +275,7 @@ impl Simulation {
         for unit in &mut self.units {
             unit.combat.landing_penalty_active = unit.armor_landing_penalty_until_tick > input.tick;
         }
-        self.rebuild_tactical_snapshot()?;
+        self.rebuild_tactical_snapshot(input.inactive_unit_ids)?;
 
         let mut counters = TickCounters {
             input_units: self.units.len(),
@@ -281,6 +289,14 @@ impl Simulation {
 
         // This preserves the browser simulation's reverse stable-array loop.
         for attacker_idx in (0..self.units.len()).rev() {
+            if input
+                .inactive_unit_ids
+                .binary_search(&self.units[attacker_idx].combat.id)
+                .is_ok()
+            {
+                counters.held_units += 1;
+                continue;
+            }
             if !eligible_at_loop_start(&self.units[attacker_idx].combat) {
                 continue;
             }
@@ -310,24 +326,9 @@ impl Simulation {
                     |cell| self.candidates.extend(cell.units.iter().copied()),
                 );
             }
-            // The JS orchestration canonicalizes tactical candidates by stable ID.
-            self.candidates
-                .sort_unstable_by_key(|&index| self.units[index].combat.id);
-
             self.accepted.clear();
             for target_idx in self.candidates.iter().copied() {
                 counters.candidate_contacts += 1;
-                if target_idx == attacker_idx
-                    || !is_hostile(
-                        input.hostility,
-                        usize::from(attacker_side),
-                        self.tactical_units[target_idx]
-                            .side
-                            .map_or(usize::MAX, usize::from),
-                    )
-                {
-                    continue;
-                }
                 // The actor is live state; the target position comes from the
                 // immutable start-of-tick tactical snapshot.
                 let d_lat =
@@ -341,6 +342,10 @@ impl Simulation {
                     self.accepted.push(target_idx);
                 }
             }
+            // Filtering is side-effect free. Canonicalize only the contacts
+            // that will be observed by mutation and target selection.
+            self.accepted
+                .sort_unstable_by_key(|&index| self.units[index].combat.id);
 
             // Target selection happens before proximity mutations. A preferred
             // accepted target wins; otherwise the first stable-ID contact wins.
@@ -460,6 +465,15 @@ impl Simulation {
         Ok(())
     }
 
+    fn validate_inactive_units(&self, ids: &[u64]) -> Result<(), SimulationError> {
+        if ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || ids.iter().any(|id| !self.unit_index_by_id.contains_key(id))
+        {
+            return Err(SimulationError::InvalidInactiveUnits);
+        }
+        Ok(())
+    }
+
     fn validate_units(&self, max_sides: Option<usize>) -> Result<(), SimulationError> {
         for unit in &self.units {
             let combat = &unit.combat;
@@ -489,22 +503,25 @@ impl Simulation {
         Ok(())
     }
 
-    fn rebuild_tactical_snapshot(&mut self) -> Result<(), SimulationError> {
+    fn rebuild_tactical_snapshot(
+        &mut self,
+        inactive_unit_ids: &[u64],
+    ) -> Result<(), SimulationError> {
         self.tactical_units.clear();
-        self.tactical_units
-            .extend(self.units.iter().map(|unit| {
-                TacticalUnit {
-                    id: unit.combat.id,
-                    side: eligible_for_tactical_snapshot(&unit.combat)
-                        .then_some(unit.combat.side as SideKey),
-                    lat: unit.combat.lat,
-                    lng: unit.combat.lng,
-                    strength: formation_strength(&unit.combat),
-                    ally_weight: unit.ally_weight,
-                    is_armor: unit.combat.kind == UnitKind::Armor,
-                    is_support: unit.is_support,
-                }
-            }));
+        self.tactical_units.extend(self.units.iter().map(|unit| {
+            TacticalUnit {
+                id: unit.combat.id,
+                side: (eligible_for_tactical_snapshot(&unit.combat)
+                    && inactive_unit_ids.binary_search(&unit.combat.id).is_err())
+                .then_some(unit.combat.side as SideKey),
+                lat: unit.combat.lat,
+                lng: unit.combat.lng,
+                strength: formation_strength(&unit.combat),
+                ally_weight: unit.ally_weight,
+                is_armor: unit.combat.kind == UnitKind::Armor,
+                is_support: unit.is_support,
+            }
+        }));
         self.grid.rebuild(&self.tactical_units)?;
         Ok(())
     }
@@ -548,7 +565,9 @@ impl Simulation {
                 health_fraction: (unit.combat.health / unit.combat.max_health).clamp(0.0, 1.0)
                     as f32,
                 personnel: unit.combat.personnel,
+                personnel_capacity: unit.combat.personnel_capacity,
                 equipment: unit.combat.equipment,
+                max_equipment: unit.combat.max_equipment,
                 dir_lat: unit.dir_lat,
                 dir_lng: unit.dir_lng,
                 coast_stuck_ticks: unit.coast_stuck_ticks,
@@ -768,6 +787,7 @@ mod tests {
                 max_sides: 2,
             },
             orders,
+            inactive_unit_ids: &[],
         }
     }
 

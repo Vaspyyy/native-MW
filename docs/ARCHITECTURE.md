@@ -28,12 +28,18 @@ browser runtime's shared mutable `main.js` structure.
    commit country and side census snapshots.
 7. Settle economy, occupation, resistance, capitulation, desertion, and treaty
    consequences as one atomic strategic pay cycle.
+8. Derive production country/city/economy inputs and production front layouts
+   from an MWSC scenario, then connect the migrated kernels under one native
+   tick owner.
 
-Every migrated simulation slice from tactical indexing onward has a checked-in
-JSON contract, a JavaScript reference runner, and a Rust fixture runner.
-`scripts/verify-scenario-parity.sh` is the cross-language correctness gate;
-benchmarks use generated production-shaped fixtures rather than the small
-canonical cases.
+Every parity-ported kernel from tactical indexing onward has a checked-in JSON
+contract, a JavaScript reference runner, and a Rust fixture runner.
+`scripts/verify-scenario-parity.sh` is the cross-language correctness gate and
+also replays the production `NativeRuntime` fixture twice to enforce native
+determinism. The browser checkpoint exporter and native loader share the v1
+handoff schema, but the complete browser tick is not presented as a
+cross-language reference implementation. Benchmarks use generated
+production-shaped fixtures rather than the small canonical cases.
 
 The tactical-grid slice ports `src/tactical-grid.js`: typed unit snapshots, stable
 row-major cell traversal, antimeridian wrapping, cell aggregates, and filtered
@@ -42,10 +48,12 @@ the JavaScript and Rust implementations and benchmarks a 4,800-unit stress
 case.
 
 Normal `mw-native` startup remains map-only. The opt-in `--demo-units` mode
-finds a real adjacent-country land border in the decoded scenario, feeds
-resolved orders through the native tick, and renders its immutable snapshots.
-This exercises the integration without adding synthetic work to normal viewer
-startup.
+finds a real adjacent-country land border in the decoded scenario, constructs a
+small explicit checkpoint, advances the shared `NativeRuntime`, and renders its
+immutable snapshots. This exercises the integration without adding synthetic
+work to normal viewer startup. The viewer does not yet deserialize production
+checkpoint JSON; production checkpoints are currently validated and replayed
+headlessly by `mw-tools`.
 
 The movement/combat slice ports the resolved per-unit hot path from the browser:
 final movement-distance multiplication, ordered coast deflection, stuck-target
@@ -75,6 +83,68 @@ through reference-counted immutable slices. The renderer can retain a frame
 while the simulation advances without reading mutable gameplay state. The GPU
 overlay uploads a snapshot only when a new one is published and reuses its CPU
 and GPU instance capacity.
+
+## Production orchestration boundary
+
+`derive_scenario_production` converts decoded MWSC countries, current control,
+de-jure ownership, cities, population, and GDP into stable country records,
+city records, economy seeds, capital cells, initial-control baselines, and
+expected force sizes. Current control is authoritative for the starting owned
+cell and unresolved-city fallback counts; de-jure ownership remains a separate
+validated input. No browser DOM or mutable `main.js` state enters this layer.
+
+The production front-layout kernel scans the dense dominant-side map in stable
+row-major order, creates directed-hostility segments, allocates capacity-limited
+slots, and publishes ordered AI objectives plus sticky prior assignments. A
+side receives slots only on a direction in which that side is hostile, so an
+asymmetric diplomacy matrix does not silently consume reverse-front capacity.
+
+`NativeRuntime` is the sole mutable owner of the live production slice. One
+logical step executes these boundaries in order:
+
+1. refresh the production front layout when due;
+2. resolve AI contacts and orders from immutable inputs;
+3. execute movement and immediate combat through `Simulation`;
+4. derive casualties and stamp surviving active-unit influence;
+5. advance or flush the territory census; and
+6. run the atomic strategic cycle at its pay boundary.
+
+Units still inside their deployment delay are published to the renderer, but
+are excluded from front slots, AI planning, tactical contacts, movement,
+combat, and territory influence until activation. The runtime publishes the
+new cross-kernel snapshot only after the step succeeds. Consumers receive an
+`Arc<RuntimeSnapshot>` and cannot observe its simulation, territory, or
+strategic components mutating underneath them. Territory upload payloads are
+also immutable and leave the runtime through a FIFO queue, so a later dirty
+tile cannot overtake an earlier one.
+
+The browser/native handoff is versioned as
+`native-runtime-checkpoint-v1` and makes its semantic boundary explicit:
+
+- `postStartWar` is the only production-resumable boundary in v1. It represents
+  the state immediately after browser `startWar()` and before the first
+  simulation tick. The loader requires tick `0`, frame `0`, strategic cycle
+  `0`, no occupations, explicit zero casualties, deployment-adjusted starting
+  economies, and exact RLE snapshots of the browser's active land,
+  world-control, and de-jure grids. The MWSC hash still pins metadata and city
+  identity; the checkpoint maps are authoritative for editor-derived or
+  prederived geography.
+- `baselineReplay` is a synthetic fixture/benchmark boundary. It may begin at a
+  later clock or pay-cycle edge, but it still reconstructs scenario-baseline
+  territory and therefore is deliberately reported as non-resumable. It must
+  never be presented as a mid-war save or production continuation.
+
+The exporter writes unvaried influence radius/delta inputs plus the original
+browser unit seed. `NativeRuntime` recomputes the logical-tick mobilization ramp
+and deterministic radius/delta noise on every step. Terrain, urban defense,
+formation support, cohesion, encirclement, and similar resolved AI/combat
+modifiers are still captured at the handoff and then owned by native policy;
+porting their live resolvers remains later work.
+
+This distinction is necessary because checkpoint v1 does not serialize live
+side-influence planes, primary/dominant controller planes, or an in-progress
+census. Adding those maps is a future mid-war checkpoint version, not an
+implicit relaxation of v1 validation.
 
 ## Territory and strategic state
 
@@ -109,17 +179,22 @@ replayed commands fail before treasury or resistance state can be settled twice.
 The strategic snapshot is the command boundary for higher-level gameplay:
 desertion and surrender are explicit commands, while budget, command-band,
 resistance, capitulation, and treaty changes are explicit events. Applying
-territory transfers and deleting units remains the caller's job, so the core
-does not mutate another subsystem behind its snapshot boundary.
+territory transfers and deleting units remains outside the current runtime
+slice, so the core does not mutate another subsystem behind its snapshot
+boundary. If a strategic publication contains any desertion, surrender, or
+conflict-resolution command, `NativeRuntime` enters
+`AwaitingStrategicEffects` and refuses another step. Resumption requires an
+authoritative replacement checkpoint with every consequence already applied;
+there is intentionally no receipt or acknowledge-and-continue escape hatch.
 
 ## Rendering model
 
 The world map is a regular geographic grid. Ownership IDs are uploaded as an
 integer GPU texture and converted to colors in WGSL. Borders are detected from
 neighboring ownership IDs in the shader. After initial upload, territory
-changes are transferred as bounded dirty tiles. Units are rendered from
-immutable frame snapshots; later passes can use the same publication model for
-cities, frontlines, labels, and effects.
+changes are transferred as bounded FIFO dirty tiles. Units are rendered from
+reference-counted immutable frame snapshots; later passes can use the same
+publication model for cities, frontlines, labels, and effects.
 
 ## Migration order
 
@@ -135,10 +210,16 @@ cities, frontlines, labels, and effects.
    renderer path.**
 7. Economy, occupation, surrender, and atomic strategic orchestration.
    **Complete in `mw-core`.**
-8. Derive full production objectives, garrisons, and strategic commands from a
-   loaded scenario, then replace the remaining browser orchestration adapters.
-9. Native UI/editor/community parity only after the simulation benchmark shows
-   the native core is worth continuing.
+8. Derive production scenario inputs and front objectives, then connect AI,
+   simulation, territory, and strategic kernels under one runtime owner.
+   **Complete for the bounded v1 checkpoint contract and headless runner.**
+9. Load production checkpoints in `mw-native`, then extend the checkpoint with
+   live territory/census state and port strategic consequence application for
+   resumable mid-war play.
+10. Move the production simulation onto a dedicated thread after measuring the
+    full-cap orchestration workload, keeping rendering on immutable snapshots.
+11. Native UI/editor/community parity only after the simulation benchmark shows
+    the native core is worth continuing.
 
 Air/naval simulation, the full gameplay HUD, map editor, online/community
 features, and satellite-map parity are still outside the native port.

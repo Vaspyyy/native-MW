@@ -24,7 +24,7 @@ impl<'a> HostilityMatrix<'a> {
         }
     }
 
-    fn is_hostile(self, left: i8, right: i8) -> bool {
+    fn is_hostile(self, left: i16, right: i16) -> bool {
         if left < 0 || right < 0 || left == right {
             return false;
         }
@@ -44,7 +44,10 @@ impl<'a> HostilityMatrix<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct DirectionFieldInput<'a> {
     pub land_mask: &'a [u8],
-    pub dominant_side_map: &'a [i8],
+    /// Shared signed controller map used by territory, AI, and field layout.
+    /// The browser currently transfers Int8 values, but the native runtime
+    /// keeps one i16 map so field refreshes do not copy the full world grid.
+    pub dominant_side_map: &'a [i16],
     pub hostility: HostilityMatrix<'a>,
     pub grid_width: usize,
     pub grid_height: usize,
@@ -214,7 +217,7 @@ mod tests {
 
     fn field(
         land: &[u8],
-        sides: &[i8],
+        sides: &[i16],
         width: usize,
         height: usize,
         relations: Option<&[u8]>,

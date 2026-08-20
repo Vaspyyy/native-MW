@@ -7,14 +7,21 @@ reference while systems move into the renderer-independent `mw-core` crate.
 
 - MWSC v2 scenario decoding and grid remapping
 - deterministic frontline direction-field generation
+- deterministic production front segmentation, slots, and objectives
 - deterministic tactical spatial grid and same-side neighbor traversal
 - browser-parity final unit movement, coast handling, and pair combat
 - deterministic native tick orchestration over resolved orders and tactical contacts
 - deterministic AI contact, retreat, frontline, reinforcement, and field orders
+- production derivation from MWSC countries, current control, cities, and GDP
 - Float32 territory influence, controller attribution, dirty-tile rendering, and
   incremental census publication
 - atomic economy, occupation, resistance, capitulation, desertion, and treaty cycles
-- immutable unit snapshots and a native `wgpu` unit overlay
+- one `NativeRuntime` owner connecting front layout -> AI -> simulation ->
+  territory -> strategic settlement
+- reference-counted immutable snapshots, FIFO territory render deltas, and a
+  native `wgpu` unit overlay
+- a versioned browser-to-native checkpoint contract with exact active-grid RLE
+  geography for the post-`startWar()` boundary
 - headless JavaScript parity fixtures and timing for every migrated slice
 
 The repository intentionally starts with the existing browser scenarios rather
@@ -35,14 +42,23 @@ From this directory:
 
 ```bash
 cargo run --release -p mw-tools -- inspect ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz --grid-res 0.15
+cargo run --release -p mw-tools -- production-inspect ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz --grid-res 0.15 --country Germany
 cargo run --release -p mw-tools -- tactical-fixture fixtures/tactical-grid-v1.json
 cargo run --release -p mw-tools -- unit-fixture fixtures/movement-combat-v1.json
 cargo run --release -p mw-tools -- native-tick-fixture fixtures/native-tick-v1.json
 cargo run --release -p mw-tools -- ai-orders-fixture fixtures/ai-orders-v1.json
 cargo run --release -p mw-tools -- territory-control-fixture fixtures/territory-control-v1.json
 cargo run --release -p mw-tools -- strategic-cycle-fixture fixtures/strategic-cycle-v1.json
+cargo run --release -p mw-tools -- native-runtime-fixture ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz fixtures/native-runtime-checkpoint-v1.json --json
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
+
+`native-runtime-fixture` accepts two deliberately different checkpoint
+boundaries. `postStartWar` is production-resumable only at tick, frame, and
+strategic cycle zero. It carries exact binary-land, world-control, and de-jure
+RLE maps plus the live unit/economy handoff. `baselineReplay` exists for
+deterministic fixtures and benchmarks; it is synthetic and must not be treated
+as a saved game or mid-war resume point.
 
 For an automated three-frame GPU/window smoke test:
 
@@ -58,6 +74,11 @@ Native viewer controls:
 - `R`: reset camera
 - left click: print the selected country and geographic cell
 - `Esc`: quit
+
+`mw-native --demo-units` now exercises the same shared `NativeRuntime` used by
+the headless tools. The viewer does not yet load production checkpoint JSON;
+the browser-exported `postStartWar` handoff is currently validated and replayed
+through `mw-tools`.
 
 Run the complete cross-language parity matrix against the adjacent web checkout:
 
@@ -108,6 +129,21 @@ node scripts/generate-strategic-cycle-stress.mjs 512 256 100 > /tmp/mw-strategic
 target/release/mw-tools strategic-cycle-bench /tmp/mw-strategic-stress.json --repeat 20 --warmup 5 --json
 node scripts/js-strategic-cycle-reference.mjs /tmp/mw-strategic-stress.json bench --repeat=20 --warmup=5
 ```
+
+Inspect production derivation and benchmark the complete production runtime at
+the 4,800-unit browser cap:
+
+```bash
+target/release/mw-tools production-inspect ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz --grid-res 0.15 --json
+node scripts/generate-native-runtime-stress.mjs 2400 3 > /tmp/mw-native-runtime-stress.json
+target/release/mw-tools native-runtime-fixture ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz /tmp/mw-native-runtime-stress.json --json
+target/release/mw-tools native-runtime-bench ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz /tmp/mw-native-runtime-stress.json --ticks 3 --repeat 9 --warmup 3 --json
+```
+
+If a strategic cycle publishes any desertion, surrender, or conflict-resolution
+command, `NativeRuntime` stops. Continuing requires a new authoritative
+checkpoint with those consequences already applied; there is no unsafe
+acknowledge-and-continue path in this slice.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the migration boundary.
 Measured Rust-versus-JavaScript results are recorded in

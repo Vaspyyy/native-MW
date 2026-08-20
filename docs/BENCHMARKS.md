@@ -248,3 +248,84 @@ node scripts/generate-strategic-cycle-stress.mjs 512 256 100 > "$strategic_fixtu
 target/release/mw-tools strategic-cycle-bench "$strategic_fixture" --repeat 20 --warmup 5 --json
 node scripts/js-strategic-cycle-reference.mjs "$strategic_fixture" bench --repeat=20 --warmup=5
 ```
+
+## Production native runtime
+
+The production runtime benchmark covers the entire migrated orchestration
+slice in one owned process: production front refresh, AI contact/order
+resolution, tactical movement/combat, casualty accounting, territory influence
+and census, strategic pay-cycle derivation/settlement, immutable snapshot
+publication, and FIFO render-delta draining. Scenario read/decompression,
+production derivation, checkpoint validation, and runtime construction are
+outside the timed region.
+
+The generated full-cap workload contains 4,800 units (2,400 per side) spread
+along the real eastern Russia-China front in the Modern 2022 MWSC scenario. It
+uses a `baselineReplay` checkpoint starting at tick 598 so a three-tick sample
+includes the tick-600 strategic boundary. This boundary is synthetic and
+non-resumable; it is suitable for repeatable measurements, not for loading a
+mid-war browser save.
+
+Two complete release validation runs used 3 warmups and 9 measured samples.
+The values below are the median of the two run medians; p95 is the more
+conservative of the two observed p95 values.
+
+| Complete three-tick runtime sample | Rust release |
+|---|---:|
+| Fresh checkpoint median | 156.23 ms (52.08 ms/tick) |
+| Fresh checkpoint p95 | 166.34 ms |
+| Persistent runtime median | 120.08 ms (40.03 ms/tick) |
+| Persistent runtime p95 | 159.05 ms |
+
+Both runs produced the same semantic benchmark checksum
+(`e3a00ede1aef3d2e`), fresh final-state checksum
+(`76a31ed4472b0d44`), and persistent final-state checksum
+(`225367174534d753`). A representative active tick retained 4,708 authoritative
+front slots, assigned 92 reinforcements, traversed about 385,000 hostile
+tactical candidates, accepted 46,052 contacts, and evaluated 128,007 territory
+source/cell applications. No work was skipped to obtain the timing.
+
+The fresh path reconstructs the checkpoint for every sample, so all nine
+samples include front bootstrap and the tick-600 strategic boundary. The
+persistent path advances one runtime for 27 measured ticks; it amortizes
+bootstrap and includes the strategic boundary only when the live clock reaches
+it. Neither number includes scenario decode, JSON serialization, or GPU upload.
+
+This complete single-threaded slice does **not** meet a 16.67 ms 60 Hz frame
+budget at the 4,800-unit cap. The measured next targets are direct
+territory-source stamping (roughly 13 ms/tick) and checked pair-combat dispatch
+(roughly 5 ms/tick). Production rendering should therefore consume snapshots
+from a dedicated simulation thread or a lower fixed simulation cadence instead
+of running this workload on the presentation thread.
+
+The report also publishes milliseconds per tick, completed steps, gate state,
+render updates drained, and deterministic final-state checksums. The benchmark
+fails if two untimed fresh executions diverge or if the requested fresh sample
+hits the strategic-effects gate. A persistent run never acknowledges that
+gate silently: any desertion, surrender, or conflict-resolution command ends
+the available persistent sample.
+
+Reproduce production inspection, the canonical deterministic replay, and the
+4,800-unit workload:
+
+```bash
+scenario=../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
+target/release/mw-tools production-inspect "$scenario" --grid-res 0.15 --json
+target/release/mw-tools native-runtime-fixture "$scenario" fixtures/native-runtime-checkpoint-v1.json --json
+
+runtime_fixture=$(mktemp --suffix=.mw-native-runtime.json)
+node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
+target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
+```
+
+`postStartWar` is the separate production-resumable checkpoint boundary. It is
+accepted only at tick/frame/strategic-cycle zero with exact RLE land,
+world-control, and de-jure maps, zero casualties, no occupations, and
+deployment-adjusted starting economies. The native runtime recomputes the
+browser's logical-tick influence ramp and deterministic radius/delta noise from
+the exported unit seed. Other terrain-, urban-, cohesion-, and live-state
+modifiers are resolved at handoff and become native-owned inputs; this is a
+production boundary, not a claim that the remaining browser tick has already
+been ported. The current native viewer uses `NativeRuntime` for `--demo-units`
+but does not yet load that production checkpoint file; `mw-tools` is the v1
+handoff validator and headless runner.

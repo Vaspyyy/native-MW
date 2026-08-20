@@ -10,6 +10,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 mod ai_orders;
+mod front_layout;
+mod native_runtime;
 mod native_tick;
 mod strategic_cycle;
 mod territory_control;
@@ -31,6 +33,11 @@ fn run() -> Result<()> {
     match command.as_str() {
         "inspect" => inspect(args.collect()),
         "field-bench" => field_bench(args.collect()),
+        "front-layout-fixture" => front_layout::run_fixture_command(args.collect()),
+        "front-layout-bench" => front_layout::run_bench_command(args.collect()),
+        "production-inspect" => native_runtime::run_production_inspect_command(args.collect()),
+        "native-runtime-fixture" => native_runtime::run_fixture_command(args.collect()),
+        "native-runtime-bench" => native_runtime::run_bench_command(args.collect()),
         "tactical-fixture" => tactical_fixture(args.collect()),
         "tactical-bench" => tactical_bench(args.collect()),
         "unit-fixture" => unit_kernel::run_fixture_command(args.collect()),
@@ -55,6 +62,11 @@ fn print_help() {
     println!(
         "mw-tools\n\n  inspect <scenario.mwsc.gz> [--grid-res N] [--repeat N] [--json]\n  \
          field-bench <scenario.mwsc.gz> [--grid-res N] [--repeat N] [--side-a NAME] [--side-b NAME] [--json]\n  \
+         front-layout-fixture <fixture.json> [--json]\n  \
+         front-layout-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n  \
+         production-inspect <scenario.mwsc.gz> [--grid-res N] [--country ID] [--json]\n  \
+         native-runtime-fixture <scenario.mwsc.gz> <checkpoint.json> [--ticks N] [--json]\n  \
+         native-runtime-bench <scenario.mwsc.gz> <checkpoint.json> [--ticks N] [--repeat N] [--warmup N] [--json]\n  \
          tactical-fixture <fixture.json> [--json]\n  \
          tactical-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n  \
          unit-fixture <fixture.json> [--json]\n  \
@@ -516,7 +528,7 @@ fn field_bench(args: Vec<String>) -> Result<()> {
         .with_context(|| format!("country {side_b:?} is not in the scenario"))?;
 
     let mut land_mask = decoded.land.clone();
-    let mut dominant_side_map = vec![-1_i8; decoded.world_control.len()];
+    let mut dominant_side_map = vec![-1_i16; decoded.world_control.len()];
     for (index, owner) in decoded.world_control.iter().copied().enumerate() {
         if owner == side_a_id {
             land_mask[index] = 2;

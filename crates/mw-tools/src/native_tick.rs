@@ -200,6 +200,7 @@ fn build_report(fixture: &Fixture) -> Result<FixtureReport> {
             world,
             hostility,
             orders: &orders,
+            inactive_unit_ids: &[],
         })?;
         steps.push(StepReport::from_snapshot(&snapshot, counters));
     }
