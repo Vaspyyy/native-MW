@@ -4,6 +4,7 @@
 //! APIs. Native and future web frontends should consume snapshots from here.
 
 pub mod ai;
+pub mod bootstrap;
 pub mod combat;
 pub mod direction;
 pub mod economy;
@@ -25,6 +26,7 @@ pub use ai::{
     AiUnitInput, AiWorldInput, AssignmentReason, FrontAssignmentRecord, FrontObjective,
     ResolvedCombatModifiers, ResolvedMovementModifiers, resolve_ai_orders,
 };
+pub use bootstrap::{NativeWarBootstrapConfig, NativeWarBootstrapError, bootstrap_native_war};
 
 pub use combat::{
     COMBAT_SCHEMA_VERSION, CombatConfig, CombatContext, CombatError, CombatEvent, CombatLayer,
@@ -70,9 +72,9 @@ pub use production::{
 pub use runtime::{
     DEFAULT_CENSUS_BUDGET, DEFAULT_CENSUS_FLUSH_CHUNK, DEFAULT_FRONT_REFRESH_TICKS,
     DEFAULT_RUNTIME_FRONT_STICKINESS, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
-    RuntimeCensusCounters, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeError,
-    RuntimeInfluenceCounters, RuntimeSnapshot, RuntimeState, RuntimeStepCounters,
-    RuntimeUnitPolicy, UnitAiPolicy, UnitInfluencePolicy,
+    NativeRuntimeCheckpointState, RuntimeCensusCounters, RuntimeCheckpoint, RuntimeConfig,
+    RuntimeDiplomacy, RuntimeError, RuntimeInfluenceCounters, RuntimeSnapshot, RuntimeState,
+    RuntimeStepCounters, RuntimeUnitPolicy, UnitAiPolicy, UnitInfluencePolicy,
 };
 pub use scenario::{
     DecodedScenario, GridSpec, ScenarioError, decode_mwsc, decode_mwsc_gzip, decode_mwsc_gzip_file,

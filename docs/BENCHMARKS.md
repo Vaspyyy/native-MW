@@ -362,6 +362,14 @@ target/release/mw-native --runtime-checkpoint "$checkpoint" "$scenario"
 target/release/mw-native --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
 ```
 
+Native-only starts use repeated `--side` selectors (ID or unique
+case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
+
+```bash
+target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v2.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v2.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v2-resumed.json "$scenario"
+```
+
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
 exact RLE land, world-control, and de-jure maps, zero casualties, no
 occupations, and deployment-adjusted starting economies. Its strict contract
@@ -379,13 +387,22 @@ territory overlay is restored. V2 encoding/decoding and restore are outside the
 timed benchmark region, and no v2 performance number is claimed here.
 
 Both `mw-native` production modes accept resumable v1 `postStartWar` and v2
-`midWar` while rejecting `baselineReplay`. The native runtime recomputes the
-browser's logical-tick influence ramp and deterministic radius/delta noise from
-the exported unit seed. Other terrain-, urban-, cohesion-, and live-state
+`midWar` while rejecting `baselineReplay`. Native-written v2 saves also carry
+the current objectives, AI assignment priors, frontline layout priors, and
+last refresh tick, which makes split and uninterrupted native runs exactly
+comparable across a refresh boundary. Browser v2 exports omit that optional
+block and intentionally begin from a fresh deterministic front layout. The
+native runtime recomputes the browser's logical-tick influence ramp and
+deterministic radius/delta noise from the exported unit seed. Other terrain-,
+urban-, cohesion-, and live-state
 modifiers are resolved at handoff and become native-owned inputs; this is a
 production boundary, not a claim that the remaining browser tick has already
-been ported. A v2 restore rebuilds private territory summaries and starts a
-fresh deterministic native front-planning boundary; partial census work,
-render queues, and prior front assignments are not serialized. Map-only
-viewing and the small scenario-derived `--demo-units` runtime remain separate
-modes.
+been ported. A v2 restore rebuilds private territory summaries; partial census
+work and render queues are not serialized. Map-only viewing and the small
+scenario-derived `--demo-units` runtime remain separate modes.
+
+Native save/reload equivalence assumes the canonical runtime configuration
+used by the CLI. The writer rejects custom cadence/kernel or noncanonical
+territory topology instead of silently restoring defaults. It also skips a
+requested save after clean `ConflictResolved` termination because checkpoint
+v2 represents resumable running state.

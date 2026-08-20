@@ -19,7 +19,7 @@ use crate::{
     },
     combat::formation_strength,
     direction::HostilityMatrix,
-    economy::PAY_CYCLE_TICKS,
+    economy::{EconomyState, PAY_CYCLE_TICKS},
     front::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
         derive_front_layout,
@@ -31,8 +31,8 @@ use crate::{
     },
     scenario::GridSpec,
     simulation::{
-        FrameSnapshot, ResolvedCombatOrder, ResolvedUnitOrder, Simulation, SimulationError,
-        TickCounters, TickInput,
+        FrameSnapshot, ResolvedCombatOrder, ResolvedUnitOrder, Simulation, SimulationConfig,
+        SimulationError, SimulationUnit, TickCounters, TickInput,
     },
     strategic::{
         ConflictResolutionPlan, PreparedStrategicCycle, StrategicCounters, StrategicError,
@@ -43,7 +43,8 @@ use crate::{
     tactical::SideKey,
     territory::{
         CensusStepResult, InfluenceApplyResult, InfluenceSource, TerritoryCommittedState,
-        TerritoryControl, TerritoryError, TerritoryRenderUpdate, TerritorySnapshot,
+        TerritoryConfig, TerritoryControl, TerritoryError, TerritoryRenderUpdate,
+        TerritorySnapshot,
     },
     world::WorldGridView,
 };
@@ -263,6 +264,8 @@ pub enum RuntimeError {
     ConflictResolved { cycle: u64, tick: u64 },
     #[error("runtime is poisoned after a post-mutation invariant failure")]
     Poisoned,
+    #[error("runtime checkpoints can only be captured from a running state")]
+    CheckpointUnavailable,
     #[error("AI planning: {0}")]
     Ai(#[from] AiOrderError),
     #[error("front layout: {0}")]
@@ -575,6 +578,36 @@ pub struct RuntimeCheckpoint {
     /// front-layout adapter once its first refresh succeeds.
     pub objectives: Vec<FrontObjective>,
     pub prior_objective_by_unit: BTreeMap<u64, u64>,
+    pub front_prior_by_unit: BTreeMap<u64, FrontLayoutPrior>,
+    pub last_front_refresh_tick: Option<u64>,
+    pub casualties: BTreeMap<u16, f64>,
+    pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+}
+
+/// Owned state captured at a committed, serialization-ready runtime boundary.
+///
+/// Renderer queues are intentionally omitted, while history-dependent planning
+/// state is retained so a restored runtime continues on the same tick phase.
+#[derive(Clone, Debug)]
+pub struct NativeRuntimeCheckpointState {
+    pub tick: u64,
+    pub frame: u64,
+    pub war_grace_end: u64,
+    pub runtime_config: RuntimeConfig,
+    pub simulation_config: SimulationConfig,
+    pub units: Vec<SimulationUnit>,
+    pub territory_config: TerritoryConfig,
+    pub territory_committed_state: TerritoryCommittedState,
+    pub strategic_cycle: u64,
+    pub economies: Vec<EconomyState>,
+    pub occupations: Vec<OccupationState>,
+    pub scenario: ScenarioProduction,
+    pub diplomacy: RuntimeDiplomacy,
+    pub unit_policies: Vec<RuntimeUnitPolicy>,
+    pub objectives: Vec<FrontObjective>,
+    pub prior_objective_by_unit: BTreeMap<u64, u64>,
+    pub front_prior_by_unit: BTreeMap<u64, FrontLayoutPrior>,
+    pub last_front_refresh_tick: Option<u64>,
     pub casualties: BTreeMap<u16, f64>,
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
 }
@@ -642,6 +675,13 @@ impl NativeRuntime {
             &checkpoint.simulation,
             &checkpoint.objectives,
             &checkpoint.prior_objective_by_unit,
+        )?;
+        validate_front_planner_state(
+            checkpoint.tick,
+            &checkpoint.simulation,
+            &checkpoint.objectives,
+            &checkpoint.front_prior_by_unit,
+            checkpoint.last_front_refresh_tick,
         )?;
         validate_casualties(&checkpoint.casualties, &checkpoint.scenario)?;
         validate_casualties_by_victim(&checkpoint.casualties_by_victim, &checkpoint.scenario)?;
@@ -737,8 +777,8 @@ impl NativeRuntime {
             unit_policies,
             unit_sovereign_by_id,
             objectives: checkpoint.objectives,
-            front_prior_by_unit: BTreeMap::new(),
-            last_front_refresh_tick: None,
+            front_prior_by_unit: checkpoint.front_prior_by_unit,
+            last_front_refresh_tick: checkpoint.last_front_refresh_tick,
             prior_objective_by_unit: checkpoint.prior_objective_by_unit,
             casualties: checkpoint.casualties,
             casualties_by_victim: checkpoint.casualties_by_victim,
@@ -777,6 +817,57 @@ impl NativeRuntime {
         matches!(self.state, RuntimeState::AwaitingStrategicEffects { .. })
             .then(|| self.latest.strategic_snapshot.clone())
             .flatten()
+    }
+
+    /// Flush the census and capture every authoritative subsystem at one
+    /// quiescent save barrier. The runtime remains usable after capture.
+    pub fn checkpoint_state(&mut self) -> Result<NativeRuntimeCheckpointState, RuntimeError> {
+        if !matches!(self.state, RuntimeState::Running) {
+            return Err(RuntimeError::CheckpointUnavailable);
+        }
+
+        let previous_commit = self.latest.territory_snapshot.commit_sequence;
+        let territory_snapshot = self.territory.flush_census(self.config.census_flush_chunk);
+        if let Some(update) = self.territory.drain_render_update() {
+            self.render_updates.push_back(update);
+        }
+        let committed = self
+            .territory
+            .committed_state()
+            .ok_or(RuntimeError::InvalidCheckpoint(
+                "save barrier did not produce a committed territory state",
+            ))?;
+
+        let mut latest = (*self.latest).clone();
+        latest.territory_snapshot = territory_snapshot.clone();
+        latest.pending_render_updates = self.render_updates.len();
+        latest.counters.census.committed |= territory_snapshot.commit_sequence != previous_commit;
+        latest.counters.census.territory_generation = territory_snapshot.generation;
+        latest.counters.census.territory_commit_sequence = territory_snapshot.commit_sequence;
+        self.latest = Arc::new(latest);
+
+        Ok(NativeRuntimeCheckpointState {
+            tick: self.tick,
+            frame: self.frame,
+            war_grace_end: self.war_grace_end,
+            runtime_config: self.config,
+            simulation_config: self.simulation.config(),
+            units: self.simulation.units.clone(),
+            territory_config: self.territory.checkpoint_config(),
+            territory_committed_state: committed,
+            strategic_cycle: self.strategic.cycle(),
+            economies: self.strategic.economies().values().cloned().collect(),
+            occupations: self.strategic.occupations().values().cloned().collect(),
+            scenario: self.scenario.clone(),
+            diplomacy: self.diplomacy.clone(),
+            unit_policies: self.unit_policies.values().cloned().collect(),
+            objectives: self.objectives.clone(),
+            prior_objective_by_unit: self.prior_objective_by_unit.clone(),
+            front_prior_by_unit: self.front_prior_by_unit.clone(),
+            last_front_refresh_tick: self.last_front_refresh_tick,
+            casualties: self.casualties.clone(),
+            casualties_by_victim: self.casualties_by_victim.clone(),
+        })
     }
 
     fn stage_strategic_effects(
@@ -1023,8 +1114,8 @@ impl NativeRuntime {
             .frame
             .checked_add(1)
             .ok_or(RuntimeError::ClockOverflow)?;
-        // The first step always lays out fronts, including restored checkpoints at an arbitrary
-        // tick. Subsequent refreshes use the browser-like 30-tick phase (configurable).
+        // Checkpoints with no completed layout refresh once before planning. Exact native
+        // checkpoints retain the prior layout and continue on the configured tick phase.
         let refresh_fronts = self.last_front_refresh_tick.is_none()
             || next_tick.is_multiple_of(self.config.front_refresh_ticks);
         let refreshed_layout = if refresh_fronts {
@@ -1536,6 +1627,46 @@ fn validate_prior_assignments(
     Ok(())
 }
 
+fn validate_front_planner_state(
+    tick: u64,
+    simulation: &Simulation,
+    objectives: &[FrontObjective],
+    front_prior_by_unit: &BTreeMap<u64, FrontLayoutPrior>,
+    last_front_refresh_tick: Option<u64>,
+) -> Result<(), RuntimeError> {
+    if last_front_refresh_tick.is_some_and(|refresh_tick| refresh_tick > tick) {
+        return Err(RuntimeError::InvalidCheckpoint(
+            "last front refresh is newer than the runtime clock",
+        ));
+    }
+    if last_front_refresh_tick.is_none() && !front_prior_by_unit.is_empty() {
+        return Err(RuntimeError::InvalidCheckpoint(
+            "front layout prior has no completed refresh",
+        ));
+    }
+
+    let units = simulation
+        .units
+        .iter()
+        .map(|unit| unit.combat.id)
+        .collect::<BTreeSet<_>>();
+    let objective_ids = objectives
+        .iter()
+        .map(|objective| objective.id)
+        .collect::<BTreeSet<_>>();
+    if front_prior_by_unit.iter().any(|(unit_id, prior)| {
+        *unit_id != prior.unit_id
+            || prior.pair_key.is_empty()
+            || !units.contains(unit_id)
+            || !objective_ids.contains(&prior.objective_id)
+    }) {
+        return Err(RuntimeError::InvalidCheckpoint(
+            "front layout prior references missing units or objectives",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_casualties(
     casualties: &BTreeMap<u16, f64>,
     scenario: &ScenarioProduction,
@@ -1978,11 +2109,127 @@ mod tests {
                 unit_policies: policies,
                 objectives,
                 prior_objective_by_unit: BTreeMap::new(),
+                front_prior_by_unit: BTreeMap::new(),
+                last_front_refresh_tick: None,
                 casualties: BTreeMap::new(),
                 casualties_by_victim: BTreeMap::new(),
             },
         )
         .unwrap()
+    }
+
+    fn runtime_checkpoint(state: NativeRuntimeCheckpointState) -> RuntimeCheckpoint {
+        RuntimeCheckpoint {
+            tick: state.tick,
+            frame: state.frame,
+            war_grace_end: state.war_grace_end,
+            simulation: Simulation::new(state.simulation_config, state.units).unwrap(),
+            territory: TerritoryControl::restore(
+                state.territory_config,
+                state.territory_committed_state,
+            )
+            .unwrap(),
+            strategic: StrategicSimulation::restore(
+                state.strategic_cycle,
+                state.economies,
+                state.occupations,
+            )
+            .unwrap(),
+            scenario: state.scenario,
+            diplomacy: state.diplomacy,
+            unit_policies: state.unit_policies,
+            objectives: state.objectives,
+            prior_objective_by_unit: state.prior_objective_by_unit,
+            front_prior_by_unit: state.front_prior_by_unit,
+            last_front_refresh_tick: state.last_front_refresh_tick,
+            casualties: state.casualties,
+            casualties_by_victim: state.casualties_by_victim,
+        }
+    }
+
+    #[test]
+    fn checkpoint_restores_exact_planner_history_and_refresh_phase() {
+        let mut original = fixture(0, false);
+        assert!(original.step().unwrap().counters.front_refreshed);
+        let config = original.config;
+        let captured = original.checkpoint_state().unwrap();
+        assert_eq!(captured.last_front_refresh_tick, Some(1));
+        assert!(!captured.objectives.is_empty());
+        assert!(!captured.front_prior_by_unit.is_empty());
+
+        let mut restored = NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap();
+        assert_eq!(restored.objectives, original.objectives);
+        assert_eq!(restored.front_prior_by_unit, original.front_prior_by_unit);
+        assert_eq!(restored.last_front_refresh_tick, Some(1));
+        assert_eq!(
+            restored.prior_objective_by_unit,
+            original.prior_objective_by_unit
+        );
+
+        let uninterrupted = original.step().unwrap();
+        let continued = restored.step().unwrap();
+        assert!(!uninterrupted.counters.front_refreshed);
+        assert_eq!(continued.frame_snapshot, uninterrupted.frame_snapshot);
+        assert_eq!(
+            continued.territory_snapshot,
+            uninterrupted.territory_snapshot
+        );
+        assert_eq!(
+            continued.strategic_snapshot,
+            uninterrupted.strategic_snapshot
+        );
+        assert_eq!(continued.casualty_totals, uninterrupted.casualty_totals);
+        assert_eq!(
+            continued.casualties_by_victim,
+            uninterrupted.casualties_by_victim
+        );
+    }
+
+    #[test]
+    fn checkpoint_rejects_inconsistent_planner_history() {
+        let mut source = fixture(0, false);
+        source.step().unwrap();
+        let config = source.config;
+        let captured = source.checkpoint_state().unwrap();
+        let prior = captured
+            .front_prior_by_unit
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+
+        let mut future_refresh = captured.clone();
+        future_refresh.last_front_refresh_tick = Some(future_refresh.tick + 1);
+        assert!(matches!(
+            NativeRuntime::new(config, runtime_checkpoint(future_refresh)),
+            Err(RuntimeError::InvalidCheckpoint(
+                "last front refresh is newer than the runtime clock"
+            ))
+        ));
+
+        let mut unknown_unit = captured.clone();
+        unknown_unit.front_prior_by_unit.insert(
+            u64::MAX,
+            FrontLayoutPrior {
+                unit_id: u64::MAX,
+                ..prior.clone()
+            },
+        );
+        assert!(matches!(
+            NativeRuntime::new(config, runtime_checkpoint(unknown_unit)),
+            Err(RuntimeError::InvalidCheckpoint(
+                "front layout prior references missing units or objectives"
+            ))
+        ));
+
+        let mut missing_refresh = captured;
+        missing_refresh.last_front_refresh_tick = None;
+        assert!(matches!(
+            NativeRuntime::new(config, runtime_checkpoint(missing_refresh)),
+            Err(RuntimeError::InvalidCheckpoint(
+                "front layout prior has no completed refresh"
+            ))
+        ));
     }
 
     #[test]

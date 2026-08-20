@@ -109,8 +109,28 @@ Native viewer controls:
 - drag left mouse: pan
 - mouse wheel: cursor-anchored zoom
 - `R`: reset camera
+- `S`: save immediately when `--save-checkpoint PATH` is configured
 - left click: print the selected country and geographic cell
 - `Esc`: quit
+
+Native-only startup accepts repeated `--side` selectors (country ID or unique
+case-insensitive name) and uses deterministic all-Army bootstrap forces. Use
+`--save-checkpoint PATH` for exact-step headless saves; windowed mode also
+supports `S` and save-on-exit when a path is configured. Native-written v2
+checkpoints retain frontline objectives, assignment priors, and the refresh
+phase, so resumed runs follow the same deterministic trajectory as an
+uninterrupted run. This path does not yet cover every browser AI/combat
+resolver or non-land force system.
+
+Checkpoint v2 is a resumable-running-state format. If a requested headless or
+windowed save reaches `ConflictResolved`, the runtime finishes cleanly and
+reports that the save was skipped instead of writing a terminal file that the
+loader could not resume.
+
+```bash
+cargo run --release -p mw-native -- --side Germany --side Czechia --headless --ticks 2 --save-checkpoint /tmp/mw-v2.json "$scenario"
+cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v2.json --headless --ticks 3 --save-checkpoint /tmp/mw-v2-resumed.json "$scenario"
+```
 
 `mw-native --demo-units`, production checkpoint viewing, native headless
 validation, and the `mw-tools` runners all exercise the shared `NativeRuntime`.

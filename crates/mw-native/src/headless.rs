@@ -8,10 +8,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use mw_checkpoint::native_runtime::load_runtime_checkpoint;
+use mw_checkpoint::native_runtime::{load_runtime_checkpoint, write_runtime_checkpoint_state_v2};
 use mw_core::{
-    CombatEvent, CombatLayer, ConflictResolutionKind, RuntimeSnapshot, RuntimeState,
-    TerritoryRenderUpdate, UnitKind,
+    CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
+    ProductionConfig, ProductionCountry, RuntimeSnapshot, RuntimeState, TerritoryRenderUpdate,
+    UnitKind, bootstrap_native_war, decode_mwsc_gzip_file, derive_scenario_production,
 };
 use serde_json::json;
 
@@ -27,42 +28,107 @@ const MIN_WATCHDOG: Duration = Duration::from_secs(30);
 const MAX_WATCHDOG: Duration = Duration::from_secs(24 * 60 * 60);
 const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
+const TERMINAL_SAVE_SKIP_REASON: &str =
+    "conflictResolved is terminal and cannot be resumed as checkpoint-v2";
+
+fn resolve_sides(
+    selectors: &[Vec<String>],
+    countries: &[ProductionCountry],
+) -> Result<Vec<Vec<u16>>> {
+    let mut resolved = Vec::with_capacity(selectors.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for side in selectors {
+        let mut ids = Vec::with_capacity(side.len());
+        for selector in side {
+            let id = if let Ok(id) = selector.parse::<u16>() {
+                ensure!(
+                    countries.iter().any(|country| country.country_id == id),
+                    "unknown country selector {selector:?}"
+                );
+                id
+            } else {
+                let matches = countries
+                    .iter()
+                    .filter(|country| country.name.eq_ignore_ascii_case(selector))
+                    .collect::<Vec<_>>();
+                ensure!(
+                    matches.len() == 1,
+                    "{} country matches for selector {:?}",
+                    if matches.is_empty() { "no" } else { "multiple" },
+                    selector
+                );
+                matches[0].country_id
+            };
+            ensure!(
+                seen.insert(id),
+                "country selector {selector:?} appears more than once"
+            );
+            ids.push(id);
+        }
+        resolved.push(ids);
+    }
+    Ok(resolved)
+}
 
 /// Load a strict production checkpoint, execute up to `steps` worker ticks, and print a
 /// deterministic report. A resolved conflict ends cleanly before that cap. This path deliberately
 /// constructs no window or GPU state.
 pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
     ensure!(steps > 0, "headless worker steps must be greater than zero");
-    let checkpoint_path = options
-        .runtime_checkpoint_path
-        .as_ref()
-        .context("headless mode requires a native runtime checkpoint")?;
-    let loaded =
-        load_runtime_checkpoint(&options.scenario_path, checkpoint_path).with_context(|| {
-            format!(
-                "failed to load native runtime checkpoint {}",
-                checkpoint_path.display()
-            )
-        })?;
+    let (baseline, runtime, boundary, unit_count) = if let Some(checkpoint_path) =
+        options.runtime_checkpoint_path.as_ref()
+    {
+        let loaded = load_runtime_checkpoint(&options.scenario_path, checkpoint_path)
+            .with_context(|| {
+                format!(
+                    "failed to load native runtime checkpoint {}",
+                    checkpoint_path.display()
+                )
+            })?;
+        ensure!(
+            loaded.resumable,
+            "checkpoint boundary {} is not resumable",
+            loaded.checkpoint_boundary
+        );
+        ensure!(
+            RESUMABLE_CHECKPOINT_BOUNDARIES.contains(&loaded.checkpoint_boundary),
+            "headless runtime requires a postStartWar or midWar checkpoint, got {}",
+            loaded.checkpoint_boundary
+        );
+        ensure!(
+            loaded.exact_geography_supplied,
+            "headless runtime requires checkpoint-supplied exact geography"
+        );
+        (
+            loaded.baseline,
+            loaded.runtime,
+            loaded.checkpoint_boundary,
+            loaded.unit_count,
+        )
+    } else {
+        ensure!(
+            options.native_war_sides.len() >= 2,
+            "headless mode requires a checkpoint or at least two --side arguments"
+        );
+        let baseline = decode_mwsc_gzip_file(&options.scenario_path, Some(GridSpec::world(0.15)?))
+            .with_context(|| format!("failed to decode {}", options.scenario_path.display()))?;
+        let production = derive_scenario_production(&baseline, &ProductionConfig::default())?;
+        let sides = resolve_sides(&options.native_war_sides, &production.countries)?;
+        let runtime = bootstrap_native_war(
+            &baseline,
+            &NativeWarBootstrapConfig {
+                sides,
+                hostility: None,
+                production: ProductionConfig::default(),
+                war_grace_end: 600,
+            },
+        )?;
+        let units = runtime.latest_snapshot().frame_snapshot.units.len();
+        (baseline, runtime, "nativeNewWar", units)
+    };
+    let initial = runtime.latest_snapshot();
     ensure!(
-        loaded.resumable,
-        "checkpoint boundary {} is not resumable",
-        loaded.checkpoint_boundary
-    );
-    ensure!(
-        RESUMABLE_CHECKPOINT_BOUNDARIES.contains(&loaded.checkpoint_boundary),
-        "headless runtime requires a postStartWar or midWar checkpoint, got {}",
-        loaded.checkpoint_boundary
-    );
-    ensure!(
-        loaded.exact_geography_supplied,
-        "headless runtime requires checkpoint-supplied exact geography"
-    );
-
-    let boundary = loaded.checkpoint_boundary;
-    let initial = loaded.runtime.latest_snapshot();
-    ensure!(
-        initial.frame_snapshot.units.len() == loaded.unit_count,
+        initial.frame_snapshot.units.len() == unit_count,
         "loaded unit count does not match the runtime's initial publication"
     );
     let initial_tick = initial.tick;
@@ -75,7 +141,7 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         .context("requested headless steps overflow the runtime frame")?;
 
     let mut worker = RuntimeWorker::spawn_with_limit(
-        loaded.runtime,
+        runtime,
         options.runtime_tick_interval,
         options.runtime_queue_capacity,
         Some(steps),
@@ -84,11 +150,42 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
 
     let watchdog = watchdog_duration(options.runtime_tick_interval, steps);
     let outcome = monitor_worker(&worker, steps, initial_tick, initial_frame, watchdog);
+    let completion = match outcome {
+        Ok(completion) => completion,
+        Err(error) => {
+            if worker.stop_and_join().is_err() {
+                bail!("{error:#}; native runtime worker also panicked while joining");
+            }
+            return Err(error);
+        }
+    };
+    let save_skip_reason =
+        checkpoint_save_skip_reason(options.save_checkpoint_path.is_some(), completion.reason);
+    let save_skipped = save_skip_reason.is_some();
+    let save_result = (|| -> Result<_> {
+        let Some(path) = options.save_checkpoint_path.as_ref() else {
+            return Ok(None);
+        };
+        if save_skipped {
+            return Ok(None);
+        }
+        let state = worker.checkpoint_state().map_err(|error| {
+            anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
+        })?;
+        Ok(Some(write_runtime_checkpoint_state_v2(
+            &options.scenario_path,
+            &baseline,
+            &state,
+            path,
+            usize::try_from(completion.completed_steps)
+                .context("completed steps exceed save format")?,
+        )?))
+    })();
     let joined = worker.stop_and_join();
     if joined.is_err() {
         bail!("native runtime worker panicked while joining");
     }
-    let completion = outcome?;
+    let save_report = save_result?;
     ensure!(
         completion.completed_steps <= steps,
         "headless worker completed {} steps, exceeding its requested limit of {steps}",
@@ -141,11 +238,13 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
                 "joined": true,
                 "termination": completion.reason.as_str(),
                 "checksum": checksum,
+                "save": save_report,
+                "saveSkipped": save_skip_reason,
             }))?
         );
     } else {
         println!(
-            "{HEADLESS_SCHEMA} {boundary}: {}/{} steps, tick {}->{}, frame {}->{}, {} units, {} territory updates, {}, joined, checksum {}",
+            "{HEADLESS_SCHEMA} {boundary}: {}/{} steps, tick {}->{}, frame {}->{}, {} units, {} territory updates, {}, joined, checksum {}{}",
             completion.completed_steps,
             steps,
             initial_tick,
@@ -156,6 +255,11 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
             completion.territory_updates,
             completion.reason.as_str(),
             checksum,
+            save_report
+                .as_ref()
+                .map(|report| format!(", saved {}", report.path))
+                .or_else(|| save_skip_reason.map(|reason| format!(", save skipped: {reason}")))
+                .unwrap_or_default(),
         );
     }
     Ok(())
@@ -182,6 +286,14 @@ impl CompletionReason {
             Self::ConflictResolved => "conflictResolved",
         }
     }
+}
+
+fn checkpoint_save_skip_reason(
+    save_requested: bool,
+    reason: CompletionReason,
+) -> Option<&'static str> {
+    (save_requested && reason == CompletionReason::ConflictResolved)
+        .then_some(TERMINAL_SAVE_SKIP_REASON)
 }
 
 fn monitor_worker(
@@ -621,6 +733,18 @@ mod tests {
                 conflict_resolution: false,
             })
             .is_err()
+        );
+        assert_eq!(
+            checkpoint_save_skip_reason(true, CompletionReason::ConflictResolved),
+            Some(TERMINAL_SAVE_SKIP_REASON)
+        );
+        assert_eq!(
+            checkpoint_save_skip_reason(true, CompletionReason::StepLimit),
+            None
+        );
+        assert_eq!(
+            checkpoint_save_skip_reason(false, CompletionReason::ConflictResolved),
+            None
         );
     }
 

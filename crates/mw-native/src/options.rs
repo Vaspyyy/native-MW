@@ -10,6 +10,8 @@ pub const DEFAULT_RUNTIME_QUEUE_CAPACITY: usize = 8;
 pub struct AppOptions {
     pub scenario_path: PathBuf,
     pub runtime_checkpoint_path: Option<PathBuf>,
+    pub native_war_sides: Vec<Vec<String>>,
+    pub save_checkpoint_path: Option<PathBuf>,
     pub demo_units: bool,
     pub smoke_frames: Option<u64>,
     pub runtime_tick_interval: Duration,
@@ -23,6 +25,8 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
     let mut arguments = arguments.into_iter();
     let mut scenario_path = None;
     let mut runtime_checkpoint_path = None;
+    let mut native_war_sides = Vec::new();
+    let mut save_checkpoint_path = None;
     let mut demo_units = false;
     let mut smoke_frames = None;
     let mut runtime_tick_ms = DEFAULT_RUNTIME_TICK_MS;
@@ -39,15 +43,45 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
         match flag.as_ref() {
             "--smoke" => smoke_frames = Some(3),
             "--demo-units" => demo_units = true,
+            "--side" => {
+                let value = arguments
+                    .next()
+                    .context("--side needs COUNTRY[,COUNTRY...]")?;
+                let selectors = value
+                    .to_str()
+                    .context("--side must be valid UTF-8")?
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if selectors.iter().any(|selector| selector.is_empty()) {
+                    bail!("--side contains an empty country selector");
+                }
+                native_war_sides.push(selectors);
+            }
             "--runtime-checkpoint" | "--checkpoint" => {
                 if runtime_checkpoint_path.is_some() {
                     bail!("runtime checkpoint was supplied more than once");
                 }
-                runtime_checkpoint_path = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .context("--runtime-checkpoint needs a JSON path")?,
-                ));
+                let path = arguments
+                    .next()
+                    .context("--runtime-checkpoint needs a JSON path")?;
+                if path.to_string_lossy().trim().is_empty() {
+                    bail!("--runtime-checkpoint path must not be empty");
+                }
+                runtime_checkpoint_path = Some(PathBuf::from(path));
+            }
+            "--save-checkpoint" => {
+                if save_checkpoint_path.is_some() {
+                    bail!("save checkpoint path was supplied more than once");
+                }
+                let path = arguments
+                    .next()
+                    .context("--save-checkpoint needs a JSON path")?;
+                if path.to_string_lossy().trim().is_empty() {
+                    bail!("--save-checkpoint path must not be empty");
+                }
+                save_checkpoint_path = Some(PathBuf::from(path));
             }
             "--tick-ms" => {
                 runtime_tick_ms = parse_positive::<u64>(
@@ -79,14 +113,22 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
         }
     }
 
+    let native_war_requested = !native_war_sides.is_empty();
+    if native_war_requested && native_war_sides.len() < 2 {
+        bail!("--side requires at least two side arguments");
+    }
+    if native_war_requested && (demo_units || runtime_checkpoint_path.is_some()) {
+        bail!("--side, --demo-units, and --runtime-checkpoint are mutually exclusive");
+    }
     if demo_units && runtime_checkpoint_path.is_some() {
         bail!("--demo-units and --runtime-checkpoint are mutually exclusive");
     }
-    if runtime_tuning_requested && !demo_units && runtime_checkpoint_path.is_none() {
+    let runtime_mode = native_war_requested || demo_units || runtime_checkpoint_path.is_some();
+    if runtime_tuning_requested && !runtime_mode {
         bail!("--tick-ms and --update-queue require a native runtime mode");
     }
-    if headless && runtime_checkpoint_path.is_none() {
-        bail!("--headless requires --runtime-checkpoint");
+    if headless && !native_war_requested && runtime_checkpoint_path.is_none() {
+        bail!("--headless requires --runtime-checkpoint or at least two --side arguments");
     }
     if headless && (demo_units || smoke_frames.is_some()) {
         bail!("--headless is mutually exclusive with --demo-units and --smoke");
@@ -94,10 +136,18 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
     if (ticks_requested || json) && !headless {
         bail!("--ticks and --json require --headless");
     }
+    if save_checkpoint_path.is_some() && !runtime_mode {
+        bail!("--save-checkpoint requires a native runtime mode");
+    }
+    if save_checkpoint_path.is_some() && demo_units {
+        bail!("--save-checkpoint is unavailable with --demo-units");
+    }
 
     Ok(AppOptions {
         scenario_path: scenario_path.unwrap_or_else(|| PathBuf::from(DEFAULT_SCENARIO)),
         runtime_checkpoint_path,
+        native_war_sides,
+        save_checkpoint_path,
         demo_units,
         smoke_frames,
         runtime_tick_interval: Duration::from_millis(runtime_tick_ms),
@@ -113,7 +163,9 @@ pub fn help_text() -> &'static str {
      \n\
      Options:\n\
        --runtime-checkpoint PATH  Load a strict browser postStartWar or midWar checkpoint\n\
+       --side COUNTRY[,COUNTRY...]  Add a side; at least two sides start a new war\n\
        --demo-units               Run the small scenario-derived demo runtime\n\
+       --save-checkpoint PATH     Save runtime v2 on exit/S; unavailable with --demo-units\n\
        --tick-ms N                Runtime tick interval in milliseconds (default 33)\n\
        --update-queue N           Bounded lossless publication queue (default 8)\n\
        --headless                 Run the checkpoint worker without a window\n\
@@ -154,6 +206,8 @@ mod tests {
         assert_eq!(options.runtime_tick_interval, Duration::from_millis(33));
         assert_eq!(options.runtime_queue_capacity, 8);
         assert!(options.runtime_checkpoint_path.is_none());
+        assert!(options.native_war_sides.is_empty());
+        assert!(options.save_checkpoint_path.is_none());
         assert!(!options.demo_units);
         assert!(options.headless_ticks.is_none());
     }
@@ -206,5 +260,77 @@ mod tests {
         assert_eq!(options.headless_ticks, Some(7));
         assert!(options.json);
         assert!(options.smoke_frames.is_none());
+    }
+
+    #[test]
+    fn parses_new_war_sides_and_save_path() {
+        let options = parse(&[
+            "--side",
+            "Germany,Italy",
+            "--side",
+            "France",
+            "--save-checkpoint",
+            "save.json",
+            "--tick-ms",
+            "20",
+            "scenario.mwsc.gz",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.native_war_sides,
+            vec![vec!["Germany", "Italy"], vec!["France"]]
+        );
+        assert_eq!(
+            options.save_checkpoint_path,
+            Some(PathBuf::from("save.json"))
+        );
+        assert_eq!(options.scenario_path, PathBuf::from("scenario.mwsc.gz"));
+    }
+
+    #[test]
+    fn rejects_new_war_and_save_conflicts() {
+        assert!(parse(&["--side", "Germany"]).is_err());
+        assert!(parse(&["--side", "Germany,", "--side", "France"]).is_err());
+        assert!(parse(&["--side", "Germany", "--side", "France", "--demo-units"]).is_err());
+        assert!(
+            parse(&[
+                "--side",
+                "Germany",
+                "--side",
+                "France",
+                "--checkpoint",
+                "x.json"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--save-checkpoint", "save.json"]).is_err());
+        let demo_save_error = parse(&["--demo-units", "--save-checkpoint", "save.json"])
+            .unwrap_err()
+            .to_string();
+        assert!(demo_save_error.contains("unavailable with --demo-units"));
+        assert!(help_text().contains("unavailable with --demo-units"));
+        assert!(
+            parse(&[
+                "--checkpoint",
+                "x.json",
+                "--save-checkpoint",
+                "a",
+                "--save-checkpoint",
+                "b"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "--side",
+                "Germany",
+                "--side",
+                "France",
+                "--headless",
+                "--ticks",
+                "2"
+            ])
+            .is_ok()
+        );
     }
 }

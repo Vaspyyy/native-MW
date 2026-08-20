@@ -6,29 +6,547 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs,
     hint::black_box,
-    path::PathBuf,
-    sync::Arc,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
 use mw_core::{
     ARMOR_PAYROLL_PER_100, CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand,
-    ConflictResolutionPlan, DecodedScenario, EconomyState, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION,
-    NativeRuntime, OccupationState, PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers,
-    ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot,
-    RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation,
-    SimulationConfig, SimulationUnit, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE,
-    TerritoryCity, TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps,
-    UnitAiPolicy, UnitInfluencePolicy, UnitKind, decode_mwsc_gzip, derive_scenario_production,
+    ConflictResolutionPlan, DecodedScenario, EconomyState, FrontLayoutPrior, FrontObjective,
+    GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime, OccupationState, PAYROLL_PER_UNIT,
+    ProductionConfig, ResolvedCombatModifiers, ResolvedMovementModifiers, RuntimeCheckpoint,
+    RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy,
+    STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
+    StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState,
+    TerritoryConfig, TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitInfluencePolicy, UnitKind,
+    decode_mwsc_gzip, derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const NATIVE_RUNTIME_CHECKPOINT_SCHEMA: &str = "native-runtime-checkpoint-v1";
 pub const NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA: &str = "native-runtime-checkpoint-v2";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeCheckpointWriteReport {
+    pub path: String,
+    pub bytes: usize,
+    pub schema: &'static str,
+}
+
+/// Serialize a quiescent runtime using the same strict v2 object consumed by the loader.
+/// Core owns the barrier and snapshot extraction; this adapter owns JSON and filesystem policy.
+pub fn write_runtime_checkpoint_v2(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    runtime: &mut NativeRuntime,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    let state = runtime
+        .checkpoint_state()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    write_runtime_checkpoint_state_v2_with_hash(&raw, baseline, &state, output, steps)
+}
+
+pub fn write_runtime_checkpoint_state_v2(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    write_runtime_checkpoint_state_v2_with_hash(&raw, baseline, state, output, steps)
+}
+
+fn write_runtime_checkpoint_state_v2_with_hash(
+    raw: &[u8],
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    if state.runtime_config != RuntimeConfig::default() {
+        bail!("checkpoint-v2 writer only supports the canonical runtime configuration");
+    }
+    if state.simulation_config != SimulationConfig::default() {
+        bail!("checkpoint-v2 writer only supports the canonical simulation configuration");
+    }
+    if baseline.target.width != state.territory_config.width
+        || baseline.target.height != state.territory_config.height
+        || baseline.target.grid_res != state.territory_config.grid_resolution
+        || state.scenario.grid != baseline.target
+    {
+        bail!("checkpoint baseline and live runtime grid do not match");
+    }
+    let expected_production = derive_scenario_production(baseline, &ProductionConfig::default())?;
+    if state.scenario != expected_production {
+        bail!("checkpoint runtime production baseline does not match the supplied scenario");
+    }
+    if state.territory_config.tile_size != TERRITORY_TILE_SIZE {
+        bail!("checkpoint-v2 writer only supports the canonical territory tile size");
+    }
+    let declared_sides = state
+        .territory_config
+        .country_to_side
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if state.territory_config.max_sides == 0
+        || declared_sides.len() != state.territory_config.max_sides
+        || !declared_sides
+            .iter()
+            .copied()
+            .eq(0..state.territory_config.max_sides)
+    {
+        bail!("checkpoint-v2 writer requires contiguous, nonempty territory sides");
+    }
+    if state.strategic_cycle == u64::MAX {
+        bail!("checkpoint-v2 strategic cycle must leave room for a later cycle");
+    }
+    let economy_ids = state
+        .economies
+        .iter()
+        .map(|economy| economy.country_id)
+        .collect::<BTreeSet<_>>();
+    if economy_ids.len() != state.economies.len()
+        || economy_ids
+            != state
+                .territory_config
+                .country_to_side
+                .keys()
+                .copied()
+                .collect()
+    {
+        bail!("checkpoint-v2 economies must exactly cover declared countries");
+    }
+    let expected_active_sides = state
+        .economies
+        .iter()
+        .filter(|economy| !economy.capitulated)
+        .map(|economy| {
+            state
+                .territory_config
+                .country_to_side
+                .get(&economy.country_id)
+                .copied()
+                .with_context(|| {
+                    format!(
+                        "economy {} is absent from checkpoint side topology",
+                        economy.country_id
+                    )
+                })
+                .and_then(|side| u16::try_from(side).context("active side index exceeds u16"))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let actual_active_sides = state
+        .diplomacy
+        .active_sides
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_active_sides.len() != state.diplomacy.active_sides.len()
+        || actual_active_sides != expected_active_sides
+    {
+        bail!("checkpoint-v2 active sides must exactly match non-capitulated economies");
+    }
+    if state.territory_config.hostility_matrix != state.diplomacy.hostility {
+        bail!("checkpoint diplomacy and territory hostility matrices disagree");
+    }
+    let expected_protected = state
+        .territory_config
+        .country_to_side
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if state.territory_config.protected_owner_ids != expected_protected {
+        bail!("checkpoint-v2 writer requires coalition countries as protected owners");
+    }
+    let expected_cities = state
+        .scenario
+        .cities
+        .iter()
+        .map(|city| TerritoryCity {
+            id: city.city_id,
+            cell: city.cell,
+            owner: city.owner_id,
+            population: city.population,
+            capital: city.capital,
+        })
+        .collect::<Vec<_>>();
+    if state.territory_config.cities != expected_cities {
+        bail!("checkpoint-v2 writer requires scenario-derived territory cities");
+    }
+    let name = scenario_name(baseline);
+    let mut sides: BTreeMap<u16, Vec<u16>> = BTreeMap::new();
+    let mut coalitions: BTreeMap<usize, BTreeSet<u16>> = BTreeMap::new();
+    for (&country, &side) in state.territory_config.country_to_side.iter() {
+        sides
+            .entry(u16::try_from(side).context("side index exceeds u16")?)
+            .or_default()
+            .push(country);
+        coalitions.entry(side).or_default().insert(country);
+    }
+    let sides: Vec<Value> = sides
+        .into_iter()
+        .map(|(side_index, mut country_ids)| {
+            country_ids.sort_unstable();
+            json!({"sideIndex": side_index, "countryIds": country_ids})
+        })
+        .collect();
+    let planner = planner_fixture(state)?;
+    let unit_ids = state
+        .units
+        .iter()
+        .map(|unit| unit.combat.id)
+        .collect::<BTreeSet<_>>();
+    validate_planner_fixture(
+        &planner,
+        state.tick,
+        state.territory_config.maps.side_influence.len(),
+        &unit_ids,
+    )?;
+    let policies = state
+        .unit_policies
+        .iter()
+        .map(|policy| (policy.unit_id, policy))
+        .collect::<BTreeMap<_, _>>();
+    if policies.len() != state.unit_policies.len() || policies.len() != state.units.len() {
+        bail!("runtime checkpoint unit policy coverage is invalid");
+    }
+    let units = state
+        .units
+        .iter()
+        .map(|unit| {
+            let policy = policies.get(&unit.combat.id).with_context(|| {
+                format!("unit {} is missing its runtime policy", unit.combat.id)
+            })?;
+            let side = usize::try_from(unit.combat.side)
+                .context("unit side exceeds the checkpoint platform")?;
+            let coalition = coalitions.get(&side).with_context(|| {
+                format!("unit {} references unknown side {side}", unit.combat.id)
+            })?;
+            if policy
+                .influence
+                .as_ref()
+                .is_some_and(|influence| &influence.owner_ally_country_ids != coalition)
+            {
+                bail!(
+                    "unit {} has owner-allies which checkpoint-v2 cannot derive from its coalition",
+                    unit.combat.id
+                );
+            }
+            Ok(unit_json(unit, policy))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let maps = &state.territory_config.maps;
+    let body = json!({
+        "schema": NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+        "checkpointBoundary": "midWar",
+        "scenario": {"sha256": sha256_hex(raw), "name": name, "gridRes": state.territory_config.grid_resolution},
+        "geography": {"landRuns": rle(&baseline.land), "worldControlRuns": rle(&baseline.world_control), "deJureRuns": rle(&baseline.de_jure)},
+        "sides": sides,
+        "activeSides": state.diplomacy.active_sides,
+        "hostilityMatrix": state.diplomacy.hostility,
+        "tick": state.tick, "frame": state.frame, "warGraceEnd": state.war_grace_end,
+        "strategicCycle": state.strategic_cycle, "steps": steps,
+        "planner": planner,
+        "units": units,
+        "economies": state.economies,
+        "occupations": state.occupations,
+        "casualties": covered_casualties(&state.casualties, &state.territory_config.country_to_side),
+        "casualtiesByVictim": covered_nested_casualties(&state.casualties_by_victim, &state.territory_config.country_to_side),
+        "territory": {"encoding": "rle-bits-v1", "maps": {
+            "landRuns": rle(&maps.land), "worldControlRuns": rle(&maps.world_control), "deJureRuns": rle(&maps.de_jure),
+            "primaryOccupierRuns": rle(&maps.primary_occupier), "dominantSideRuns": rle(&maps.dominant_side),
+            "occupationBitsRuns": rle(&maps.occupation.iter().map(|v| v.to_bits()).collect::<Vec<_>>()),
+            "sideInfluenceBitsRuns": maps.side_influence.iter().map(|row| rle(&row.iter().map(|v| v.to_bits()).collect::<Vec<_>>())).collect::<Vec<_>>()
+        }, "revisions": {"topologyRevision": state.territory_config.topology_revision, "worldRevision": state.territory_config.world_revision, "cityRevision": state.territory_config.city_revision},
+        "committedCensus": state.territory_committed_state}
+    });
+    let bytes = serde_json::to_vec(&body)?;
+    let parent = checkpoint_output_parent(output);
+    if !parent.exists() {
+        bail!("output parent does not exist: {}", parent.display());
+    }
+    let (tmp, mut f) = create_checkpoint_temp(output)?;
+    let write_result = (|| -> Result<()> {
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    drop(f);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("failed to write {}", output.display()));
+    }
+    let result =
+        fs::rename(&tmp, output).with_context(|| format!("failed to install {}", output.display()));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync output directory {}", parent.display()))?;
+    Ok(NativeCheckpointWriteReport {
+        path: output.display().to_string(),
+        bytes: bytes.len(),
+        schema: NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+    })
+}
+
+fn validate_checkpoint_write_steps(steps: usize) -> Result<()> {
+    if steps == 0 {
+        bail!("checkpoint save requires at least one continuation step");
+    }
+    Ok(())
+}
+
+static CHECKPOINT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_checkpoint_temp(output: &Path) -> Result<(PathBuf, fs::File)> {
+    let parent = checkpoint_output_parent(output);
+    let output_name = output
+        .file_name()
+        .context("checkpoint output path must name a file")?;
+    for _ in 0..1_024 {
+        let sequence = CHECKPOINT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut name = OsString::from(".");
+        name.push(output_name);
+        name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        let path = parent.join(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create temporary checkpoint beside {}",
+                        output.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "could not allocate a unique temporary checkpoint beside {}",
+        output.display()
+    )
+}
+
+fn checkpoint_output_parent(output: &Path) -> &Path {
+    output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn planner_fixture(state: &mw_core::NativeRuntimeCheckpointState) -> Result<PlannerFixture> {
+    let front_prior_by_unit = state
+        .front_prior_by_unit
+        .iter()
+        .map(|(&unit_id, prior)| {
+            if unit_id != prior.unit_id {
+                bail!(
+                    "front planner map key {unit_id} disagrees with embedded unit {}",
+                    prior.unit_id
+                );
+            }
+            Ok(FrontPriorFixture::from(prior))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PlannerFixture {
+        objectives: state
+            .objectives
+            .iter()
+            .map(PlannerObjectiveFixture::from)
+            .collect(),
+        prior_objective_by_unit: state.prior_objective_by_unit.clone(),
+        front_prior_by_unit,
+        last_front_refresh_tick: state.last_front_refresh_tick,
+    })
+}
+
+fn validate_planner_fixture(
+    planner: &PlannerFixture,
+    tick: u64,
+    side_count: usize,
+    unit_ids: &BTreeSet<u64>,
+) -> Result<()> {
+    if planner
+        .last_front_refresh_tick
+        .is_some_and(|refresh_tick| refresh_tick > tick)
+    {
+        bail!("planner.lastFrontRefreshTick cannot be newer than the checkpoint tick");
+    }
+    if planner.last_front_refresh_tick.is_none() && !planner.front_prior_by_unit.is_empty() {
+        bail!("planner front priors require a completed front refresh tick");
+    }
+
+    let mut objective_ids = BTreeSet::new();
+    for objective in &planner.objectives {
+        if !objective_ids.insert(objective.id) {
+            bail!("planner objective ids must be unique");
+        }
+        if objective.side_pair[0] == objective.side_pair[1]
+            || objective
+                .side_pair
+                .iter()
+                .any(|side| usize::from(*side) >= side_count)
+        {
+            bail!("planner objectives must reference two distinct declared sides");
+        }
+        FrontObjective::new(
+            objective.id,
+            objective.side_pair,
+            objective.segment_id,
+            objective.lat,
+            objective.lng,
+            objective.capacity,
+            objective.priority,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+
+    for (&unit_id, &objective_id) in &planner.prior_objective_by_unit {
+        if !unit_ids.contains(&unit_id) {
+            bail!("planner prior assignment references unknown unit {unit_id}");
+        }
+        if !objective_ids.contains(&objective_id) {
+            bail!("planner prior assignment references unknown objective {objective_id}");
+        }
+    }
+
+    let mut prior_unit_ids = BTreeSet::new();
+    for prior in &planner.front_prior_by_unit {
+        if !prior_unit_ids.insert(prior.unit_id) {
+            bail!("planner front priors must contain unique unit ids");
+        }
+        if prior.pair_key.is_empty() {
+            bail!("planner front prior pairKey must not be empty");
+        }
+        if !unit_ids.contains(&prior.unit_id) {
+            bail!(
+                "planner front prior references unknown unit {}",
+                prior.unit_id
+            );
+        }
+        if !objective_ids.contains(&prior.objective_id) {
+            bail!(
+                "planner front prior references unknown objective {}",
+                prior.objective_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn rle<T: Copy + PartialEq + serde::Serialize>(values: &[T]) -> Vec<(u64, T)> {
+    let mut out = Vec::new();
+    for &value in values {
+        if let Some((n, prior)) = out.last_mut()
+            && *prior == value
+        {
+            *n += 1;
+            continue;
+        }
+        out.push((1, value));
+    }
+    out
+}
+
+fn unit_json(unit: &SimulationUnit, policy: &RuntimeUnitPolicy) -> Value {
+    let ai = &policy.ai;
+    let ai = json!({
+        "baseSpeed": ai.base_speed,
+        "terrainSpeedMultiplier": ai.movement.terrain_speed_multiplier,
+        "speedMultiplier": ai.movement.speed_multiplier,
+        "planSpeedMultiplier": ai.movement.plan_speed_multiplier,
+        "neutralPenalty": ai.movement.neutral_penalty,
+        "pushReadiness": ai.movement.push_readiness,
+        "dealtMultiplier": ai.combat.dealt_multiplier,
+        "takenMultiplier": ai.combat.taken_multiplier,
+        "defenseBonus": ai.combat.defense_bonus,
+        "longWarDefense": ai.combat.long_war_defense,
+        "mountain": ai.combat.mountain,
+        "urban": ai.combat.urban,
+        "isReserve": ai.is_reserve,
+        "reinforcementEligible": ai.reinforcement_eligible,
+        "encircled": ai.encircled,
+        "deployUntilTick": ai.deploy_until_tick,
+        "garrisonExcluded": ai.garrison_excluded,
+    });
+    let influence = policy.influence.as_ref().map(|influence| {
+        json!({
+            "radius": influence.radius,
+            "delta": influence.delta,
+            "concentrationBonus": influence.concentration_bonus,
+            "beneficiaryCountryId": influence.beneficiary,
+            "protectedOwnerIds": influence.protected_owner_ids,
+            "rebelDeJure": influence.rebel_de_jure,
+            "creditDeJure": influence.credit_de_jure,
+            "creditDeJureByCountry": influence.credit_de_jure_by_country,
+            "refusesOffense": influence.refuses_offense,
+            "temporalSeed": influence.browser_temporal_seed,
+        })
+    });
+    json!({"id":unit.combat.id,"side":unit.combat.side,"countryId":unit.combat.sovereign,"kind":format!("{:?}",unit.combat.kind).to_ascii_lowercase(),"lat":unit.combat.lat,"lng":unit.combat.lng,"health":unit.combat.health,"maxHealth":unit.combat.max_health,"personnel":unit.combat.personnel,"personnelCapacity":unit.combat.personnel_capacity,"equipment":unit.combat.equipment,"maxEquipment":unit.combat.max_equipment,"quality":unit.combat.quality,"transport":unit.combat.transport,"armorSupported":unit.combat.armor_supported,"landingPenaltyActive":unit.combat.landing_penalty_active,"atSea":unit.combat.at_sea,"lastCombatTick":unit.combat.last_combat_tick,"victoryBoostTicks":unit.combat.victory_boost_ticks,"dirLat":unit.dir_lat,"dirLng":unit.dir_lng,"coastStuckTicks":unit.coast_stuck_ticks,"armorLandingPenaltyUntilTick":unit.armor_landing_penalty_until_tick,"isSupport":unit.is_support,"allyWeight":unit.ally_weight,"aiPolicy":ai,"influencePolicy":influence})
+}
+
+fn covered_casualties(
+    src: &BTreeMap<u16, f64>,
+    countries: &BTreeMap<u16, usize>,
+) -> BTreeMap<u16, f64> {
+    countries
+        .keys()
+        .map(|&id| (id, src.get(&id).copied().unwrap_or(0.0)))
+        .collect()
+}
+fn covered_nested_casualties(
+    src: &BTreeMap<u16, BTreeMap<u16, f64>>,
+    countries: &BTreeMap<u16, usize>,
+) -> BTreeMap<u16, BTreeMap<u16, f64>> {
+    countries
+        .keys()
+        .map(|&v| {
+            (
+                v,
+                countries
+                    .keys()
+                    .filter(|&&a| a != v)
+                    .map(|&a| {
+                        (
+                            a,
+                            src.get(&v).and_then(|m| m.get(&a)).copied().unwrap_or(0.0),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
 
 const DEFAULT_GRID_RESOLUTION: f64 = 0.15;
 const DEFAULT_BENCH_REPEAT: usize = 7;
@@ -386,6 +904,8 @@ struct RuntimeCheckpointFixture {
     war_grace_end: u64,
     strategic_cycle: u64,
     steps: usize,
+    #[serde(default)]
+    planner: Option<PlannerFixture>,
     units: Vec<RuntimeUnitFixture>,
     economies: Vec<EconomyFixture>,
     #[serde(default)]
@@ -394,6 +914,129 @@ struct RuntimeCheckpointFixture {
     casualties: BTreeMap<u16, f64>,
     #[serde(default)]
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+}
+
+/// Native v2 continuation-only state. Browser-generated v2 checkpoints may omit
+/// this block and intentionally begin with a fresh deterministic front refresh.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlannerFixture {
+    objectives: Vec<PlannerObjectiveFixture>,
+    #[serde(deserialize_with = "deserialize_unique_u64_map")]
+    prior_objective_by_unit: BTreeMap<u64, u64>,
+    front_prior_by_unit: Vec<FrontPriorFixture>,
+    #[serde(deserialize_with = "deserialize_required_nullable_tick")]
+    last_front_refresh_tick: Option<u64>,
+}
+
+fn deserialize_required_nullable_tick<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer)
+}
+
+fn deserialize_unique_u64_map<'de, D>(deserializer: D) -> Result<BTreeMap<u64, u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueU64MapVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueU64MapVisitor {
+        type Value = BTreeMap<u64, u64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object with unique unsigned integer keys")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((unit_id, objective_id)) = access.next_entry::<u64, u64>()? {
+                if values.insert(unit_id, objective_id).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate planner unit id {unit_id}"
+                    )));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueU64MapVisitor)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlannerObjectiveFixture {
+    id: u64,
+    side_pair: [u16; 2],
+    segment_id: u64,
+    lat: f64,
+    lng: f64,
+    capacity: usize,
+    priority: i32,
+}
+
+impl From<&FrontObjective> for PlannerObjectiveFixture {
+    fn from(objective: &FrontObjective) -> Self {
+        Self {
+            id: objective.id,
+            side_pair: objective.side_pair,
+            segment_id: objective.segment_id,
+            lat: objective.lat,
+            lng: objective.lng,
+            capacity: objective.capacity,
+            priority: objective.priority,
+        }
+    }
+}
+
+impl From<&PlannerObjectiveFixture> for FrontObjective {
+    fn from(objective: &PlannerObjectiveFixture) -> Self {
+        Self {
+            id: objective.id,
+            side_pair: objective.side_pair,
+            segment_id: objective.segment_id,
+            lat: objective.lat,
+            lng: objective.lng,
+            capacity: objective.capacity,
+            priority: objective.priority,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FrontPriorFixture {
+    unit_id: u64,
+    pair_key: String,
+    segment_idx: usize,
+    objective_id: u64,
+}
+
+impl From<&FrontLayoutPrior> for FrontPriorFixture {
+    fn from(prior: &FrontLayoutPrior) -> Self {
+        Self {
+            unit_id: prior.unit_id,
+            pair_key: prior.pair_key.clone(),
+            segment_idx: prior.segment_idx,
+            objective_id: prior.objective_id,
+        }
+    }
+}
+
+impl From<&FrontPriorFixture> for FrontLayoutPrior {
+    fn from(prior: &FrontPriorFixture) -> Self {
+        Self {
+            unit_id: prior.unit_id,
+            pair_key: prior.pair_key.clone(),
+            segment_idx: prior.segment_idx,
+            objective_id: prior.objective_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -676,6 +1319,7 @@ struct PreparedRuntime {
     raw_sha256: String,
     scenario_name: String,
     decoded: DecodedScenario,
+    baseline: DecodedScenario,
     production: ScenarioProduction,
     checkpoint: RuntimeCheckpointFixture,
     country_to_side: BTreeMap<u16, usize>,
@@ -691,6 +1335,7 @@ struct PreparedRuntime {
 /// scenario a second time.
 pub struct LoadedRuntime {
     pub decoded: DecodedScenario,
+    pub baseline: DecodedScenario,
     pub runtime: NativeRuntime,
     pub checkpoint_boundary: &'static str,
     pub resumable: bool,
@@ -715,6 +1360,7 @@ pub fn load_runtime_checkpoint(
     let unit_count = prepared.checkpoint.units.len();
     Ok(LoadedRuntime {
         decoded: prepared.decoded,
+        baseline: prepared.baseline,
         runtime,
         checkpoint_boundary,
         resumable,
@@ -763,6 +1409,12 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         decoded.world_control = exact.world_control;
         decoded.de_jure = exact.de_jure;
     }
+    // Immutable geography is the checkpoint-supplied scenario baseline, not
+    // necessarily the raw MWSC projection. Capture it before applying v2 live
+    // conquest/control maps so a later native save can round-trip the exact
+    // browser/native starting geography without baking current territory into
+    // production baselines.
+    let baseline = decoded.clone();
     let production = derive_scenario_production(&decoded, &ProductionConfig::default())?;
     if checkpoint.geography.is_some() {
         validate_exact_geography_owners(&decoded, &production)?;
@@ -793,6 +1445,7 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         raw_sha256,
         scenario_name,
         decoded,
+        baseline,
         production,
         checkpoint,
         country_to_side,
@@ -1017,6 +1670,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             if checkpoint.checkpoint_boundary == CheckpointBoundary::MidWar
                 || checkpoint.territory.is_some()
                 || !checkpoint.casualties_by_victim.is_empty()
+                || checkpoint.planner.is_some()
             {
                 bail!("checkpoint-v1 cannot contain checkpoint-v2 live state");
             }
@@ -1086,6 +1740,14 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
     )?;
     if let Some(territory) = checkpoint.territory.as_ref() {
         validate_territory_markers(territory)?;
+    }
+    if let Some(planner) = checkpoint.planner.as_ref() {
+        let unit_ids = checkpoint
+            .units
+            .iter()
+            .map(|unit| unit.id)
+            .collect::<BTreeSet<_>>();
+        validate_planner_fixture(planner, checkpoint.tick, side_count, &unit_ids)?;
     }
     Ok(())
 }
@@ -1558,6 +2220,37 @@ impl RuntimeUnitFixture {
 
 fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
     let checkpoint = &prepared.checkpoint;
+    let objectives = checkpoint
+        .planner
+        .as_ref()
+        .map(|planner| {
+            planner
+                .objectives
+                .iter()
+                .map(FrontObjective::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let prior_objective_by_unit = checkpoint
+        .planner
+        .as_ref()
+        .map(|planner| planner.prior_objective_by_unit.clone())
+        .unwrap_or_default();
+    let front_prior_by_unit = checkpoint
+        .planner
+        .as_ref()
+        .map(|planner| {
+            planner
+                .front_prior_by_unit
+                .iter()
+                .map(|prior| (prior.unit_id, FrontLayoutPrior::from(prior)))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let last_front_refresh_tick = checkpoint
+        .planner
+        .as_ref()
+        .and_then(|planner| planner.last_front_refresh_tick);
     let units = checkpoint
         .units
         .iter()
@@ -1612,8 +2305,10 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
             active_sides: checkpoint.active_sides.clone(),
         },
         unit_policies,
-        objectives: Vec::new(),
-        prior_objective_by_unit: BTreeMap::new(),
+        objectives,
+        prior_objective_by_unit,
+        front_prior_by_unit,
+        last_front_refresh_tick,
         casualties: checkpoint.casualties.clone(),
         casualties_by_victim: checkpoint.casualties_by_victim.clone(),
     };
@@ -2958,6 +3653,7 @@ mod tests {
             war_grace_end: 0,
             strategic_cycle: 0,
             steps: 1,
+            planner: None,
             units: Vec::new(),
             economies: Vec::new(),
             occupations: Vec::new(),
@@ -3018,11 +3714,19 @@ mod tests {
 
     #[test]
     fn checkpoint_v2_requires_its_mid_war_live_state_contract() {
-        let checkpoint = minimal_checkpoint(
+        let mut checkpoint = minimal_checkpoint(
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
             CheckpointBoundary::MidWar,
             Some(valid_v2_territory()),
         );
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        checkpoint.planner = Some(PlannerFixture {
+            objectives: Vec::new(),
+            prior_objective_by_unit: BTreeMap::new(),
+            front_prior_by_unit: Vec::new(),
+            last_front_refresh_tick: None,
+        });
         assert!(validate_checkpoint_shape(&checkpoint).is_ok());
 
         let mut independently_advanced_cycle = checkpoint.clone();
@@ -3052,6 +3756,97 @@ mod tests {
             Some(valid_v2_territory()),
         );
         assert!(validate_checkpoint_shape(&legacy_with_v2_state).is_err());
+
+        let mut legacy_with_planner = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            CheckpointBoundary::PostStartWar,
+            None,
+        );
+        legacy_with_planner.planner = checkpoint.planner;
+        assert!(validate_checkpoint_shape(&legacy_with_planner).is_err());
+    }
+
+    #[test]
+    fn planner_block_is_strict_and_reference_checked() {
+        let mut planner = PlannerFixture {
+            objectives: vec![PlannerObjectiveFixture {
+                id: 19,
+                side_pair: [0, 1],
+                segment_id: 23,
+                lat: 1.0,
+                lng: 2.0,
+                capacity: 1,
+                priority: 3,
+            }],
+            prior_objective_by_unit: BTreeMap::from([(7, 19)]),
+            front_prior_by_unit: vec![FrontPriorFixture {
+                unit_id: 7,
+                pair_key: "0|1".to_owned(),
+                segment_idx: 0,
+                objective_id: 19,
+            }],
+            last_front_refresh_tick: Some(10),
+        };
+        let units = BTreeSet::from([7]);
+        assert!(validate_planner_fixture(&planner, 10, 2, &units).is_ok());
+
+        let encoded = serde_json::to_value(&planner).unwrap();
+        assert_eq!(encoded["objectives"][0]["sidePair"], json!([0, 1]));
+        assert!(encoded.get("frontPriorByUnit").is_some());
+        let mut missing_field = encoded.clone();
+        missing_field
+            .as_object_mut()
+            .unwrap()
+            .remove("lastFrontRefreshTick");
+        assert!(serde_json::from_value::<PlannerFixture>(missing_field).is_err());
+        let mut unknown = encoded;
+        unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<PlannerFixture>(unknown).is_err());
+        assert!(
+            serde_json::from_str::<PlannerFixture>(
+                r#"{
+                    "objectives":[{"id":19,"sidePair":[0,1],"segmentId":23,"lat":1.0,"lng":2.0,"capacity":1,"priority":3}],
+                    "priorObjectiveByUnit":{"7":19,"07":19},
+                    "frontPriorByUnit":[],
+                    "lastFrontRefreshTick":10
+                }"#
+            )
+            .is_err()
+        );
+
+        let mut duplicate_objective = planner.clone();
+        duplicate_objective
+            .objectives
+            .push(duplicate_objective.objectives[0]);
+        assert!(validate_planner_fixture(&duplicate_objective, 10, 2, &units).is_err());
+
+        let mut duplicate_unit = planner.clone();
+        duplicate_unit
+            .front_prior_by_unit
+            .push(duplicate_unit.front_prior_by_unit[0].clone());
+        assert!(validate_planner_fixture(&duplicate_unit, 10, 2, &units).is_err());
+
+        planner.prior_objective_by_unit = BTreeMap::from([(8, 19)]);
+        assert!(validate_planner_fixture(&planner, 10, 2, &units).is_err());
+        planner.prior_objective_by_unit = BTreeMap::from([(7, 20)]);
+        assert!(validate_planner_fixture(&planner, 10, 2, &units).is_err());
+        planner.prior_objective_by_unit = BTreeMap::from([(7, 19)]);
+        planner.last_front_refresh_tick = Some(11);
+        assert!(validate_planner_fixture(&planner, 10, 2, &units).is_err());
+    }
+
+    #[test]
+    fn checkpoint_writer_rejects_zero_continuation_steps() {
+        assert!(validate_checkpoint_write_steps(0).is_err());
+        assert!(validate_checkpoint_write_steps(1).is_ok());
+        assert_eq!(
+            checkpoint_output_parent(Path::new("save.json")),
+            Path::new(".")
+        );
+        assert_eq!(
+            checkpoint_output_parent(Path::new("saves/save.json")),
+            Path::new("saves")
+        );
     }
 
     #[test]
@@ -3201,5 +3996,84 @@ mod tests {
         assert!(validate_exact_geography_owner_ids(&[0, 1, 2], &[2, 1, 0], &known).is_ok());
         assert!(validate_exact_geography_owner_ids(&[0, 99], &[0, 1], &known).is_err());
         assert!(validate_exact_geography_owner_ids(&[0, 1], &[99, 0], &known).is_err());
+    }
+
+    #[test]
+    fn checkpoint_rle_is_stable_and_merges_adjacent_values() {
+        assert_eq!(rle(&[1_u8, 1, 2, 2, 2, 1]), vec![(2, 1), (3, 2), (1, 1)]);
+        assert_eq!(rle(&[0x8000_0000_u32, 0x8000_0000]), vec![(2, 0x8000_0000)]);
+    }
+
+    #[test]
+    fn checkpoint_unit_json_contains_policy_contract() {
+        let unit = SimulationUnit {
+            combat: CombatUnit {
+                id: 7,
+                side: 1,
+                sovereign: 42,
+                kind: UnitKind::Armor,
+                lat: 1.0,
+                lng: 2.0,
+                health: 3.0,
+                max_health: 4.0,
+                personnel: 5,
+                personnel_capacity: 6,
+                equipment: 7,
+                max_equipment: 8,
+                quality: 9.0,
+                transport: false,
+                armor_supported: true,
+                landing_penalty_active: false,
+                at_sea: false,
+                last_combat_tick: 10,
+                victory_boost_ticks: 11,
+            },
+            dir_lat: 0.1,
+            dir_lng: 0.2,
+            coast_stuck_ticks: 3,
+            armor_landing_penalty_until_tick: 12,
+            is_support: false,
+            ally_weight: 1.0,
+        };
+        let mut influence = UnitInfluencePolicy {
+            browser_temporal_seed: Some(4.5),
+            ..UnitInfluencePolicy::default()
+        };
+        influence.owner_ally_country_ids.insert(42);
+        let policy = RuntimeUnitPolicy {
+            unit_id: 7,
+            ai: UnitAiPolicy {
+                is_reserve: true,
+                deploy_until_tick: 13,
+                ..UnitAiPolicy::default()
+            },
+            influence: Some(influence),
+        };
+        let value = unit_json(&unit, &policy);
+        assert_eq!(value["aiPolicy"]["isReserve"], true);
+        assert_eq!(value["aiPolicy"]["deployUntilTick"], 13);
+        assert_eq!(value["influencePolicy"]["temporalSeed"], 4.5);
+        assert!(
+            value["influencePolicy"]
+                .as_object()
+                .is_some_and(|policy| !policy.contains_key("ownerAllyCountryIds"))
+        );
+        let parsed: RuntimeUnitFixture = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.id, 7);
+        assert_eq!(parsed.ai_policy.deploy_until_tick, 13);
+        assert_eq!(
+            parsed
+                .influence_policy
+                .and_then(|policy| policy.temporal_seed),
+            Some(4.5)
+        );
+    }
+
+    #[test]
+    fn checkpoint_casualty_coverage_omits_invalid_self_pairs() {
+        let countries = BTreeMap::from([(7, 0_usize), (11, 1_usize)]);
+        let nested = covered_nested_casualties(&BTreeMap::new(), &countries);
+        assert_eq!(nested[&7], BTreeMap::from([(11, 0.0)]));
+        assert_eq!(nested[&11], BTreeMap::from([(7, 0.0)]));
     }
 }

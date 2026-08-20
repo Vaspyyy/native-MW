@@ -17,7 +17,7 @@ fi
 node "$web_root/scripts/native-runtime-checkpoint-smoke.mjs"
 node "$web_root/scripts/native-runtime-checkpoint-v2-smoke.mjs"
 
-cargo build --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools
+cargo build --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools -p mw-native
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-core committed_state_restore
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v2
 
@@ -130,3 +130,12 @@ if ! jq -e '
 fi
 
 printf 'native runtime deterministic fixture ok: ticks 598 through 601\n'
+
+save_tmp=$(mktemp -d)
+trap 'rm -rf "$save_tmp"' EXIT
+native_bin="$native_root/target/debug/mw-native"
+"$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/part.json" "$modern_path" >/dev/null
+"$native_bin" --runtime-checkpoint "$save_tmp/part.json" --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/resumed.json" "$modern_path" >/dev/null
+"$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 40 --tick-ms 1 --save-checkpoint "$save_tmp/full.json" "$modern_path" >/dev/null
+diff -u <(jq -S 'del(.steps)' "$save_tmp/resumed.json") <(jq -S 'del(.steps)' "$save_tmp/full.json")
+printf 'native save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'

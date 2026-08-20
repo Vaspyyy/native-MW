@@ -279,9 +279,17 @@ unapplied commands; newly executed cycles do not use it.
 
 The consequence port is intentionally bounded. It does not yet reproduce
 browser releasables, province-border smoothing, equipment-reserve or aircraft
-cleanup, or treaty/UI presentation. A v2 restore also starts a fresh
-deterministic native planning boundary rather than serializing private front
-assignment history.
+cleanup, or treaty/UI presentation. Browser-authored v2 checkpoints omit the
+optional native planner block and therefore start a fresh deterministic front
+planning boundary. Native-authored v2 saves include current objectives,
+assignment priors, layout priors, and the last refresh tick, preserving exact
+native save/reload continuation.
+
+The native writer accepts only the canonical runtime, simulation, territory
+tile, city, protection, and contiguous-side configuration that the strict v2
+loader can reconstruct. `ConflictResolved` is terminal rather than resumable;
+a configured save is explicitly skipped at that state instead of producing a
+false continuation artifact.
 
 ## Rendering model
 
@@ -322,8 +330,18 @@ publication model for cities, frontlines, labels, and effects.
 12. Add quiescent checkpoint v2 with exact live territory, committed census,
     and nested casualty attribution while preserving strict v1 compatibility.
     **Complete.**
-13. Native UI/editor/community parity remains later work after the remaining
+13. Bootstrap a deterministic war directly from MWSC scenario countries and
+    save/reload native checkpoint v2 without a browser handoff. **Complete for
+    all-Army land wars through the viewer and exact-step headless paths,
+    including history-dependent frontline planner state.**
+14. Native UI/editor/community parity remains later work after the remaining
     simulation boundaries are chosen and measured.
 
 Air/naval simulation, the full gameplay HUD, map editor, online/community
 features, and satellite-map parity are still outside the native port.
+
+Native-only startup accepts repeated `--side` selectors (numeric IDs or unique
+case-insensitive names), with deterministic all-Army bootstrap forces.
+`--save-checkpoint PATH` saves at an exact headless step boundary; windowed mode
+also supports `S` and save-on-exit when configured. This remains native-only
+and does not claim full browser AI/combat or non-land-force parity.

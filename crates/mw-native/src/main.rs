@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -7,13 +7,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
-use mw_checkpoint::native_runtime::load_runtime_checkpoint;
+use mw_checkpoint::native_runtime::{load_runtime_checkpoint, write_runtime_checkpoint_state_v2};
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
-    ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeUnitPolicy,
-    ScenarioProduction, Simulation, SimulationConfig, SimulationUnit, StrategicSimulation,
-    TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps, TerritoryRenderUpdate,
-    TerritoryTilePixels, UnitKind, decode_mwsc_gzip_file, derive_scenario_production,
+    NativeWarBootstrapConfig, ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy,
+    RuntimeState, RuntimeUnitPolicy, ScenarioProduction, Simulation, SimulationConfig,
+    SimulationUnit, StrategicSimulation, TerritoryCity, TerritoryConfig, TerritoryControl,
+    TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels, UnitKind, bootstrap_native_war,
+    decode_mwsc_gzip_file, derive_scenario_production,
 };
 use serde_json::Value;
 use wgpu::util::DeviceExt;
@@ -73,6 +74,9 @@ struct DemoBorder {
 struct App {
     scenario_path: PathBuf,
     runtime_checkpoint_path: Option<PathBuf>,
+    native_war_sides: Vec<Vec<String>>,
+    save_checkpoint_path: Option<PathBuf>,
+    checkpoint_baseline: Option<DecodedScenario>,
     demo_units_requested: bool,
     runtime_tick_interval: std::time::Duration,
     runtime_queue_capacity: usize,
@@ -111,6 +115,9 @@ impl App {
         Self {
             scenario_path: options.scenario_path,
             runtime_checkpoint_path: options.runtime_checkpoint_path,
+            native_war_sides: options.native_war_sides,
+            save_checkpoint_path: options.save_checkpoint_path,
+            checkpoint_baseline: None,
             demo_units_requested: options.demo_units,
             runtime_tick_interval: options.runtime_tick_interval,
             runtime_queue_capacity: options.runtime_queue_capacity,
@@ -148,7 +155,7 @@ impl App {
     fn initialize(&mut self, window: Arc<Window>) -> Result<()> {
         let load_started = Instant::now();
         let checkpoint_path = self.runtime_checkpoint_path.clone();
-        let (decoded, mut pending_runtime, demo_border, runtime_label) =
+        let (decoded, mut pending_runtime, demo_border, runtime_label, checkpoint_baseline) =
             if let Some(checkpoint_path) = checkpoint_path.as_ref() {
                 let loaded = load_runtime_checkpoint(&self.scenario_path, checkpoint_path)
                     .with_context(|| {
@@ -167,14 +174,45 @@ impl App {
                     checkpoint_path.display(),
                     loaded.unit_count
                 );
-                (loaded.decoded, Some(loaded.runtime), None, Some(label))
+                let baseline = self
+                    .save_checkpoint_path
+                    .is_some()
+                    .then_some(loaded.baseline);
+                (
+                    loaded.decoded,
+                    Some(loaded.runtime),
+                    None,
+                    Some(label),
+                    baseline,
+                )
             } else {
                 let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
                 let decoded = decode_mwsc_gzip_file(&self.scenario_path, Some(target))
                     .with_context(|| {
                         format!("failed to decode {}", self.scenario_path.display())
                     })?;
-                if self.demo_units_requested {
+                let baseline = self.save_checkpoint_path.is_some().then(|| decoded.clone());
+                if !self.native_war_sides.is_empty() {
+                    let sides = resolve_native_war_sides(&decoded, &self.native_war_sides)?;
+                    let runtime = bootstrap_native_war(
+                        &decoded,
+                        &NativeWarBootstrapConfig {
+                            sides,
+                            hostility: None,
+                            production: ProductionConfig::default(),
+                            war_grace_end: 600,
+                        },
+                    )
+                    .context("failed to bootstrap native war")?;
+                    let unit_count = runtime.latest_snapshot().frame_snapshot.units.len();
+                    (
+                        decoded,
+                        Some(runtime),
+                        None,
+                        Some(format!("native new war ({unit_count} units)")),
+                        baseline,
+                    )
+                } else if self.demo_units_requested {
                     let border = find_demo_border(
                         &decoded.world_control,
                         &decoded.land,
@@ -194,11 +232,13 @@ impl App {
                         Some(runtime),
                         Some(border),
                         Some("scenario-derived demo".to_owned()),
+                        baseline,
                     )
                 } else {
-                    (decoded, None, None, None)
+                    (decoded, None, None, None, None)
                 }
             };
+        self.checkpoint_baseline = checkpoint_baseline;
         log::info!(
             "loaded {} entries into {}x{} in {:.1} ms",
             decoded.entry_count,
@@ -537,6 +577,42 @@ impl App {
         }
     }
 
+    fn save_runtime_checkpoint(&mut self) -> Result<()> {
+        let Some(output) = self.save_checkpoint_path.as_ref() else {
+            return Ok(());
+        };
+        let baseline = self
+            .checkpoint_baseline
+            .as_ref()
+            .context("native runtime save is missing its immutable scenario baseline")?;
+        let worker = self
+            .runtime_worker
+            .as_ref()
+            .context("native runtime save requested without an active runtime worker")?;
+        if matches!(
+            worker.latest_snapshot().state,
+            RuntimeState::ConflictResolved { .. }
+        ) {
+            log::warn!(
+                "checkpoint save skipped: conflictResolved is terminal and cannot be resumed as checkpoint-v2"
+            );
+            return Ok(());
+        }
+        let state = worker.checkpoint_state().map_err(|error| {
+            anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
+        })?;
+        let report =
+            write_runtime_checkpoint_state_v2(&self.scenario_path, baseline, &state, output, 1)?;
+        log::info!(
+            "saved {} bytes of {} to {} at tick {}",
+            report.bytes,
+            report.schema,
+            report.path,
+            state.tick
+        );
+        Ok(())
+    }
+
     fn drain_runtime_worker(&mut self) -> Result<()> {
         let Some(worker) = self.runtime_worker.as_ref() else {
             return Ok(());
@@ -813,6 +889,14 @@ impl ApplicationHandler for App {
                         self.reset_camera(window.inner_size());
                         window.request_redraw();
                     }
+                    PhysicalKey::Code(KeyCode::KeyS) if self.save_checkpoint_path.is_some() => {
+                        if let Err(error) = self.save_runtime_checkpoint() {
+                            let message = format!("checkpoint save failed: {error:#}");
+                            log::error!("{message}");
+                            self.fatal_error = Some(message);
+                            event_loop.exit();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -883,6 +967,13 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.fatal_error.is_none()
+            && let Err(error) = self.save_runtime_checkpoint()
+        {
+            let message = format!("checkpoint save failed during shutdown: {error:#}");
+            log::error!("{message}");
+            self.fatal_error = Some(message);
+        }
         self.stop_runtime_worker();
     }
 }
@@ -1230,6 +1321,8 @@ fn create_demo_runtime(
             // Front objectives are derived by the runtime on its first step.
             objectives: Vec::new(),
             prior_objective_by_unit: BTreeMap::new(),
+            front_prior_by_unit: BTreeMap::new(),
+            last_front_refresh_tick: None,
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
         },
@@ -1254,6 +1347,61 @@ fn validate_production_checkpoint(
         "production runtime checkpoint is missing exact geography or live territory"
     );
     Ok(())
+}
+
+fn resolve_native_war_sides(
+    decoded: &DecodedScenario,
+    requested: &[Vec<String>],
+) -> Result<Vec<Vec<u16>>> {
+    let production = derive_scenario_production(decoded, &ProductionConfig::default())
+        .context("failed to derive countries for native war selection")?;
+    let known_ids = production
+        .countries
+        .iter()
+        .map(|country| country.country_id)
+        .collect::<BTreeSet<_>>();
+    let mut claimed = BTreeSet::new();
+    let mut sides = Vec::with_capacity(requested.len());
+
+    for (side_index, selectors) in requested.iter().enumerate() {
+        let mut side = Vec::with_capacity(selectors.len());
+        for selector in selectors {
+            let country_id = if let Ok(id) = selector.parse::<u16>() {
+                anyhow::ensure!(
+                    id != 0 && known_ids.contains(&id),
+                    "side {} references unknown country ID {id}",
+                    side_index + 1
+                );
+                id
+            } else {
+                let matches = production
+                    .countries
+                    .iter()
+                    .filter(|country| country.name.eq_ignore_ascii_case(selector))
+                    .map(|country| country.country_id)
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    !matches.is_empty(),
+                    "side {} references unknown country {selector:?}",
+                    side_index + 1
+                );
+                anyhow::ensure!(
+                    matches.len() == 1,
+                    "side {} country name {selector:?} is ambiguous; use a numeric ID",
+                    side_index + 1
+                );
+                matches[0]
+            };
+            anyhow::ensure!(
+                claimed.insert(country_id),
+                "country {country_id} appears in more than one native war side"
+            );
+            side.push(country_id);
+        }
+        side.sort_unstable();
+        sides.push(side);
+    }
+    Ok(sides)
 }
 
 fn apply_territory_update_to_grid(
@@ -1690,6 +1838,48 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(inexact.contains("missing exact geography or live territory"));
+    }
+
+    #[test]
+    fn native_war_side_selection_accepts_names_and_ids_and_rejects_duplicates() {
+        let grid = GridSpec {
+            grid_res: 180.0,
+            width: 2,
+            height: 1,
+        };
+        let decoded = DecodedScenario {
+            metadata: serde_json::json!({
+                "metadata": [
+                    {"id": 7, "name": "Seven", "gdp": 10, "population": 1000},
+                    {"id": 11, "name": "Eleven", "gdp": 10, "population": 1000}
+                ]
+            }),
+            source: grid,
+            target: grid,
+            entry_count: 2,
+            world_control: vec![7, 11],
+            de_jure: vec![7, 11],
+            land: vec![1, 1],
+            biome: vec![0; 2],
+            province: vec![0; 2],
+        };
+
+        assert_eq!(
+            resolve_native_war_sides(&decoded, &[vec!["seven".to_owned()], vec!["11".to_owned()]],)
+                .unwrap(),
+            vec![vec![7], vec![11]]
+        );
+        assert!(
+            resolve_native_war_sides(&decoded, &[vec!["Seven".to_owned()], vec!["7".to_owned()]],)
+                .is_err()
+        );
+        assert!(
+            resolve_native_war_sides(
+                &decoded,
+                &[vec!["Missing".to_owned()], vec!["11".to_owned()]],
+            )
+            .is_err()
+        );
     }
 
     #[test]
