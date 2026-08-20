@@ -1,0 +1,36 @@
+{
+  "schemaVersion":"strategic-cycle-v1",
+  "economySeeds":[
+    {"countryId":1,"gdp":100,"population":0,"territoryUnits":0,"initialCoreCells":100,"initialCityPop":100000},
+    {"countryId":2,"gdp":64,"population":0,"territoryUnits":0,"initialCoreCells":100,"initialCityPop":80000},
+    {"countryId":3,"gdp":36,"population":0,"territoryUnits":0,"initialCoreCells":50,"initialCityPopulation":0},
+    {"countryId":4,"gdp":25,"population":0,"territoryUnits":0,"initialCoreCells":20,"initialCityPop":0},
+    {"countryId":5,"gdp":25,"population":0,"territoryUnits":0,"initialCoreCells":20,"initialCityPop":0},
+    {"countryId":6,"gdp":25,"population":0,"territoryUnits":0,"initialCoreCells":100,"initialCityPop":0},
+    {"countryId":7,"gdp":25,"population":0,"territoryUnits":0,"initialCoreCells":100,"initialCityPop":0}
+  ],
+  "occupationStates":[
+    {"victimId":2,"annexerId":1,"baseIncome":100,"coreCells":100,"expectedArmyUnits":21,"resistance":74,"occupationCoverage":1,"garrisonCoverage":0,"garrisonAssigned":0,"requiredGarrison":4,"heldRatio":1,"activeRebellion":false,"queuedAtCycle":0,"cooldownUntilCycle":0},
+    {"victimId":3,"annexerId":1,"baseIncome":40,"coreCells":50,"expectedArmyUnits":0,"resistance":94,"occupationCoverage":1,"garrisonCoverage":1,"garrisonAssigned":3,"requiredGarrison":3,"heldRatio":1,"activeRebellion":false,"queuedAtCycle":0,"cooldownUntilCycle":0}
+  ],
+  "cycles":[
+    {"tick":600,"territoryGeneration":1,"territoryCommitSequence":1,"territoryFresh":true,"countries":[
+      {"countryId":1,"side":0,"ownedCells":100,"controlledCells":100,"coreControlled":100,"initialCells":100,"cityPopulationControlled":100000,"unitCount":10,"payrollDue":300,"capitalHeld":true,"isRebel":false,"active":true},
+      {"countryId":2,"side":1,"ownedCells":100,"controlledCells":2,"coreControlled":2,"initialCells":100,"cityPopulationControlled":0,"unitCount":4,"payrollDue":10,"capitalHeld":false,"isRebel":false,"active":true},
+      {"countryId":4,"side":2,"ownedCells":20,"controlledCells":0,"coreControlled":0,"initialCells":20,"cityPopulationControlled":0,"unitCount":0,"payrollDue":0,"capitalHeld":true,"isRebel":false,"active":true},
+      {"countryId":5,"side":2,"ownedCells":20,"controlledCells":0,"coreControlled":0,"initialCells":20,"cityPopulationControlled":0,"unitCount":0,"payrollDue":0,"capitalHeld":true,"isRebel":true,"active":true},
+      {"countryId":6,"side":3,"ownedCells":100,"controlledCells":2,"coreControlled":2,"initialCells":100,"cityPopulationControlled":0,"unitCount":4,"payrollDue":0,"capitalHeld":true,"isRebel":false,"active":true},
+      {"countryId":7,"side":3,"ownedCells":100,"controlledCells":25,"coreControlled":25,"initialCells":100,"cityPopulationControlled":0,"unitCount":0,"payrollDue":0,"capitalHeld":true,"isRebel":false,"active":true}
+    ],"occupations":[{"victimId":2,"heldCells":50,"garrisonStrength":2,"casualtyPressure":1},{"victimId":3,"heldCells":50,"garrisonStrength":0,"casualtyPressure":1}],"activeSides":[0,1],"activeHostilePairs":[[0,1]]},
+    {"tick":1200,"territoryGeneration":2,"territoryCommitSequence":2,"territoryFresh":true,"countries":[{"countryId":3,"side":1,"ownedCells":50,"controlledCells":50,"coreControlled":50,"initialCells":50,"cityPopulationControlled":0,"unitCount":10,"payrollDue":100000,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[],"activeHostilePairs":[]},
+    {"tick":1800,"territoryGeneration":3,"territoryCommitSequence":3,"territoryFresh":true,"countries":[{"countryId":3,"side":1,"ownedCells":50,"controlledCells":50,"coreControlled":50,"initialCells":50,"cityPopulationControlled":0,"unitCount":10,"payrollDue":100000,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[0],"activeHostilePairs":[]},
+    {"tick":2400,"territoryGeneration":4,"territoryCommitSequence":4,"territoryFresh":true,"countries":[{"countryId":3,"side":1,"ownedCells":50,"controlledCells":50,"coreControlled":50,"initialCells":50,"cityPopulationControlled":0,"unitCount":10,"payrollDue":100000,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[0,1],"activeHostilePairs":[[0,1]]},
+    {"tick":3000,"territoryGeneration":5,"territoryCommitSequence":5,"territoryFresh":true,"countries":[{"countryId":3,"side":1,"ownedCells":50,"controlledCells":50,"coreControlled":50,"initialCells":50,"cityPopulationControlled":0,"unitCount":10,"payrollDue":100000,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[0,1],"activeHostilePairs":[[0,1]]},
+    {"tick":3600,"territoryGeneration":6,"territoryCommitSequence":6,"territoryFresh":false,"countries":[{"countryId":3,"side":1,"ownedCells":50,"controlledCells":0,"coreControlled":0,"initialCells":50,"cityPopulationControlled":0,"unitCount":10,"payrollDue":100000,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[0,1],"activeHostilePairs":[[0,1]]},
+    {"tick":4200,"territoryGeneration":7,"territoryCommitSequence":7,"territoryFresh":true,"countries":[{"countryId":1,"side":0,"ownedCells":100,"controlledCells":100,"coreControlled":100,"initialCells":100,"cityPopulationControlled":100000,"unitCount":10,"payrollDue":0,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[0],"activeHostilePairs":[]},
+    {"tick":4800,"territoryGeneration":8,"territoryCommitSequence":8,"territoryFresh":true,"countries":[{"countryId":1,"side":0,"ownedCells":100,"controlledCells":100,"coreControlled":100,"initialCells":100,"cityPopulationControlled":100000,"unitCount":10,"payrollDue":0,"capitalHeld":true,"isRebel":false,"active":true},{"countryId":1,"side":0,"ownedCells":100,"controlledCells":100,"coreControlled":100,"initialCells":100,"cityPopulationControlled":100000,"unitCount":10,"payrollDue":0,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[],"activeHostilePairs":[],"expectedError":"duplicate country id 1"},
+    {"tick":4200,"territoryGeneration":8,"territoryCommitSequence":8,"territoryFresh":true,"countries":[],"occupations":[],"activeSides":[],"activeHostilePairs":[],"expectedError":"strategic tick 4200 must be greater than previous tick 4200"},
+    {"tick":4800,"territoryGeneration":7,"territoryCommitSequence":7,"territoryFresh":true,"countries":[{"countryId":1,"side":0,"ownedCells":100,"controlledCells":100,"coreControlled":100,"initialCells":100,"cityPopulationControlled":100000,"unitCount":10,"payrollDue":0,"capitalHeld":true,"isRebel":false,"active":true}],"occupations":[],"activeSides":[0],"activeHostilePairs":[[8,9],[0,7],[0,0]]},
+    {"tick":5400,"territoryGeneration":6,"territoryCommitSequence":8,"territoryFresh":true,"countries":[],"occupations":[],"activeSides":[],"activeHostilePairs":[],"expectedError":"territory generation 6 must not be less than previous generation 7"}
+  ]
+}

@@ -9,7 +9,10 @@ use mw_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod ai_orders;
 mod native_tick;
+mod strategic_cycle;
+mod territory_control;
 mod unit_kernel;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -34,6 +37,12 @@ fn run() -> Result<()> {
         "unit-bench" => unit_kernel::run_bench_command(args.collect()),
         "native-tick-fixture" => native_tick::run_fixture_command(args.collect()),
         "native-tick-bench" => native_tick::run_bench_command(args.collect()),
+        "ai-orders-fixture" => ai_orders::run_fixture_command(args.collect()),
+        "ai-orders-bench" => ai_orders::run_bench_command(args.collect()),
+        "strategic-cycle-fixture" => strategic_cycle::run_fixture_command(args.collect()),
+        "strategic-cycle-bench" => strategic_cycle::run_bench_command(args.collect()),
+        "territory-control-fixture" => territory_control::run_fixture_command(args.collect()),
+        "territory-control-bench" => territory_control::run_bench_command(args.collect()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -52,6 +61,12 @@ fn print_help() {
          unit-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n  \
          native-tick-fixture <fixture.json> [--json]\n  \
          native-tick-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
+         ai-orders-fixture <fixture.json> [--json]\n  \
+         ai-orders-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
+         strategic-cycle-fixture <fixture.json> [--json]\n  \
+         strategic-cycle-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
+         territory-control-fixture <fixture.json> [--json]\n  \
+         territory-control-bench <fixture.json> [--repeat N] [--warmup N] [--json]\n\n\
          Inspects web-compatible scenarios and runs deterministic parity fixtures and\n\
          performance benchmarks for migrated native systems."
     );

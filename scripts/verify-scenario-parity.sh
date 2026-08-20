@@ -63,3 +63,21 @@ node "$native_root/scripts/compare-native-tick-parity.mjs" \
 		"$web_root" "$native_root/fixtures/native-tick-v1.json") \
 	<("$native_root/target/debug/mw-tools" native-tick-fixture \
 		"$native_root/fixtures/native-tick-v1.json" --json)
+
+node "$native_root/scripts/compare-ai-orders-parity.mjs" \
+	<(node "$native_root/scripts/js-ai-orders-reference.mjs" \
+		"$native_root/fixtures/ai-orders-v1.json" report) \
+	<("$native_root/target/debug/mw-tools" ai-orders-fixture \
+		"$native_root/fixtures/ai-orders-v1.json" --json)
+
+node "$native_root/scripts/compare-territory-control-parity.mjs" \
+	<(node "$native_root/scripts/js-territory-control-reference.mjs" \
+		"$native_root/fixtures/territory-control-v1.json" report) \
+	<("$native_root/target/debug/mw-tools" territory-control-fixture \
+		"$native_root/fixtures/territory-control-v1.json" --json)
+
+node "$native_root/scripts/compare-strategic-cycle-parity.mjs" \
+	<(node "$native_root/scripts/js-strategic-cycle-reference.mjs" \
+		"$native_root/fixtures/strategic-cycle-v1.json" report) \
+	<("$native_root/target/debug/mw-tools" strategic-cycle-fixture \
+		"$native_root/fixtures/strategic-cycle-v1.json" --json)

@@ -1,0 +1,109 @@
+{
+  "schema": "ai-orders-v1",
+  "cases": [
+    {
+      "name": "permutation-and-capacity",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [{"id":20,"sidePair":[0,1],"segmentId":2,"lat":0,"lng":5,"capacity":1,"priority":1},{"id":10,"sidePair":[0,1],"segmentId":1,"lat":0,"lng":-5,"capacity":1,"priority":1}] },
+      "units": [
+        { "id":3,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":-4,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":1,"side":0,"sovereign":1,"kind":"armor","lat":0,"lng":4,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.004,"movement":{"terrainSpeedMultiplier":0.8,"speedMultiplier":1.25,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1.1,"takenMultiplier":0.9,"defenseBonus":1.2,"longWarDefense":1,"mountain":false,"urban":true},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":2,"side":0,"sovereign":1,"kind":"army","lat":20,"lng":0,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false }
+      ],
+      "verifyPermutationInvariance": true,
+      "expectedError": null
+    },
+    {
+      "name": "nearest-id-and-directed-multiside-hostility",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [2,2,2,2,2,2,2,2], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [] },
+      "units": [
+        { "id":10,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":3,"side":1,"sovereign":2,"kind":"army","lat":0,"lng":0.1,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":2,"side":1,"sovereign":2,"kind":"army","lat":0,"lng":-0.1,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":4,"side":2,"sovereign":3,"kind":"army","lat":0,"lng":0.2,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false }
+      ],
+      "verifyPermutationInvariance": true,
+      "expectedError": null
+    },
+    {
+      "name": "retreat-threshold-centroid-wrap-and-encirclement",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 1, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [] },
+      "units": [
+        { "id":1,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":179.9,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":true },
+        { "id":2,"side":1,"sovereign":2,"kind":"army","lat":0,"lng":-179.9,"health":100,"maxHealth":100,"combatPower":5,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false }
+      ],
+      "verifyPermutationInvariance": true,
+      "expectedError": null
+    },
+    {
+      "name": "retreat-strict-multiple-does-not-trigger-on-equality",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 1, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [] },
+      "units": [
+        { "id":1,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0,"health":100,"maxHealth":100,"combatPower":5,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":2,"side":1,"sovereign":2,"kind":"army","lat":0,"lng":0.1,"health":100,"maxHealth":100,"combatPower":5,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false }
+      ],
+      "verifyPermutationInvariance": false,
+      "expectedError": null
+    },
+    {
+      "name": "prior-assignment-stickiness-capacity",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [{"id":10,"sidePair":[0,1],"segmentId":1,"lat":0,"lng":0,"capacity":1,"priority":1}] },
+      "units": [
+        { "id":10,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":1,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":{"objectiveId":10},"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":20,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0.1,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":{"objectiveId":10},"isReserve":false,"reinforcementEligible":false,"encircled":false }
+      ],
+      "verifyPermutationInvariance": true,
+      "expectedError": null
+    },
+    {
+      "name": "low-readiness-reinforcement-underfilled-priority",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [{"id":10,"sidePair":[0,1],"segmentId":1,"lat":0,"lng":-1,"capacity":2,"priority":10},{"id":20,"sidePair":[0,1],"segmentId":2,"lat":0,"lng":1,"capacity":1,"priority":1}] },
+      "units": [
+        { "id":1,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":-1,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":2,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0,"health":45,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":true,"encircled":false }
+      ],
+      "verifyPermutationInvariance": true,
+      "expectedError": null
+    },
+    {
+      "name": "direction-field-fallback",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1.25, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": [0,0,0,0,0,0,3,0], "frontlineLongitude": [0,0,0,0,0,0,4,0], "objectives": [] },
+      "units": [{ "id":1,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":0.8,"neutralPenalty":0.9,"pushReadiness":1.1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false }],
+      "verifyPermutationInvariance": false,
+      "expectedError": null
+    },
+    {
+      "name": "no-objective-hold",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [] },
+      "units": [{ "id":1,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false }],
+      "verifyPermutationInvariance": false,
+      "expectedError": null
+    },
+    {
+      "name": "reinforcement-friendly-cell-fallback",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [0,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [] },
+      "units": [{ "id":1,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0,"health":40,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":true,"reinforcementEligible":true,"encircled":false }],
+      "verifyPermutationInvariance": false,
+      "expectedError": null
+    },
+    {
+      "name": "invalid-duplicate-unit-atomic-rejection",
+      "config": { "contactScanRadius": 0.6, "retreatMinHostilePower": 5, "retreatMultiple": 8, "retreatBoost": 5.5, "encircledRetreatMultiplier": 0.25, "priorAssignmentStickiness": 8, "reinforcementReadinessThreshold": 0.45, "contactPlanSpeedMultiplier": 1, "frontPlanSpeedMultiplier": 1, "reinforcementPlanSpeedMultiplier": 0.75, "fieldPlanSpeedMultiplier": 1, "maxUnits": 100000, "maxObjectives": 10000, "maxGridCells": 5000000, "maxAssignmentEdges": 5000000 },
+      "world": { "gridWidth": 4, "gridHeight": 2, "gridRes": 90, "landMask": [1,1,1,1,1,1,1,1], "dominantSideMap": [-1,-1,-1,-1,-1,-1,-1,-1], "maxSides": 3, "hostilityMatrix": [0,1,0,0,0,1,1,0,0], "frontlineLatitude": null, "frontlineLongitude": null, "objectives": [] },
+      "units": [
+        { "id":7,"side":0,"sovereign":1,"kind":"army","lat":0,"lng":0,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false },
+        { "id":7,"side":1,"sovereign":2,"kind":"army","lat":0,"lng":0.1,"health":100,"maxHealth":100,"combatPower":1,"allyWeight":1,"atSea":false,"transport":false,"baseSpeed":0.003,"movement":{"terrainSpeedMultiplier":1,"speedMultiplier":1,"planSpeedMultiplier":1,"neutralPenalty":1,"pushReadiness":1},"combat":{"dealtMultiplier":1,"takenMultiplier":1,"defenseBonus":1,"longWarDefense":1,"mountain":false,"urban":false},"previousAssignment":null,"isReserve":false,"reinforcementEligible":false,"encircled":false }
+      ],
+      "verifyPermutationInvariance": false,
+      "expectedError": "duplicate_unit"
+    }
+  ]
+}

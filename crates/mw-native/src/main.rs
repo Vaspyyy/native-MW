@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -7,9 +8,11 @@ use std::{
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use mw_core::{
-    CombatConfig, CombatUnit, FrameSnapshot, GridSpec, HostilityMatrix, MovementFactors,
-    ResolvedCombatOrder, ResolvedUnitOrder, Simulation, SimulationConfig, SimulationUnit,
-    TickInput, UnitKind, WorldGridView, decode_mwsc_gzip_file,
+    AiOrderConfig, AiUnitInput, AiWorldInput, CombatConfig, CombatUnit, FrameSnapshot,
+    FrontObjective, GridSpec, HostilityMatrix, InfluenceSource, ResolvedCombatModifiers,
+    ResolvedMovementModifiers, Simulation, SimulationConfig, SimulationUnit, TerritoryConfig,
+    TerritoryControl, TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels, TickInput,
+    UnitKind, WorldGridView, decode_mwsc_gzip_file, formation_strength, resolve_ai_orders,
 };
 use serde_json::Value;
 use wgpu::util::DeviceExt;
@@ -49,12 +52,15 @@ struct GpuState {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     view_buffer: wgpu::Buffer,
+    ownership_texture: wgpu::Texture,
     unit_renderer: UnitRenderer,
 }
 
 struct DemoSimulation {
     simulation: Simulation,
-    orders: Vec<ResolvedUnitOrder>,
+    objectives: Vec<FrontObjective>,
+    prior_assignments: BTreeMap<u64, u64>,
+    territory: TerritoryControl,
     max_sides: usize,
     tick: u64,
     next_step_at: Instant,
@@ -95,6 +101,7 @@ struct App {
     demo_center: Option<[f32; 2]>,
     latest_snapshot: Option<FrameSnapshot>,
     snapshot_dirty: bool,
+    territory_update: Option<Arc<TerritoryRenderUpdate>>,
     fps_epoch: Instant,
     fps: f64,
 }
@@ -125,6 +132,7 @@ impl App {
             demo_center: None,
             latest_snapshot: None,
             snapshot_dirty: false,
+            territory_update: None,
             fps_epoch: Instant::now(),
             fps: 0.0,
         }
@@ -179,7 +187,14 @@ impl App {
             .context("--demo-units requires an adjacent-country land border")?;
             let first_name = self.country_name(border.first_owner).to_owned();
             let second_name = self.country_name(border.second_owner).to_owned();
-            let (demo, snapshot) = create_demo_simulation(border)?;
+            let (demo, snapshot) = create_demo_simulation(
+                border,
+                &self.ownership,
+                &self.land,
+                self.grid_width as usize,
+                self.grid_height as usize,
+                f64::from(self.grid_res),
+            )?;
             self.demo_center = Some(geographic_to_world(border.midpoint[0], border.midpoint[1]));
             self.center = self.demo_center.expect("demo center was just assigned");
             self.zoom = demo_zoom(size);
@@ -393,6 +408,7 @@ impl App {
             pipeline,
             bind_group,
             view_buffer,
+            ownership_texture,
             unit_renderer,
         });
         self.window = Some(window);
@@ -440,39 +456,118 @@ impl App {
         )
         .context("invalid decoded land grid for demo simulation")?;
         let next_tick = demo.tick.saturating_add(1);
+        let ai_units = demo
+            .simulation
+            .units
+            .iter()
+            .map(|unit| AiUnitInput {
+                id: unit.combat.id,
+                side: u16::try_from(unit.combat.side).unwrap_or(u16::MAX),
+                sovereign: unit.combat.sovereign,
+                kind: unit.combat.kind,
+                lat: unit.combat.lat,
+                lng: unit.combat.lng,
+                health: unit.combat.health,
+                max_health: unit.combat.max_health,
+                combat_power: formation_strength(&unit.combat),
+                ally_weight: unit.ally_weight,
+                at_sea: unit.combat.at_sea,
+                transport: unit.combat.transport,
+                base_speed: 0.003,
+                movement: ResolvedMovementModifiers::default(),
+                combat: ResolvedCombatModifiers::default(),
+                prior_front_objective_id: demo.prior_assignments.get(&unit.combat.id).copied(),
+                is_reserve: false,
+                reinforcement_eligible: false,
+                encircled: false,
+            })
+            .collect::<Vec<_>>();
+        let hostility = [0_u8, 1, 1, 0];
+        let planning = resolve_ai_orders(
+            AiOrderConfig::default(),
+            &ai_units,
+            AiWorldInput {
+                grid_width: self.grid_width as usize,
+                grid_height: self.grid_height as usize,
+                grid_res: f64::from(self.grid_res),
+                land_mask: &self.land,
+                dominant_side_map: demo.territory.dominant_side(),
+                hostility: HostilityMatrix::new(Some(&hostility), demo.max_sides),
+                frontline_latitude: None,
+                frontline_longitude: None,
+                objectives: &demo.objectives,
+            },
+        )?;
+        demo.prior_assignments.clear();
+        demo.prior_assignments
+            .extend(planning.assignments.iter().filter_map(|assignment| {
+                assignment
+                    .objective_id
+                    .map(|objective| (assignment.unit_id, objective))
+            }));
         let input = TickInput {
             tick: next_tick,
             frame: next_tick,
             war_grace_end: 0,
             world,
-            hostility: HostilityMatrix::new(None, demo.max_sides),
-            orders: &demo.orders,
+            hostility: HostilityMatrix::new(Some(&hostility), demo.max_sides),
+            orders: &planning.orders,
         };
         let (snapshot, counters) = demo.simulation.step(input)?;
         demo.tick = next_tick;
 
-        demo.orders
-            .retain(|order| snapshot.units.iter().any(|unit| unit.id == order.unit_id));
-        for order in &mut demo.orders {
-            if order
-                .preferred_target_id
-                .is_some_and(|target| !snapshot.units.iter().any(|unit| unit.id == target))
-            {
-                order.preferred_target_id = None;
-            }
+        let influence_sources = snapshot
+            .units
+            .iter()
+            .filter(|unit| unit.health > 0.0 && !unit.at_sea)
+            .map(|unit| {
+                let sovereign = u16::try_from(unit.sovereign)
+                    .context("demo sovereign id exceeds territory map width")?;
+                Ok(InfluenceSource {
+                    id: unit.id,
+                    side: usize::from(unit.side),
+                    sovereign,
+                    beneficiary: sovereign,
+                    lat: unit.lat,
+                    lng: unit.lng,
+                    radius: 0.45,
+                    delta: 0.04,
+                    concentration_bonus: 1.0,
+                    owner_ally_country_ids: BTreeSet::from([sovereign]),
+                    protected_owner_ids: BTreeSet::new(),
+                    rebel_de_jure: None,
+                    credit_de_jure: None,
+                    credit_de_jure_by_country: BTreeMap::new(),
+                    refuses_offense: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let influence = demo.territory.apply_influence_sources(&influence_sources)?;
+        let census = demo.territory.advance_census(16_384);
+        if let Some(update) = demo.territory.drain_render_update() {
+            apply_territory_update_to_grid(
+                &mut self.ownership,
+                self.grid_width as usize,
+                self.grid_height as usize,
+                &update,
+            )?;
+            self.territory_update = Some(update);
         }
+
         demo.finished = snapshot.units.len() < 2
             || snapshot
                 .units
                 .first()
                 .is_none_or(|first| snapshot.units.iter().all(|unit| unit.side == first.side));
         log::trace!(
-            "demo tick {}: {} units, {} contacts, {} direct engagements, {} moves",
+            "demo tick {}: {} units, {} contacts, {} direct engagements, {} moves, {} influence cells, territory commit {}",
             demo.tick,
             snapshot.units.len(),
             counters.accepted_contacts,
             counters.direct_events,
-            counters.moved_units
+            counters.moved_units,
+            influence.touched_influence_cells.len(),
+            census.committed,
         );
         self.latest_snapshot = Some(snapshot);
         self.snapshot_dirty = true;
@@ -533,9 +628,16 @@ impl App {
         let size = window.inner_size();
         let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
+        let territory_update = self.territory_update.take();
         let Some(gpu) = &mut self.gpu else { return };
         gpu.queue
             .write_buffer(&gpu.view_buffer, 0, bytemuck::bytes_of(&uniform));
+        if let Some(update) = territory_update
+            && let Err(error) = upload_territory_update(&gpu.queue, &gpu.ownership_texture, &update)
+        {
+            log::error!("territory texture update failed: {error:#}");
+            self.demo = None;
+        }
         if self.snapshot_dirty
             && let Some(snapshot) = &self.latest_snapshot
         {
@@ -857,7 +959,14 @@ fn cell_geographic_center(cell: [usize; 2], grid_res: f64) -> [f64; 2] {
     ]
 }
 
-fn create_demo_simulation(border: DemoBorder) -> Result<(DemoSimulation, FrameSnapshot)> {
+fn create_demo_simulation(
+    border: DemoBorder,
+    ownership: &[u16],
+    land: &[u8],
+    grid_width: usize,
+    grid_height: usize,
+    grid_resolution: f64,
+) -> Result<(DemoSimulation, FrameSnapshot)> {
     let normal = border.toward_second;
     let tangent = [-normal[1], normal[0]];
     let half_separation = 0.018;
@@ -876,21 +985,35 @@ fn create_demo_simulation(border: DemoBorder) -> Result<(DemoSimulation, FrameSn
         offset_geographic(second_base, tangent, -lane_offset),
         offset_geographic(second_base, tangent, lane_offset),
     ];
-    let first_side = u64::from(border.first_owner);
-    let second_side = u64::from(border.second_owner);
     let units = vec![
-        demo_unit(1, first_side, UnitKind::Army, positions[0], normal),
-        demo_unit(2, first_side, UnitKind::Armor, positions[1], normal),
+        demo_unit(
+            1,
+            0,
+            u64::from(border.first_owner),
+            UnitKind::Army,
+            positions[0],
+            normal,
+        ),
+        demo_unit(
+            2,
+            0,
+            u64::from(border.first_owner),
+            UnitKind::Armor,
+            positions[1],
+            normal,
+        ),
         demo_unit(
             3,
-            second_side,
+            1,
+            u64::from(border.second_owner),
             UnitKind::Army,
             positions[2],
             [-normal[0], -normal[1]],
         ),
         demo_unit(
             4,
-            second_side,
+            1,
+            u64::from(border.second_owner),
             UnitKind::Armor,
             positions[3],
             [-normal[0], -normal[1]],
@@ -909,24 +1032,217 @@ fn create_demo_simulation(border: DemoBorder) -> Result<(DemoSimulation, FrameSn
         units,
     )?;
     let snapshot = simulation.initial_snapshot(0, 0);
-    let orders = vec![
-        demo_order(1, 3, normal),
-        demo_order(2, 4, normal),
-        demo_order(3, 1, [-normal[0], -normal[1]]),
-        demo_order(4, 2, [-normal[0], -normal[1]]),
+    let objectives = vec![
+        FrontObjective::new(1, [0, 1], 1, second_base[0], second_base[1], 2, 10)?,
+        FrontObjective::new(2, [1, 0], 1, first_base[0], first_base[1], 2, 10)?,
     ];
-    let max_sides = usize::from(border.first_owner.max(border.second_owner)) + 1;
+    let cell_count = grid_width
+        .checked_mul(grid_height)
+        .context("demo territory dimensions overflow")?;
+    anyhow::ensure!(
+        ownership.len() == cell_count,
+        "demo ownership grid has {} cells, expected {cell_count}",
+        ownership.len()
+    );
+    anyhow::ensure!(
+        land.len() == cell_count,
+        "demo land grid has {} cells, expected {cell_count}",
+        land.len()
+    );
+    let dominant_side = ownership
+        .iter()
+        .map(|owner| {
+            if *owner == border.first_owner {
+                0
+            } else if *owner == border.second_owner {
+                1
+            } else {
+                -1
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut side_influence = vec![vec![0.0_f32; cell_count]; 2];
+    let mut occupation = vec![0.0_f32; cell_count];
+    for (cell, owner) in ownership.iter().copied().enumerate() {
+        if owner == border.first_owner {
+            side_influence[0][cell] = 1.0;
+            occupation[cell] = 1.0;
+        } else if owner == border.second_owner {
+            side_influence[1][cell] = 1.0;
+            occupation[cell] = -1.0;
+        }
+    }
+    let country_to_side = BTreeMap::from([
+        (border.first_owner, 0_usize),
+        (border.second_owner, 1_usize),
+    ]);
+    let mut territory = TerritoryControl::new(TerritoryConfig {
+        width: grid_width,
+        height: grid_height,
+        grid_resolution,
+        max_sides: 2,
+        tile_size: 32,
+        maps: TerritoryMaps {
+            land: land
+                .iter()
+                .map(|value| if *value == 0 { 0 } else { 2 })
+                .collect(),
+            world_control: ownership.to_vec(),
+            de_jure: ownership.to_vec(),
+            primary_occupier: ownership.to_vec(),
+            dominant_side,
+            occupation,
+            side_influence,
+        },
+        country_to_side,
+        hostility_matrix: vec![0, 1, 1, 0],
+        cities: Vec::new(),
+        protected_owner_ids: BTreeSet::new(),
+        topology_revision: 0,
+        world_revision: 0,
+        city_revision: 0,
+    })?;
+    territory.flush_census(65_536);
+    let _ = territory.drain_render_update();
     Ok((
         DemoSimulation {
             simulation,
-            orders,
-            max_sides,
+            objectives,
+            prior_assignments: BTreeMap::new(),
+            territory,
+            max_sides: 2,
             tick: 0,
             next_step_at: Instant::now(),
             finished: false,
         },
         snapshot,
     ))
+}
+
+fn apply_territory_update_to_grid(
+    ownership: &mut [u16],
+    width: usize,
+    height: usize,
+    update: &TerritoryRenderUpdate,
+) -> Result<()> {
+    let expected_cells = width
+        .checked_mul(height)
+        .context("territory render dimensions overflow")?;
+    anyhow::ensure!(
+        ownership.len() == expected_cells,
+        "ownership grid has {} cells, expected {expected_cells}",
+        ownership.len()
+    );
+    for tile in &update.tiles {
+        let bounds = tile.bounds;
+        anyhow::ensure!(
+            bounds.min_x < bounds.max_x
+                && bounds.min_y < bounds.max_y
+                && bounds.max_x <= width
+                && bounds.max_y <= height,
+            "territory tile {} has invalid bounds",
+            bounds.tile
+        );
+        let tile_width = bounds.max_x - bounds.min_x;
+        let tile_height = bounds.max_y - bounds.min_y;
+        let expected_pixels = tile_width
+            .checked_mul(tile_height)
+            .context("territory tile dimensions overflow")?;
+        anyhow::ensure!(
+            tile.pixels.len() == expected_pixels,
+            "territory tile {} has {} pixels, expected {expected_pixels}",
+            bounds.tile,
+            tile.pixels.len()
+        );
+        for row in 0..tile_height {
+            let source_start = row * tile_width;
+            let target_start = (bounds.min_y + row) * width + bounds.min_x;
+            ownership[target_start..target_start + tile_width]
+                .copy_from_slice(&tile.pixels[source_start..source_start + tile_width]);
+        }
+    }
+    Ok(())
+}
+
+fn pack_territory_tile(tile: &TerritoryTilePixels) -> Result<(Vec<u8>, u32, u32)> {
+    let bounds = tile.bounds;
+    anyhow::ensure!(
+        bounds.min_x < bounds.max_x && bounds.min_y < bounds.max_y,
+        "territory tile {} has empty bounds",
+        bounds.tile
+    );
+    let width = bounds.max_x - bounds.min_x;
+    let height = bounds.max_y - bounds.min_y;
+    let expected_pixels = width
+        .checked_mul(height)
+        .context("territory tile dimensions overflow")?;
+    anyhow::ensure!(
+        tile.pixels.len() == expected_pixels,
+        "territory tile {} has {} pixels, expected {expected_pixels}",
+        bounds.tile,
+        tile.pixels.len()
+    );
+    let unpadded_bytes_per_row = width
+        .checked_mul(std::mem::size_of::<u16>())
+        .context("territory tile row size overflow")?;
+    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+    let mut packed = vec![0_u8; padded_bytes_per_row * height];
+    for row in 0..height {
+        let source = &tile.pixels[row * width..(row + 1) * width];
+        let bytes = bytemuck::cast_slice(source);
+        let target_start = row * padded_bytes_per_row;
+        packed[target_start..target_start + unpadded_bytes_per_row].copy_from_slice(bytes);
+    }
+    Ok((
+        packed,
+        u32::try_from(padded_bytes_per_row).context("territory tile row exceeds GPU limits")?,
+        u32::try_from(height).context("territory tile height exceeds GPU limits")?,
+    ))
+}
+
+fn upload_territory_update(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    update: &TerritoryRenderUpdate,
+) -> Result<()> {
+    let texture_size = texture.size();
+    for tile in &update.tiles {
+        let bounds = tile.bounds;
+        anyhow::ensure!(
+            bounds.max_x <= texture_size.width as usize
+                && bounds.max_y <= texture_size.height as usize,
+            "territory tile {} exceeds ownership texture",
+            bounds.tile
+        );
+        let (packed, bytes_per_row, rows_per_image) = pack_territory_tile(tile)?;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: u32::try_from(bounds.min_x)
+                        .context("territory tile x exceeds GPU limits")?,
+                    y: u32::try_from(bounds.min_y)
+                        .context("territory tile y exceeds GPU limits")?,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &packed,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(rows_per_image),
+            },
+            wgpu::Extent3d {
+                width: u32::try_from(bounds.max_x - bounds.min_x)
+                    .context("territory tile width exceeds GPU limits")?,
+                height: rows_per_image,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn offset_geographic(origin: [f64; 2], direction: [f64; 2], distance: f64) -> [f64; 2] {
@@ -939,6 +1255,7 @@ fn offset_geographic(origin: [f64; 2], direction: [f64; 2], distance: f64) -> [f
 fn demo_unit(
     id: u64,
     side: u64,
+    sovereign: u64,
     kind: UnitKind,
     position: [f64; 2],
     direction: [f64; 2],
@@ -948,7 +1265,7 @@ fn demo_unit(
         combat: CombatUnit {
             id,
             side,
-            sovereign: side,
+            sovereign,
             kind,
             lat: position[0],
             lng: position[1],
@@ -972,25 +1289,6 @@ fn demo_unit(
         armor_landing_penalty_until_tick: 0,
         is_support: false,
         ally_weight: 1.0,
-    }
-}
-
-fn demo_order(unit_id: u64, preferred_target_id: u64, direction: [f64; 2]) -> ResolvedUnitOrder {
-    ResolvedUnitOrder {
-        unit_id,
-        preferred_target_id: Some(preferred_target_id),
-        movement_enabled: true,
-        dir_lat: direction[0],
-        dir_lng: direction[1],
-        factors: MovementFactors {
-            base_speed: 0.003,
-            speed_mult: 1.0,
-            plan_speed_mult: 1.0,
-            neutral_penalty: 1.0,
-            retreat_boost: 1.0,
-            push_readiness: 1.0,
-        },
-        combat: ResolvedCombatOrder::default(),
     }
 }
 
@@ -1167,11 +1465,53 @@ mod tests {
             midpoint: [45.0, 8.0],
             toward_second: [0.0, 1.0],
         };
-        let (demo, snapshot) = create_demo_simulation(border).unwrap();
+        let (demo, snapshot) =
+            create_demo_simulation(border, &[7, 11], &[1, 1], 2, 1, 180.0).unwrap();
         assert_eq!(snapshot.units.len(), 4);
-        assert!(snapshot.units.iter().any(|unit| unit.side == 7));
-        assert!(snapshot.units.iter().any(|unit| unit.side == 11));
-        assert_eq!(demo.orders.len(), 4);
-        assert_eq!(demo.max_sides, 12);
+        assert!(
+            snapshot
+                .units
+                .iter()
+                .any(|unit| unit.side == 0 && unit.sovereign == 7)
+        );
+        assert!(
+            snapshot
+                .units
+                .iter()
+                .any(|unit| unit.side == 1 && unit.sovereign == 11)
+        );
+        assert_eq!(demo.objectives.len(), 2);
+        assert_eq!(demo.max_sides, 2);
+        assert!(demo.territory.snapshot().is_some());
+    }
+
+    #[test]
+    fn territory_tiles_patch_cpu_grid_and_pack_aligned_gpu_rows() {
+        let tile = TerritoryTilePixels {
+            bounds: mw_core::TileBounds {
+                tile: 3,
+                min_x: 1,
+                min_y: 1,
+                max_x: 3,
+                max_y: 3,
+            },
+            pixels: vec![9, 8, 7, 6],
+        };
+        let update = TerritoryRenderUpdate {
+            full_update: false,
+            tiles: vec![tile.clone()],
+        };
+        let mut ownership = vec![0_u16; 12];
+        apply_territory_update_to_grid(&mut ownership, 4, 3, &update).unwrap();
+        assert_eq!(ownership, vec![0, 0, 0, 0, 0, 9, 8, 0, 0, 7, 6, 0]);
+
+        let (packed, bytes_per_row, rows) = pack_territory_tile(&tile).unwrap();
+        assert_eq!(bytes_per_row as usize, ROW_ALIGNMENT);
+        assert_eq!(rows, 2);
+        assert_eq!(&packed[..4], bytemuck::cast_slice::<u16, u8>(&[9_u16, 8]));
+        assert_eq!(
+            &packed[ROW_ALIGNMENT..ROW_ALIGNMENT + 4],
+            bytemuck::cast_slice::<u16, u8>(&[7_u16, 6])
+        );
     }
 }
