@@ -39,6 +39,8 @@ pub struct ResolvedCombatOrder {
     pub long_war_defense: f64,
     pub mountain: bool,
     pub urban: bool,
+    pub current_cell_mountain: Option<bool>,
+    pub current_cell_urban: Option<bool>,
 }
 
 impl Default for ResolvedCombatOrder {
@@ -50,6 +52,8 @@ impl Default for ResolvedCombatOrder {
             long_war_defense: 1.0,
             mountain: false,
             urban: false,
+            current_cell_mountain: None,
+            current_cell_urban: None,
         }
     }
 }
@@ -486,7 +490,6 @@ impl Simulation {
                 .or_else(|| self.accepted.first().copied());
 
             let mut direct_engaged = false;
-            let context = combat_context(input, order.combat);
             if !in_war_grace {
                 // Keep the reusable accepted buffer while mutating unit state.
                 for position in 0..self.accepted.len() {
@@ -496,7 +499,7 @@ impl Simulation {
                         continue;
                     }
                     if let Some(event) =
-                        self.resolve_pair(attacker_idx, target_idx, false, &context)
+                        self.resolve_pair(attacker_idx, target_idx, false, input, order.combat)
                     {
                         counters.proximity_events += 1;
                         self.events.push(event);
@@ -506,7 +509,8 @@ impl Simulation {
 
             if let Some(target_idx) = selected_target
                 && self.units[target_idx].combat.health > 0.0
-                && let Some(event) = self.resolve_pair(attacker_idx, target_idx, true, &context)
+                && let Some(event) =
+                    self.resolve_pair(attacker_idx, target_idx, true, input, order.combat)
             {
                 counters.direct_events += 1;
                 self.events.push(event);
@@ -634,24 +638,29 @@ impl Simulation {
         attacker_idx: usize,
         target_idx: usize,
         direct: bool,
-        context: &CombatContext<'_>,
+        input: TickInput<'_>,
+        attacker_order: ResolvedCombatOrder,
     ) -> Option<CombatEvent> {
         debug_assert_ne!(attacker_idx, target_idx);
         let config = self.config.combat;
+        let target_order = self.order_by_unit[target_idx]
+            .map(|order| order.combat)
+            .unwrap_or_default();
+        let context = combat_context(input, attacker_order, target_order, direct);
         let (attacker, target) =
             two_simulation_units_mut(&mut self.units, attacker_idx, target_idx);
         if direct {
             resolve_direct_engagement_prevalidated(
                 &mut attacker.combat,
                 &mut target.combat,
-                context,
+                &context,
                 &config,
             )
         } else {
             resolve_proximity_contact_prevalidated(
                 &mut attacker.combat,
                 &mut target.combat,
-                context,
+                &context,
                 &config,
             )
         }
@@ -838,17 +847,42 @@ fn is_hostile(hostility: HostilityMatrix<'_>, attacker: usize, target: usize) ->
             .is_none_or(|relations| relations[attacker * hostility.max_sides + target] == 1)
 }
 
-fn combat_context<'a>(input: TickInput<'a>, order: ResolvedCombatOrder) -> CombatContext<'a> {
+fn combat_context<'a>(
+    input: TickInput<'a>,
+    attacker: ResolvedCombatOrder,
+    target: ResolvedCombatOrder,
+    direct: bool,
+) -> CombatContext<'a> {
+    let has_live_pair_context = attacker.current_cell_mountain.is_some()
+        && attacker.current_cell_urban.is_some()
+        && target.current_cell_mountain.is_some()
+        && target.current_cell_urban.is_some();
+    let mountain = if has_live_pair_context {
+        attacker.current_cell_mountain.unwrap_or(false)
+            || target.current_cell_mountain.unwrap_or(false)
+    } else {
+        attacker.mountain
+    };
+    let urban = if has_live_pair_context {
+        let target_cell_urban = target.current_cell_urban.unwrap_or(false);
+        if direct {
+            attacker.urban || target_cell_urban
+        } else {
+            attacker.current_cell_urban.unwrap_or(false) || target_cell_urban
+        }
+    } else {
+        attacker.urban
+    };
     CombatContext {
         sim_tick: input.tick,
         frame: input.frame,
         war_grace_end: input.war_grace_end,
-        attacker_damage_dealt_multiplier: order.dealt_multiplier,
-        attacker_damage_taken_multiplier: order.taken_multiplier,
-        defense_bonus: order.defense_bonus,
-        long_war_defense: order.long_war_defense,
-        mountain: order.mountain,
-        urban: order.urban,
+        attacker_damage_dealt_multiplier: attacker.dealt_multiplier,
+        attacker_damage_taken_multiplier: attacker.taken_multiplier,
+        defense_bonus: attacker.defense_bonus,
+        long_war_defense: attacker.long_war_defense,
+        mountain,
+        urban,
         world: Some(input.world),
     }
 }
@@ -948,6 +982,53 @@ mod tests {
             orders,
             inactive_unit_ids: &[],
         }
+    }
+
+    #[test]
+    fn live_pair_context_combines_both_cells_without_changing_legacy_orders() {
+        let mask = all_land();
+        let orders = [];
+        let tick = input(&mask, &orders, None);
+        let attacker = ResolvedCombatOrder {
+            urban: true, // near its own sovereign city, but not in a city cell
+            current_cell_mountain: Some(false),
+            current_cell_urban: Some(false),
+            ..ResolvedCombatOrder::default()
+        };
+        let target = ResolvedCombatOrder {
+            current_cell_mountain: Some(true),
+            current_cell_urban: Some(true),
+            ..ResolvedCombatOrder::default()
+        };
+
+        let direct = combat_context(tick, attacker, target, true);
+        assert!(direct.mountain);
+        assert!(direct.urban);
+        let proximity = combat_context(tick, attacker, target, false);
+        assert!(proximity.mountain);
+        assert!(proximity.urban);
+
+        let flat_target = ResolvedCombatOrder {
+            current_cell_mountain: Some(false),
+            current_cell_urban: Some(false),
+            ..ResolvedCombatOrder::default()
+        };
+        assert!(combat_context(tick, attacker, flat_target, true).urban);
+        assert!(!combat_context(tick, attacker, flat_target, false).urban);
+
+        let legacy = ResolvedCombatOrder {
+            mountain: true,
+            urban: true,
+            ..ResolvedCombatOrder::default()
+        };
+        let legacy_target = ResolvedCombatOrder {
+            current_cell_mountain: Some(false),
+            current_cell_urban: Some(false),
+            ..ResolvedCombatOrder::default()
+        };
+        let legacy_context = combat_context(tick, legacy, legacy_target, false);
+        assert!(legacy_context.mountain);
+        assert!(legacy_context.urban);
     }
 
     #[test]

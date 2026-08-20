@@ -42,6 +42,10 @@ browser runtime's shared mutable `main.js` structure.
 10. Apply strategic commands inside the owned runtime: desertion, capitulation
     unit removal and territory allocation, occupation creation, and terminal
     conflict resolution.
+11. Resolve the bounded live battlefield policy carried by optional v2 state:
+    current terrain/city/control context, encirclement combat and retreat
+    modifiers, local support/cohesion/repulsion, and pre-combat influence
+    eligibility.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -85,13 +89,16 @@ checked public combat API remains unchanged. War-grace short-circuiting skips
 only the proximity-contact loop; target selection and eligible direct combat
 still run, preserving the browser behavior.
 
-Terrain and country modifiers remain explicit caller inputs to the movement and
-combat kernels. The AI planner now owns deterministic contact selection,
-retreat decisions, sticky/capacity-limited frontline assignment,
-reinforcement, and fallback field movement. It returns both resolved unit
-orders and the assignment records needed by the next planning tick; it owns no
-clock, random source, or hidden assignment cache. That makes the output
-permutation-stable and keeps strategic policy outside the hot unit kernel.
+Terrain and country modifiers remain explicit inputs to the movement and combat
+kernels. The optional live battlefield layer now derives a bounded set of those
+inputs from current maps and units before invoking the kernels; older
+checkpoints continue supplying their frozen resolved inputs. The AI planner
+owns deterministic contact selection, retreat decisions,
+sticky/capacity-limited frontline assignment, reinforcement, and fallback
+field movement. It returns both resolved unit orders and the assignment records
+needed by the next planning tick; it owns no clock, random source, or hidden
+assignment cache. That makes the output permutation-stable and keeps policy
+resolution outside the hot unit kernel.
 
 The native-tick slice connects these boundaries into `mw-core::Simulation`. Each
 logical tick rebuilds one tactical snapshot, consumes caller-resolved orders,
@@ -122,17 +129,17 @@ slots, and publishes ordered AI objectives plus sticky prior assignments. A
 side receives slots only on a direction in which that side is hostile, so an
 asymmetric diplomacy matrix does not silently consume reverse-front capacity.
 
-`NativeRuntime` is the sole mutable owner of the live production slice. One
-logical step executes these boundaries in order:
-
-1. refresh the production front layout when due;
-2. resolve AI contacts and orders from immutable inputs;
-3. execute movement and immediate combat through `Simulation`;
-4. derive casualties and stamp surviving active-unit influence;
-5. advance or flush the territory census;
-6. prepare the atomic strategic cycle at its pay boundary; and
-7. stage and apply any desertion, capitulation, territory, and terminal
-   conflict consequences before committing and publishing that cycle.
+`NativeRuntime` is the sole mutable owner of the live production slice. With a
+live battlefield block, one logical step first samples pre-movement units and
+maps, stages eligible influence using the prior combat marker, and then derives
+current controller-dependent battlefield policy. It subsequently refreshes the
+production front layout when due, resolves AI contacts/orders and local
+cohesion/repulsion, executes movement and immediate combat, derives casualties,
+advances or flushes territory census work, and performs any due atomic
+strategic settlement before publishing. The staged influence is rolled back if
+a fallible pre-simulation boundary fails. Checkpoints without the optional
+block retain the older frozen-policy ordering, including post-simulation
+survivor influence stamping.
 
 Units still inside their deployment delay are published to the renderer, but
 are excluded from front slots, AI planning, tactical contacts, movement,
@@ -206,10 +213,37 @@ mid-war. The stable side topology includes capitulated countries, while
 
 The exporter writes unvaried influence radius/delta inputs plus the original
 browser unit seed. `NativeRuntime` recomputes the logical-tick mobilization ramp
-and deterministic radius/delta noise on every step. Terrain, urban defense,
-formation support, cohesion, encirclement, and similar resolved AI/combat
-modifiers are still captured at the handoff and then owned by native policy;
-porting their live resolvers remains later work.
+and deterministic radius/delta noise on every step. New v2 exports additionally
+carry an optional, all-or-nothing `native-battlefield-v1` block: exact terrain
+Float32 bits, urban centers, combat-versus-influence country primitives, and
+per-unit encirclement, armor-support, ally-strength, and cohesion state. When
+present, runtime samples the pre-movement unit/map state, resolves live
+movement/combat/influence modifiers, resolves local support and cohesion, then
+runs AI and simulation. Influence eligibility deliberately uses the prior
+combat marker so a unit entering combat still stamps on that tick and becomes
+suppressed on the following tick. Old checkpoints without the block keep their
+frozen resolved-policy semantics.
+
+This resolver is deliberately narrower than the complete browser tick.
+Encirclement history feeds combat and retreat modifiers, but browser
+encirclement attrition and supply-cutoff damage are not applied yet. Local
+repulsion does not yet suppress separation for units belonging to the same task
+force. Strategic command-band changes are settled, but they do not yet refresh
+the per-unit `refuses_offense` flag or corresponding resolved order policy.
+Influence cohort scheduling/frontier diffusion and live war-phase/posture
+transitions are also omitted.
+
+The native runtime advances `frame` once per successful logical step. The
+browser can run multiple logical subticks before advancing its RAF-owned
+`simFrameCount`, depending on speed and background cadence. A handoff preserves
+the captured numeric frame, but subsequent grace, active-combat, and long-war
+frame windows follow deterministic native cadence rather than reproducing a
+different browser scheduling cadence.
+
+Browser v2 exports carry the exact terrain plane used by this resolver. The
+standalone stock MWSC format has no `mountainData`; native-only bootstrap
+therefore explicitly disables mountain handling and seeds flat terrain instead
+of inferring it from unrelated scenario fields.
 
 V1 validation is unchanged: live v2 territory or nested casualty state is
 rejected under the v1 schema. Conversely, v2 requires `midWar`, immutable
@@ -234,10 +268,12 @@ applications. The published cell lists retain their sorted, unique contract,
 but ordered-tree lookup and allocation are removed from the source-stamping hot
 loop.
 
-The current territory boundary covers direct source stamping and attribution.
-The browser's separate frontier-diffusion pass and active-combat exclusion are
-still upstream work, so territory parity means parity with the checked-in
-bounded contract, not with every operation in the browser's full tick.
+The current territory boundary covers direct source stamping and attribution;
+`NativeRuntime` now handles active-combat source exclusion before calling it.
+The browser's three-cohort source scheduler and separate frontier-diffusion
+queues are still upstream work, so territory parity means parity with the
+checked-in bounded contract, not with every operation in the browser's full
+tick.
 
 The census processes deterministic tile-local work under an item budget. A
 generation is published only after every dirty tile, its cities, and any dirty
@@ -334,11 +370,22 @@ publication model for cities, frontlines, labels, and effects.
     save/reload native checkpoint v2 without a browser handoff. **Complete for
     all-Army land wars through the viewer and exact-step headless paths,
     including history-dependent frontline planner state.**
-14. Native UI/editor/community parity remains later work after the remaining
+14. Recompute live battlefield terrain, urban, encirclement, support,
+    concentration, cohesion, repulsion, and active-combat influence policy.
+    **Complete for the bounded optional-v2/native-bootstrap resolver; browser
+    attrition and supply-cutoff damage, task-force-aware repulsion suppression,
+    command-band-to-unit policy refresh, influence cohorts/frontier diffusion,
+    and live phase/posture remain pending. Older checkpoints intentionally
+    retain frozen-policy behavior.**
+15. Native UI/editor/community parity remains later work after the remaining
     simulation boundaries are chosen and measured.
 
-Air/naval simulation, the full gameplay HUD, map editor, online/community
-features, and satellite-map parity are still outside the native port.
+Browser influence cohort scheduling/frontier diffusion, live war-phase/posture
+transitions, encirclement attrition and supply-cutoff damage, task-force-aware
+repulsion suppression, command-band-to-unit order-policy refresh, air/naval
+simulation, the full gameplay HUD, map editor, online/community features, and
+satellite-map parity are still outside the native port. The migrated kernel and
+handoff contracts do not imply exact full-browser tick parity.
 
 Native-only startup accepts repeated `--side` selectors (numeric IDs or unique
 case-insensitive names), with deterministic all-Army bootstrap forces.

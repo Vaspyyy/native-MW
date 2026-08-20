@@ -20,6 +20,9 @@ reference while systems move into the renderer-independent `mw-core` crate.
   terminal conflict-resolution consequences
 - one `NativeRuntime` owner connecting front layout -> AI -> simulation ->
   territory -> strategic settlement
+- opt-in, bounded live battlefield resolution for current terrain/sea/city
+  context, encirclement-driven combat/retreat policy, armor support, formation
+  concentration, cohesion, local repulsion, and pre-combat influence exclusion
 - reference-counted immutable snapshots, FIFO territory render deltas, and a
   native `wgpu` unit overlay
 - a named dedicated simulation worker with bounded, lossless atomic
@@ -82,6 +85,18 @@ census remains active or dirty. It retains immutable baseline geography for
 scenario production derivation; the loader derives those immutable baselines
 first and only then overlays the committed live territory maps.
 
+New v2 exports also carry a strict optional `native-battlefield-v1` block with
+the exact Float32 terrain plane, urban centers, country primitives, and every
+unit's encirclement/support/cohesion memory. When present, `NativeRuntime`
+rebuilds position-dependent movement, combat, and influence policy every tick
+from live maps and units. Older v1/v2 files without the block remain valid and
+continue under their frozen resolved-policy contract.
+
+The browser v2 handoff supplies that exact terrain plane. Stock standalone
+MWSC files do not contain the browser's `mountainData`, so native-only bootstrap
+explicitly disables mountain handling and uses flat terrain rather than
+inventing elevation data.
+
 Run a browser-exported production checkpoint in the native viewer, or exercise
 the same dedicated runtime worker without creating a window or GPU device:
 
@@ -119,8 +134,9 @@ case-insensitive name) and uses deterministic all-Army bootstrap forces. Use
 supports `S` and save-on-exit when a path is configured. Native-written v2
 checkpoints retain frontline objectives, assignment priors, and the refresh
 phase, so resumed runs follow the same deterministic trajectory as an
-uninterrupted run. This path does not yet cover every browser AI/combat
-resolver or non-land force system.
+uninterrupted run. Stock MWSC bootstrap uses the explicit flat-terrain fallback
+described above. This path does not yet cover every browser AI/combat resolver
+or non-land force system.
 
 Checkpoint v2 is a resumable-running-state format. If a requested headless or
 windowed save reaches `ConflictResolved`, the runtime finishes cleanly and
@@ -226,12 +242,20 @@ terminal state instead of requiring an external acknowledge-and-continue
 step.
 
 This remains a bounded simulation port. Mid-war v2 does not serialize a
-partial census, render queues, or private front-assignment history; those are
-rebuilt at the save/load boundary. The surrender path does not yet include the
+partial census or render queues. The surrender path does not yet include the
 browser's releasables, province-border smoothing, equipment-reserve or air
-cleanup, or treaty/UI presentation. Frontier diffusion, active-combat source
-exclusion, air/naval simulation, and the full gameplay UI remain outside this
-slice.
+cleanup, or treaty/UI presentation. Encirclement history currently drives
+combat and retreat modifiers, but browser encirclement attrition and
+supply-cutoff damage remain pending. Repulsion is local and deterministic, but
+task-force-aware suppression is not represented yet. Strategic command-band
+changes do not yet refresh each unit's `refuses_offense` flag or resolved order
+policy. Browser influence cohort scheduling and frontier diffusion, live
+war-phase/posture transitions, air/naval simulation, and the full gameplay UI
+remain outside this slice. Native `frame` advances once per runtime step; a
+browser speed mode may execute several logical ticks in one RAF frame, so
+frame-window mechanics become deterministic native-step windows after handoff
+rather than preserving a different browser cadence. These bounded contracts
+are not a claim of exact full-browser tick parity.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the migration boundary.
 Measured Rust-versus-JavaScript results are recorded in

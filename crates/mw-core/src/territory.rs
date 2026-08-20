@@ -235,6 +235,31 @@ pub struct InfluenceApplyResult {
     pub changed_credit_cells: Vec<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct InfluenceCellUndo {
+    cell: usize,
+    primary_occupier: u16,
+    dominant_side: i16,
+    occupation: f32,
+}
+
+/// Sparse rollback record used by runtime to expose same-tick influence to planning while
+/// retaining the failed-step atomicity contract.
+pub(crate) struct InfluenceTransaction {
+    result: InfluenceApplyResult,
+    cells: Vec<InfluenceCellUndo>,
+    side_influence: Vec<f32>,
+    census_dirty: BTreeSet<usize>,
+    render_dirty: BTreeSet<usize>,
+    mutation_sequence: u64,
+}
+
+impl InfluenceTransaction {
+    pub(crate) fn result(&self) -> &InfluenceApplyResult {
+        &self.result
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CensusStepResult {
     pub processed_items: usize,
@@ -420,6 +445,7 @@ pub struct TerritoryControl {
     cities_by_tile: BTreeMap<usize, Vec<CityRef>>,
     city_cell_mask: Vec<bool>,
     influence_cell_changes: InfluenceCellChanges,
+    influence_undo_mask: Vec<bool>,
     protected_owner_ids: BTreeSet<u16>,
     census_dirty: BTreeSet<usize>,
     render_dirty: BTreeSet<usize>,
@@ -464,6 +490,7 @@ impl TerritoryControl {
             cities_by_tile,
             city_cell_mask,
             influence_cell_changes: InfluenceCellChanges::new(total_cells),
+            influence_undo_mask: vec![false; total_cells],
             protected_owner_ids: config.protected_owner_ids,
             census_dirty: all_tiles.clone(),
             render_dirty: all_tiles,
@@ -953,11 +980,61 @@ impl TerritoryControl {
         let mut changes = std::mem::take(&mut self.influence_cell_changes);
         let mut counts = InfluenceApplyCounts::default();
         for source in sources {
-            self.apply_source(source, &mut changes, &mut counts);
+            self.apply_source(source, &mut changes, &mut counts, None);
         }
         let result = changes.finish(counts);
         self.influence_cell_changes = changes;
         Ok(result)
+    }
+
+    /// Apply a validated influence batch immediately and return the exact sparse state required
+    /// to undo it. Runtime uses this to let controller changes feed same-tick planning without a
+    /// full-world clone; dropping the transaction commits it.
+    pub(crate) fn apply_influence_sources_staged(
+        &mut self,
+        sources: &[InfluenceSource],
+    ) -> Result<InfluenceTransaction, TerritoryError> {
+        for source in sources {
+            validate_source(source, self.max_sides)?;
+        }
+        let mut transaction = InfluenceTransaction {
+            result: InfluenceApplyResult::default(),
+            cells: Vec::new(),
+            side_influence: Vec::new(),
+            census_dirty: self.census_dirty.clone(),
+            render_dirty: self.render_dirty.clone(),
+            mutation_sequence: self.mutation_sequence,
+        };
+        let mut changes = std::mem::take(&mut self.influence_cell_changes);
+        let mut counts = InfluenceApplyCounts::default();
+        for source in sources {
+            self.apply_source(source, &mut changes, &mut counts, Some(&mut transaction));
+        }
+        transaction.result = changes.finish(counts);
+        self.influence_cell_changes = changes;
+        for undo in &transaction.cells {
+            self.influence_undo_mask[undo.cell] = false;
+        }
+        Ok(transaction)
+    }
+
+    pub(crate) fn rollback_influence_transaction(&mut self, transaction: InfluenceTransaction) {
+        debug_assert_eq!(
+            transaction.side_influence.len(),
+            transaction.cells.len() * self.max_sides
+        );
+        for (position, undo) in transaction.cells.into_iter().enumerate() {
+            self.maps.primary_occupier[undo.cell] = undo.primary_occupier;
+            self.maps.dominant_side[undo.cell] = undo.dominant_side;
+            self.maps.occupation[undo.cell] = undo.occupation;
+            for side in 0..self.max_sides {
+                self.maps.side_influence[side][undo.cell] =
+                    transaction.side_influence[position * self.max_sides + side];
+            }
+        }
+        self.census_dirty = transaction.census_dirty;
+        self.render_dirty = transaction.render_dirty;
+        self.mutation_sequence = transaction.mutation_sequence;
     }
 
     fn apply_source(
@@ -965,6 +1042,7 @@ impl TerritoryControl {
         source: &InfluenceSource,
         changes: &mut InfluenceCellChanges,
         counts: &mut InfluenceApplyCounts,
+        mut transaction: Option<&mut InfluenceTransaction>,
     ) {
         // Exact browser floor-and-clamp bounds and lower-edge cell coordinates.
         let sy =
@@ -1010,6 +1088,24 @@ impl TerritoryControl {
                     continue;
                 }
                 counts.processed_source_cells += 1;
+
+                if let Some(transaction) = transaction.as_deref_mut()
+                    && !self.influence_undo_mask[i]
+                {
+                    self.influence_undo_mask[i] = true;
+                    transaction.cells.push(InfluenceCellUndo {
+                        cell: i,
+                        primary_occupier: self.maps.primary_occupier[i],
+                        dominant_side: self.maps.dominant_side[i],
+                        occupation: self.maps.occupation[i],
+                    });
+                    transaction.side_influence.extend(
+                        self.maps
+                            .side_influence
+                            .iter()
+                            .map(|influence| influence[i]),
+                    );
+                }
 
                 let mut cell_delta = source.delta;
                 if self.city_cell_mask[i] {
@@ -2316,6 +2412,48 @@ mod tests {
         assert_eq!(result.touched_influence_cells, vec![1]);
         assert_eq!(result.changed_controller_cells, vec![1]);
         assert_eq!(result.changed_credit_cells, vec![1]);
+    }
+
+    #[test]
+    fn staged_influence_rollback_restores_maps_and_dirty_state_exactly() {
+        let mut c = config(3, 1, 2, 1);
+        c.maps.world_control.fill(3);
+        c.maps.de_jure.fill(3);
+        let mut first = source(0, 1, -90.0, -178.0);
+        first.radius = 0.5;
+        first.delta = 0.4;
+        let mut opposing = source(1, 2, -90.0, -178.0);
+        opposing.id = 2;
+        opposing.radius = 0.5;
+        opposing.delta = 1.0;
+        opposing.owner_ally_country_ids.clear();
+
+        let mut staged = TerritoryControl::new(c.clone()).unwrap();
+        staged.mark_cells(&[1], false).unwrap();
+        let maps_before = staged.checkpoint_maps();
+        let census_dirty_before = staged.census_dirty.clone();
+        let render_dirty_before = staged.render_dirty.clone();
+        let mutation_before = staged.mutation_sequence;
+        let transaction = staged
+            .apply_influence_sources_staged(&[first.clone(), opposing.clone()])
+            .unwrap();
+        assert_ne!(staged.checkpoint_maps(), maps_before);
+        staged.rollback_influence_transaction(transaction);
+
+        assert_eq!(staged.checkpoint_maps(), maps_before);
+        assert_eq!(staged.census_dirty, census_dirty_before);
+        assert_eq!(staged.render_dirty, render_dirty_before);
+        assert_eq!(staged.mutation_sequence, mutation_before);
+
+        let mut clean = TerritoryControl::new(c).unwrap();
+        clean.mark_cells(&[1], false).unwrap();
+        let staged_result = staged
+            .apply_influence_sources(&[first.clone(), opposing.clone()])
+            .unwrap();
+        let clean_result = clean.apply_influence_sources(&[first, opposing]).unwrap();
+        assert_eq!(staged_result, clean_result);
+        assert_eq!(staged.checkpoint_maps(), clean.checkpoint_maps());
+        assert_eq!(staged.census_status(), clean.census_status());
     }
 
     #[test]

@@ -200,11 +200,13 @@ integrity signal, not a native dirty-tile upload benchmark. The canonical
 dirty-tail census publication, reset/replace behavior, aggregate snapshots,
 and tile payloads.
 
-This slice ports deterministic source stamping, hostile influence decay,
-control/credit attribution, census, and render invalidation. It does not yet
-include the browser's separate frontier-diffusion pass or its active-combat
-source exclusion; the JavaScript runner is the frozen cross-language contract
-for this bounded slice, not a claim of complete browser territory-tick parity.
+This direct territory slice ports deterministic source stamping, hostile
+influence decay, control/credit attribution, census, and render invalidation.
+The higher-level native runtime now performs active-combat source exclusion,
+but this standalone benchmark does not. Browser frontier diffusion and its
+three-cohort source scheduler remain outside both runners, so the JavaScript
+runner is a bounded contract rather than complete browser territory-tick
+parity.
 
 Reproduce the workload (the generated JSON is intentionally large because it
 contains the dense browser-compatible maps):
@@ -340,6 +342,11 @@ trips the safety gate rather than being acknowledged silently. The measured
 full-cap fixture stays `running`, so the table does not claim timings for
 capitulation allocation or conflict termination.
 
+Command-band evaluation in this measured slice settles strategic state, but a
+live command-band transition does not yet refresh each unit's
+`refuses_offense` flag or its resolved order policy. The timing should not be
+read as covering that remaining feedback path.
+
 Reproduce production inspection, the canonical deterministic replay, and the
 4,800-unit workload:
 
@@ -393,13 +400,27 @@ last refresh tick, which makes split and uninterrupted native runs exactly
 comparable across a refresh boundary. Browser v2 exports omit that optional
 block and intentionally begin from a fresh deterministic front layout. The
 native runtime recomputes the browser's logical-tick influence ramp and
-deterministic radius/delta noise from the exported unit seed. Other terrain-,
-urban-, cohesion-, and live-state
-modifiers are resolved at handoff and become native-owned inputs; this is a
-production boundary, not a claim that the remaining browser tick has already
-been ported. A v2 restore rebuilds private territory summaries; partial census
-work and render queues are not serialized. Map-only viewing and the small
-scenario-derived `--demo-units` runtime remain separate modes.
+deterministic radius/delta noise from the exported unit seed. A strict optional
+`native-battlefield-v1` block lets it also recompute terrain, city, formation,
+encirclement combat/retreat, armor-support, cohesion, local repulsion, and
+prior-combat influence policy from current positions and maps. Encirclement
+history does not yet apply the browser's attrition or supply-cutoff damage, and
+repulsion does not yet implement task-force-aware suppression. Strategic
+command-band changes also do not refresh per-unit `refuses_offense` or order
+policy. Browser influence cohorts/frontier diffusion and live war-phase/posture
+remain omitted. Native frames advance once per logical runtime step, so
+frame-window mechanics after handoff follow native cadence rather than a
+browser speed mode that batches several ticks into one RAF frame. Old saves
+without the block retain their frozen resolved inputs.
+
+Browser v2 handoffs carry the exact Float32 terrain plane. Standalone stock
+MWSC files lack `mountainData`, so native bootstrap explicitly disables
+mountains and uses flat terrain. The full-cap timings above use the frozen
+stress fixture and therefore do not measure the live resolver or any of these
+pending paths; they are not a claim of complete browser-tick parity. A v2
+restore rebuilds private territory summaries; partial census work and render
+queues are not serialized. Map-only viewing and the small scenario-derived
+`--demo-units` runtime remain separate modes.
 
 Native save/reload equivalence assumes the canonical runtime configuration
 used by the CLI. The writer rejects custom cadence/kernel or noncanonical

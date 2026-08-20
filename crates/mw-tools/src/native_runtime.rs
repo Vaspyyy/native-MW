@@ -20,15 +20,17 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use mw_core::{
-    ARMOR_PAYROLL_PER_100, CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand,
-    ConflictResolutionPlan, DecodedScenario, EconomyState, FrontLayoutPrior, FrontObjective,
+    ARMOR_PAYROLL_PER_100, BATTLEFIELD_SCHEMA_VERSION, BattlefieldBuff, BattlefieldConfig,
+    BattlefieldRuntimeState, BattlefieldUnitState, BattlefieldUrbanCenter, BattlefieldWarPhase,
+    CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand, ConflictResolutionPlan,
+    CountryBattlefieldPrimitives, DecodedScenario, EconomyState, FrontLayoutPrior, FrontObjective,
     GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime, OccupationState, PAYROLL_PER_UNIT,
     ProductionConfig, ResolvedCombatModifiers, ResolvedMovementModifiers, RuntimeCheckpoint,
     RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy,
     STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
     StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState,
     TerritoryConfig, TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitInfluencePolicy, UnitKind,
-    decode_mwsc_gzip, derive_scenario_production,
+    WorldGridView, decode_mwsc_gzip, derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -216,6 +218,30 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         .iter()
         .map(|unit| unit.combat.id)
         .collect::<BTreeSet<_>>();
+    let battlefield = state
+        .battlefield
+        .as_ref()
+        .map(|battlefield| {
+            let world = WorldGridView::new(
+                state.territory_config.grid_resolution,
+                state.territory_config.width,
+                state.territory_config.height,
+                &state.territory_config.maps.land,
+            )?;
+            let live_unit_ids = state
+                .units
+                .iter()
+                .map(|unit| unit.combat.id)
+                .collect::<Vec<_>>();
+            battlefield.validate(
+                world,
+                state.territory_config.max_sides,
+                &state.territory_config.country_to_side,
+                &live_unit_ids,
+            )?;
+            battlefield_fixture(battlefield, state.tick)
+        })
+        .transpose()?;
     validate_planner_fixture(
         &planner,
         state.tick,
@@ -256,7 +282,7 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         })
         .collect::<Result<Vec<_>>>()?;
     let maps = &state.territory_config.maps;
-    let body = json!({
+    let mut body = json!({
         "schema": NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
         "checkpointBoundary": "midWar",
         "scenario": {"sha256": sha256_hex(raw), "name": name, "gridRes": state.territory_config.grid_resolution},
@@ -280,6 +306,11 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         }, "revisions": {"topologyRevision": state.territory_config.topology_revision, "worldRevision": state.territory_config.world_revision, "cityRevision": state.territory_config.city_revision},
         "committedCensus": state.territory_committed_state}
     });
+    if let Some(battlefield) = battlefield {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert("battlefield".to_owned(), serde_json::to_value(battlefield)?);
+    }
     let bytes = serde_json::to_vec(&body)?;
     let parent = checkpoint_output_parent(output);
     if !parent.exists() {
@@ -475,6 +506,50 @@ fn rle<T: Copy + PartialEq + serde::Serialize>(values: &[T]) -> Vec<(u64, T)> {
         out.push((1, value));
     }
     out
+}
+
+fn battlefield_fixture(
+    battlefield: &BattlefieldRuntimeState,
+    checkpoint_tick: u64,
+) -> Result<BattlefieldFixture> {
+    if let Some((&unit_id, state)) = battlefield.units.iter().find(|(_, state)| {
+        state
+            .armor_support_last_tick
+            .is_some_and(|tick| tick > checkpoint_tick)
+    }) {
+        bail!(
+            "battlefield unit {unit_id} armor support tick {:?} is newer than checkpoint tick {checkpoint_tick}",
+            state.armor_support_last_tick
+        );
+    }
+    Ok(BattlefieldFixture {
+        schema: BATTLEFIELD_SCHEMA_VERSION.to_owned(),
+        mountains_enabled: battlefield.mountains_enabled,
+        terrain_intensity_bits_runs: rle(&battlefield
+            .terrain_intensity
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()),
+        urban_centers: battlefield
+            .urban_centers
+            .iter()
+            .copied()
+            .map(BattlefieldUrbanCenterFixture::from)
+            .collect(),
+        config: battlefield.config.into(),
+        countries: battlefield
+            .countries
+            .iter()
+            .map(|(&country_id, &country)| {
+                BattlefieldCountryFixture::from_primitives(country_id, country)
+            })
+            .collect(),
+        units: battlefield
+            .units
+            .iter()
+            .map(|(&unit_id, &state)| BattlefieldUnitStateFixture::from_state(unit_id, state))
+            .collect(),
+    })
 }
 
 fn unit_json(unit: &SimulationUnit, policy: &RuntimeUnitPolicy) -> Value {
@@ -896,6 +971,9 @@ struct RuntimeCheckpointFixture {
     geography: Option<GeographyFixture>,
     #[serde(default)]
     territory: Option<TerritoryV2Fixture>,
+    /// Optional raw battlefield inputs. Absence preserves the legacy frozen-policy mode.
+    #[serde(default, deserialize_with = "deserialize_optional_battlefield_fixture")]
+    battlefield: Option<BattlefieldFixture>,
     sides: Vec<SideFixture>,
     active_sides: Vec<u16>,
     hostility_matrix: Vec<u8>,
@@ -1084,6 +1162,275 @@ struct TerritoryCommittedCensusFixture {
     mutation_sequence: u64,
     processed_tiles: usize,
     processed_items: usize,
+}
+
+/// Complete live battlefield inputs. The root field is optional for old checkpoints, but once
+/// this object is present every field is required and unknown fields are rejected.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BattlefieldFixture {
+    schema: String,
+    mountains_enabled: bool,
+    terrain_intensity_bits_runs: Vec<(u64, u32)>,
+    urban_centers: Vec<BattlefieldUrbanCenterFixture>,
+    config: BattlefieldConfigFixture,
+    countries: Vec<BattlefieldCountryFixture>,
+    units: Vec<BattlefieldUnitStateFixture>,
+}
+
+fn deserialize_optional_battlefield_fixture<'de, D>(
+    deserializer: D,
+) -> Result<Option<BattlefieldFixture>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    BattlefieldFixture::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BattlefieldConfigFixture {
+    unit_speed: f64,
+    unit_naval_speed: f64,
+    influence_rate: f64,
+    influence_radius: f64,
+    encirclement_radius: f64,
+    alpen_mountain_speed_multiplier: f64,
+    alpen_combat_multiplier: f64,
+    native_speed_scale: f64,
+    active_combat_exclusion_frames: u64,
+    long_war_frame_threshold: u64,
+    long_war_defense_multiplier: f64,
+    armor_support_radius: f64,
+    armor_support_memory_ticks: u64,
+}
+
+impl From<BattlefieldConfigFixture> for BattlefieldConfig {
+    fn from(value: BattlefieldConfigFixture) -> Self {
+        Self {
+            unit_speed: value.unit_speed,
+            unit_naval_speed: value.unit_naval_speed,
+            influence_rate: value.influence_rate,
+            influence_radius: value.influence_radius,
+            encirclement_radius: value.encirclement_radius,
+            armor_support_radius: value.armor_support_radius,
+            armor_support_memory_ticks: value.armor_support_memory_ticks,
+            alpen_mountain_speed_multiplier: value.alpen_mountain_speed_multiplier,
+            alpen_combat_multiplier: value.alpen_combat_multiplier,
+            native_speed_scale: value.native_speed_scale,
+            active_combat_exclusion_frames: value.active_combat_exclusion_frames,
+            long_war_frame_threshold: value.long_war_frame_threshold,
+            long_war_defense_multiplier: value.long_war_defense_multiplier,
+        }
+    }
+}
+
+impl From<BattlefieldConfig> for BattlefieldConfigFixture {
+    fn from(value: BattlefieldConfig) -> Self {
+        Self {
+            unit_speed: value.unit_speed,
+            unit_naval_speed: value.unit_naval_speed,
+            influence_rate: value.influence_rate,
+            influence_radius: value.influence_radius,
+            encirclement_radius: value.encirclement_radius,
+            alpen_mountain_speed_multiplier: value.alpen_mountain_speed_multiplier,
+            alpen_combat_multiplier: value.alpen_combat_multiplier,
+            native_speed_scale: value.native_speed_scale,
+            active_combat_exclusion_frames: value.active_combat_exclusion_frames,
+            long_war_frame_threshold: value.long_war_frame_threshold,
+            long_war_defense_multiplier: value.long_war_defense_multiplier,
+            armor_support_radius: value.armor_support_radius,
+            armor_support_memory_ticks: value.armor_support_memory_ticks,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BattlefieldUrbanCenterFixture {
+    id: u64,
+    country_id: u16,
+    cell: usize,
+    lat: f64,
+    lng: f64,
+}
+
+impl From<BattlefieldUrbanCenterFixture> for BattlefieldUrbanCenter {
+    fn from(value: BattlefieldUrbanCenterFixture) -> Self {
+        Self {
+            id: value.id,
+            country_id: value.country_id,
+            cell: value.cell,
+            lat: value.lat,
+            lng: value.lng,
+        }
+    }
+}
+
+impl From<BattlefieldUrbanCenter> for BattlefieldUrbanCenterFixture {
+    fn from(value: BattlefieldUrbanCenter) -> Self {
+        Self {
+            id: value.id,
+            country_id: value.country_id,
+            cell: value.cell,
+            lat: value.lat,
+            lng: value.lng,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum BattlefieldBuffFixture {
+    None,
+    Buff,
+    Super,
+    Godly,
+    Weakened,
+    Crippled,
+}
+
+impl From<BattlefieldBuffFixture> for BattlefieldBuff {
+    fn from(value: BattlefieldBuffFixture) -> Self {
+        match value {
+            BattlefieldBuffFixture::None => Self::None,
+            BattlefieldBuffFixture::Buff => Self::Buff,
+            BattlefieldBuffFixture::Super => Self::Super,
+            BattlefieldBuffFixture::Godly => Self::Godly,
+            BattlefieldBuffFixture::Weakened => Self::Weakened,
+            BattlefieldBuffFixture::Crippled => Self::Crippled,
+        }
+    }
+}
+
+impl From<BattlefieldBuff> for BattlefieldBuffFixture {
+    fn from(value: BattlefieldBuff) -> Self {
+        match value {
+            BattlefieldBuff::None => Self::None,
+            BattlefieldBuff::Buff => Self::Buff,
+            BattlefieldBuff::Super => Self::Super,
+            BattlefieldBuff::Godly => Self::Godly,
+            BattlefieldBuff::Weakened => Self::Weakened,
+            BattlefieldBuff::Crippled => Self::Crippled,
+        }
+    }
+}
+
+/// The browser exposes four phase labels, but RETREATING and STALEMATE have identical live
+/// battlefield behavior. Core intentionally normalizes both to Stable.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum BattlefieldWarPhaseFixture {
+    #[serde(rename = "ADVANCING")]
+    Advancing,
+    #[serde(rename = "STALEMATE")]
+    Stalemate,
+    #[serde(rename = "RETREATING")]
+    Retreating,
+    #[serde(rename = "COLLAPSING")]
+    Collapsing,
+}
+
+impl From<BattlefieldWarPhaseFixture> for BattlefieldWarPhase {
+    fn from(value: BattlefieldWarPhaseFixture) -> Self {
+        match value {
+            BattlefieldWarPhaseFixture::Advancing => Self::Advancing,
+            BattlefieldWarPhaseFixture::Collapsing => Self::Collapsing,
+            BattlefieldWarPhaseFixture::Stalemate | BattlefieldWarPhaseFixture::Retreating => {
+                Self::Stable
+            }
+        }
+    }
+}
+
+impl From<BattlefieldWarPhase> for BattlefieldWarPhaseFixture {
+    fn from(value: BattlefieldWarPhase) -> Self {
+        match value {
+            BattlefieldWarPhase::Advancing => Self::Advancing,
+            BattlefieldWarPhase::Collapsing => Self::Collapsing,
+            BattlefieldWarPhase::Stable => Self::Stalemate,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BattlefieldCountryFixture {
+    country_id: u16,
+    combat_buff: BattlefieldBuffFixture,
+    influence_buff: BattlefieldBuffFixture,
+    attack_buff_percent: f64,
+    defense_buff_percent: f64,
+    capital_lost: bool,
+    war_phase: BattlefieldWarPhaseFixture,
+    conquest_mode: bool,
+    ai_speed_multiplier: f64,
+}
+
+impl BattlefieldCountryFixture {
+    fn primitives(self) -> CountryBattlefieldPrimitives {
+        CountryBattlefieldPrimitives {
+            combat_buff: self.combat_buff.into(),
+            influence_buff: self.influence_buff.into(),
+            attack_buff_percent: self.attack_buff_percent,
+            defense_buff_percent: self.defense_buff_percent,
+            capital_lost: self.capital_lost,
+            war_phase: self.war_phase.into(),
+            conquest_mode: self.conquest_mode,
+            ai_speed_multiplier: self.ai_speed_multiplier,
+        }
+    }
+
+    fn from_primitives(country_id: u16, value: CountryBattlefieldPrimitives) -> Self {
+        Self {
+            country_id,
+            combat_buff: value.combat_buff.into(),
+            influence_buff: value.influence_buff.into(),
+            attack_buff_percent: value.attack_buff_percent,
+            defense_buff_percent: value.defense_buff_percent,
+            capital_lost: value.capital_lost,
+            war_phase: value.war_phase.into(),
+            conquest_mode: value.conquest_mode,
+            ai_speed_multiplier: value.ai_speed_multiplier,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BattlefieldUnitStateFixture {
+    unit_id: u64,
+    is_alpenjager: bool,
+    cohesion_seed: f64,
+    local_tactics_excluded: bool,
+    encircled_ticks: u64,
+    #[serde(deserialize_with = "deserialize_required_nullable_tick")]
+    armor_support_last_tick: Option<u64>,
+    last_ally_count: f64,
+}
+
+impl BattlefieldUnitStateFixture {
+    fn state(self) -> BattlefieldUnitState {
+        BattlefieldUnitState {
+            is_alpenjager: self.is_alpenjager,
+            cohesion_seed: self.cohesion_seed,
+            local_tactics_excluded: self.local_tactics_excluded,
+            encircled_ticks: self.encircled_ticks,
+            armor_support_last_tick: self.armor_support_last_tick,
+            last_ally_count: self.last_ally_count,
+        }
+    }
+
+    fn from_state(unit_id: u64, value: BattlefieldUnitState) -> Self {
+        Self {
+            unit_id,
+            is_alpenjager: value.is_alpenjager,
+            cohesion_seed: value.cohesion_seed,
+            local_tactics_excluded: value.local_tactics_excluded,
+            encircled_ticks: value.encircled_ticks,
+            armor_support_last_tick: value.armor_support_last_tick,
+            last_ally_count: value.last_ally_count,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1325,6 +1672,7 @@ struct PreparedRuntime {
     country_to_side: BTreeMap<u16, usize>,
     coalition_by_side: Vec<BTreeSet<u16>>,
     live_territory_maps: Option<TerritoryMaps>,
+    battlefield: Option<BattlefieldRuntimeState>,
 }
 
 /// Fully validated production handoff for native rendering and simulation.
@@ -1440,6 +1788,26 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         decoded.de_jure.clone_from(&maps.de_jure);
     }
     validate_checkpoint_against_scenario(&checkpoint, &production, &country_to_side)?;
+    let live_unit_ids = checkpoint
+        .units
+        .iter()
+        .map(|unit| unit.id)
+        .collect::<Vec<_>>();
+    let battlefield = checkpoint
+        .battlefield
+        .as_ref()
+        .map(|battlefield| {
+            decode_battlefield(
+                battlefield,
+                decoded.target,
+                &decoded.land,
+                checkpoint.sides.len(),
+                &country_to_side,
+                &live_unit_ids,
+                checkpoint.tick,
+            )
+        })
+        .transpose()?;
 
     Ok(PreparedRuntime {
         raw_sha256,
@@ -1451,6 +1819,7 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         country_to_side,
         coalition_by_side,
         live_territory_maps,
+        battlefield,
     })
 }
 
@@ -1537,6 +1906,93 @@ fn decode_territory_v2(
         occupation,
         side_influence,
     })
+}
+
+fn decode_battlefield(
+    battlefield: &BattlefieldFixture,
+    grid: GridSpec,
+    land: &[u8],
+    max_sides: usize,
+    country_to_side: &BTreeMap<u16, usize>,
+    live_unit_ids: &[u64],
+    checkpoint_tick: u64,
+) -> Result<BattlefieldRuntimeState> {
+    if battlefield.schema != BATTLEFIELD_SCHEMA_VERSION {
+        bail!(
+            "unsupported battlefield schema {:?}; expected {:?}",
+            battlefield.schema,
+            BATTLEFIELD_SCHEMA_VERSION
+        );
+    }
+    if battlefield
+        .terrain_intensity_bits_runs
+        .windows(2)
+        .any(|runs| runs[0].1 == runs[1].1)
+    {
+        bail!("battlefield terrain intensity runs must be maximal");
+    }
+    let terrain_intensity = decode_runs(
+        &battlefield.terrain_intensity_bits_runs,
+        grid.cell_count()?,
+        "battlefield.terrainIntensityBitsRuns",
+        |bits| {
+            let value = f32::from_bits(*bits);
+            (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+        },
+    )?;
+
+    if battlefield.urban_centers.iter().any(|city| city.id == 0) {
+        bail!("battlefield urban center ids must be positive");
+    }
+
+    let mut countries = BTreeMap::new();
+    for country in battlefield.countries.iter().copied() {
+        if countries
+            .insert(country.country_id, country.primitives())
+            .is_some()
+        {
+            bail!(
+                "battlefield countries contain duplicate country id {}",
+                country.country_id
+            );
+        }
+    }
+
+    let mut units = BTreeMap::new();
+    for unit in battlefield.units.iter().copied() {
+        if unit
+            .armor_support_last_tick
+            .is_some_and(|support_tick| support_tick > checkpoint_tick)
+        {
+            bail!(
+                "battlefield unit {} armorSupportLastTick cannot be newer than checkpoint tick",
+                unit.unit_id
+            );
+        }
+        if units.insert(unit.unit_id, unit.state()).is_some() {
+            bail!(
+                "battlefield units contain duplicate unit id {}",
+                unit.unit_id
+            );
+        }
+    }
+
+    let state = BattlefieldRuntimeState {
+        config: battlefield.config.into(),
+        mountains_enabled: battlefield.mountains_enabled,
+        terrain_intensity,
+        urban_centers: battlefield
+            .urban_centers
+            .iter()
+            .copied()
+            .map(BattlefieldUrbanCenter::from)
+            .collect(),
+        countries,
+        units,
+    };
+    let world = WorldGridView::new(grid.grid_res, grid.width, grid.height, land)?;
+    state.validate(world, max_sides, country_to_side, live_unit_ids)?;
+    Ok(state)
 }
 
 fn validate_live_territory_owners(
@@ -1669,6 +2125,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
         NATIVE_RUNTIME_CHECKPOINT_SCHEMA => {
             if checkpoint.checkpoint_boundary == CheckpointBoundary::MidWar
                 || checkpoint.territory.is_some()
+                || checkpoint.battlefield.is_some()
                 || !checkpoint.casualties_by_victim.is_empty()
                 || checkpoint.planner.is_some()
             {
@@ -2190,6 +2647,8 @@ impl RuntimeUnitFixture {
                     long_war_defense: ai.long_war_defense,
                     mountain: ai.mountain,
                     urban: ai.urban,
+                    current_cell_mountain: None,
+                    current_cell_urban: None,
                 },
                 is_reserve: ai.is_reserve,
                 reinforcement_eligible: ai.reinforcement_eligible,
@@ -2305,6 +2764,7 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
             active_sides: checkpoint.active_sides.clone(),
         },
         unit_policies,
+        battlefield: prepared.battlefield.clone(),
         objectives,
         prior_objective_by_unit,
         front_prior_by_unit,
@@ -3623,6 +4083,46 @@ mod tests {
         }
     }
 
+    fn valid_battlefield() -> BattlefieldFixture {
+        BattlefieldFixture {
+            schema: BATTLEFIELD_SCHEMA_VERSION.to_owned(),
+            mountains_enabled: true,
+            terrain_intensity_bits_runs: vec![
+                (1, 0.0_f32.to_bits()),
+                (2, f32::from_bits(0x3eaa_aaab).to_bits()),
+                (1, 0.0_f32.to_bits()),
+            ],
+            urban_centers: vec![BattlefieldUrbanCenterFixture {
+                id: 11,
+                country_id: 1,
+                cell: 0,
+                lat: -89.5,
+                lng: -179.5,
+            }],
+            config: BattlefieldConfig::default().into(),
+            countries: vec![BattlefieldCountryFixture {
+                country_id: 1,
+                combat_buff: BattlefieldBuffFixture::Super,
+                influence_buff: BattlefieldBuffFixture::Weakened,
+                attack_buff_percent: 12.5,
+                defense_buff_percent: 7.5,
+                capital_lost: true,
+                war_phase: BattlefieldWarPhaseFixture::Retreating,
+                conquest_mode: false,
+                ai_speed_multiplier: 1.25,
+            }],
+            units: vec![BattlefieldUnitStateFixture {
+                unit_id: 7,
+                is_alpenjager: true,
+                cohesion_seed: 0.375,
+                local_tactics_excluded: false,
+                encircled_ticks: 61,
+                armor_support_last_tick: Some(9),
+                last_ally_count: 4.0,
+            }],
+        }
+    }
+
     fn minimal_checkpoint(
         schema: &str,
         boundary: CheckpointBoundary,
@@ -3642,6 +4142,7 @@ mod tests {
                 de_jure_runs: vec![(4, 1)],
             }),
             territory,
+            battlefield: None,
             sides: vec![SideFixture {
                 side_index: 0,
                 country_ids: vec![1],
@@ -3860,6 +4361,138 @@ mod tests {
         assert_eq!(decoded.occupation, [0.25, 0.25, -0.5, -0.5]);
         assert_eq!(decoded.side_influence[0], [1.0, 1.0, 0.0, 0.0]);
         assert_eq!(decoded.side_influence[1], [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn battlefield_block_is_optional_but_present_object_is_strict_and_complete() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OptionalBattlefield {
+            #[serde(default, deserialize_with = "deserialize_optional_battlefield_fixture")]
+            battlefield: Option<BattlefieldFixture>,
+        }
+
+        let absent: OptionalBattlefield = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.battlefield.is_none());
+        assert!(
+            serde_json::from_value::<OptionalBattlefield>(json!({"battlefield": null})).is_err()
+        );
+
+        let encoded = serde_json::to_value(valid_battlefield()).unwrap();
+        let present: OptionalBattlefield =
+            serde_json::from_value(json!({"battlefield": encoded.clone()})).unwrap();
+        assert!(present.battlefield.is_some());
+
+        let mut missing = encoded.clone();
+        missing.as_object_mut().unwrap().remove("config");
+        assert!(serde_json::from_value::<BattlefieldFixture>(missing).is_err());
+
+        let mut unknown = encoded.clone();
+        unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<BattlefieldFixture>(unknown).is_err());
+
+        let mut missing_nullable = encoded.clone();
+        missing_nullable["units"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("armorSupportLastTick");
+        assert!(serde_json::from_value::<BattlefieldFixture>(missing_nullable).is_err());
+
+        let mut invalid_phase = encoded;
+        invalid_phase["countries"][0]["warPhase"] = json!("STABLE");
+        assert!(serde_json::from_value::<BattlefieldFixture>(invalid_phase).is_err());
+    }
+
+    #[test]
+    fn battlefield_decode_is_exact_reference_checked_and_round_trips_core_state() {
+        let grid = GridSpec {
+            grid_res: 1.0,
+            width: 2,
+            height: 2,
+        };
+        let land = [2, 2, 2, 2];
+        let topology = BTreeMap::from([(1, 0_usize)]);
+        let state =
+            decode_battlefield(&valid_battlefield(), grid, &land, 1, &topology, &[7], 10).unwrap();
+        assert_eq!(
+            state
+                .terrain_intensity
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [
+                0.0_f32.to_bits(),
+                0x3eaa_aaab,
+                0x3eaa_aaab,
+                0.0_f32.to_bits()
+            ]
+        );
+        assert_eq!(state.countries[&1].war_phase, BattlefieldWarPhase::Stable);
+        assert_eq!(state.units[&7].encircled_ticks, 61);
+        assert_eq!(state.units[&7].armor_support_last_tick, Some(9));
+
+        let encoded = battlefield_fixture(&state, 10).unwrap();
+        assert_eq!(encoded.schema, BATTLEFIELD_SCHEMA_VERSION);
+        assert!(matches!(
+            encoded.countries[0].war_phase,
+            BattlefieldWarPhaseFixture::Stalemate
+        ));
+        let restored = decode_battlefield(&encoded, grid, &land, 1, &topology, &[7], 10).unwrap();
+        assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn battlefield_decode_rejects_corruption_and_incomplete_coverage() {
+        let grid = GridSpec {
+            grid_res: 1.0,
+            width: 2,
+            height: 2,
+        };
+        let land = [2, 2, 2, 2];
+        let topology = BTreeMap::from([(1, 0_usize)]);
+        let decode = |fixture: &BattlefieldFixture| {
+            decode_battlefield(fixture, grid, &land, 1, &topology, &[7], 10)
+        };
+
+        let mut invalid = valid_battlefield();
+        invalid.schema = "battlefield-v0".to_owned();
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.terrain_intensity_bits_runs = vec![(2, 0), (2, 0)];
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.terrain_intensity_bits_runs = vec![(4, f32::NAN.to_bits())];
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.terrain_intensity_bits_runs = vec![(4, 1.01_f32.to_bits())];
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.countries.clear();
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.countries.push(invalid.countries[0]);
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.units.clear();
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.units[0].armor_support_last_tick = Some(11);
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.urban_centers[0].cell = 1;
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.urban_centers[0].id = 0;
+        assert!(decode(&invalid).is_err());
     }
 
     #[test]

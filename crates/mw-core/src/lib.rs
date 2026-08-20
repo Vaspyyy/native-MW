@@ -4,6 +4,7 @@
 //! APIs. Native and future web frontends should consume snapshots from here.
 
 pub mod ai;
+pub mod battlefield;
 pub mod bootstrap;
 pub mod combat;
 pub mod direction;
@@ -25,6 +26,16 @@ pub use ai::{
     AI_ORDER_SCHEMA_VERSION, AiOrderConfig, AiOrderError, AiPlanningCounters, AiPlanningResult,
     AiUnitInput, AiWorldInput, AssignmentReason, FrontAssignmentRecord, FrontObjective,
     ResolvedCombatModifiers, ResolvedMovementModifiers, resolve_ai_orders,
+};
+pub use battlefield::{
+    BATTLEFIELD_SCHEMA_VERSION, BattlefieldBuff, BattlefieldCellState, BattlefieldCohesionGroup,
+    BattlefieldConfig, BattlefieldDirectionInput, BattlefieldDirectionResult, BattlefieldError,
+    BattlefieldInfluenceModifiers, BattlefieldLocalTacticsResult, BattlefieldLocalUnitInput,
+    BattlefieldLocalUnitResult, BattlefieldMapView, BattlefieldRuntimeState, BattlefieldTickInput,
+    BattlefieldTickResult, BattlefieldUnitInput, BattlefieldUnitResult, BattlefieldUnitState,
+    BattlefieldUrbanCenter, BattlefieldVector, BattlefieldWarPhase, CountryBattlefieldPrimitives,
+    active_combat_influence_eligible, apply_cohesion_and_repulsion, armor_influence_multiplier,
+    armor_speed_multiplier, cohesion_group, resolve_battlefield_tick, resolve_local_tactics,
 };
 pub use bootstrap::{NativeWarBootstrapConfig, NativeWarBootstrapError, bootstrap_native_war};
 

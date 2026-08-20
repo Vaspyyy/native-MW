@@ -91,6 +91,11 @@ pub struct ResolvedCombatModifiers {
     pub long_war_defense: f64,
     pub mountain: bool,
     pub urban: bool,
+    /// Exact current-cell flags are present only for the live battlefield resolver. They let
+    /// simulation combine both units' terrain per contact without changing legacy resolved-order
+    /// fixtures, whose `mountain`/`urban` values remain attacker-owned.
+    pub current_cell_mountain: Option<bool>,
+    pub current_cell_urban: Option<bool>,
 }
 
 impl Default for ResolvedCombatModifiers {
@@ -102,6 +107,8 @@ impl Default for ResolvedCombatModifiers {
             long_war_defense: 1.0,
             mountain: false,
             urban: false,
+            current_cell_mountain: None,
+            current_cell_urban: None,
         }
     }
 }
@@ -435,6 +442,8 @@ pub fn resolve_ai_orders(
                 long_war_defense: unit.combat.long_war_defense,
                 mountain: unit.combat.mountain,
                 urban: unit.combat.urban,
+                current_cell_mountain: unit.combat.current_cell_mountain,
+                current_cell_urban: unit.combat.current_cell_urban,
             },
         });
         assignments.push(FrontAssignmentRecord {

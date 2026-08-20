@@ -4,6 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::{
+    battlefield::{
+        BattlefieldBuff, BattlefieldConfig, BattlefieldRuntimeState, BattlefieldUnitState,
+        BattlefieldUrbanCenter, BattlefieldWarPhase, CountryBattlefieldPrimitives,
+    },
     combat::{CombatUnit, UnitKind},
     economy::{
         EconomyState, PAYROLL_PER_UNIT, STARTING_RESERVE_CYCLES, TARGET_STARTING_PAYROLL_SHARE,
@@ -16,6 +20,7 @@ use crate::{
     simulation::{Simulation, SimulationConfig, SimulationUnit},
     strategic::StrategicSimulation,
     territory::{TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps},
+    world::WorldGridView,
 };
 
 #[derive(Clone, Debug)]
@@ -40,6 +45,166 @@ pub enum NativeWarBootstrapError {
     Strategic(#[from] crate::strategic::StrategicError),
     #[error("runtime: {0}")]
     Runtime(#[from] crate::runtime::RuntimeError),
+    #[error("scenario battlefield metadata is invalid: {0}")]
+    BattlefieldMetadata(String),
+}
+
+fn parse_battlefield_buff(value: Option<&serde_json::Value>) -> BattlefieldBuff {
+    match value.and_then(serde_json::Value::as_str) {
+        Some("buff") => BattlefieldBuff::Buff,
+        Some("super") => BattlefieldBuff::Super,
+        Some("godly") => BattlefieldBuff::Godly,
+        Some("weakened") => BattlefieldBuff::Weakened,
+        Some("crippled") => BattlefieldBuff::Crippled,
+        _ => BattlefieldBuff::None,
+    }
+}
+
+fn scenario_country_metadata(
+    scenario: &DecodedScenario,
+) -> impl Iterator<Item = &serde_json::Map<String, serde_json::Value>> {
+    scenario
+        .metadata
+        .get("metadata")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| {
+            scenario
+                .metadata
+                .get("countries")
+                .and_then(serde_json::Value::as_array)
+        })
+        .or_else(|| scenario.metadata.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object)
+}
+
+fn bootstrap_country_battlefield(
+    scenario: &DecodedScenario,
+    country_to_side: &BTreeMap<u16, usize>,
+) -> Result<BTreeMap<u16, CountryBattlefieldPrimitives>, NativeWarBootstrapError> {
+    let metadata = scenario_country_metadata(scenario)
+        .filter_map(|country| {
+            let id = country
+                .get("id")?
+                .as_u64()
+                .and_then(|id| u16::try_from(id).ok())?;
+            Some((id, country))
+        })
+        .collect::<BTreeMap<_, _>>();
+    country_to_side
+        .keys()
+        .map(|&country_id| {
+            let raw = metadata.get(&country_id).copied();
+            let influence_buff = parse_battlefield_buff(raw.and_then(|raw| raw.get("buffState")));
+            let hidden = parse_battlefield_buff(raw.and_then(|raw| raw.get("hiddenBuffState")));
+            let combat_buff = if hidden == BattlefieldBuff::None {
+                influence_buff
+            } else {
+                hidden
+            };
+            let number = |key: &str, fallback: f64| {
+                raw.and_then(|raw| raw.get(key))
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(fallback)
+            };
+            let attack_buff_percent = number("attackBuffPercent", 0.0);
+            let defense_buff_percent = number("defenseBuffPercent", 0.0);
+            let ai_speed_multiplier = number("aiSpeedMultiplier", 1.0);
+            if !attack_buff_percent.is_finite()
+                || !defense_buff_percent.is_finite()
+                || !ai_speed_multiplier.is_finite()
+                || ai_speed_multiplier < 0.0
+            {
+                return Err(NativeWarBootstrapError::BattlefieldMetadata(format!(
+                    "country {country_id} has invalid battlefield modifiers"
+                )));
+            }
+            Ok((
+                country_id,
+                CountryBattlefieldPrimitives {
+                    combat_buff,
+                    influence_buff,
+                    attack_buff_percent,
+                    defense_buff_percent,
+                    capital_lost: false,
+                    war_phase: BattlefieldWarPhase::Stable,
+                    conquest_mode: true,
+                    ai_speed_multiplier,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn bootstrap_terrain(
+    scenario: &DecodedScenario,
+) -> Result<(bool, Vec<f32>), NativeWarBootstrapError> {
+    let cell_count = scenario
+        .target
+        .cell_count()
+        .map_err(|error| NativeWarBootstrapError::BattlefieldMetadata(error.to_string()))?;
+    let mut terrain = vec![0.0_f32; cell_count];
+    let Some(entries) = scenario
+        .metadata
+        .get("mountainData")
+        .and_then(serde_json::Value::as_array)
+    else {
+        // The stock MWSC does not contain the browser's separately loaded mountain GeoJSON.
+        // Flat terrain is therefore explicit rather than pretending mountains are enabled.
+        return Ok((false, terrain));
+    };
+    let source_cells = scenario
+        .source
+        .cell_count()
+        .map_err(|error| NativeWarBootstrapError::BattlefieldMetadata(error.to_string()))?;
+    let world = WorldGridView::new(
+        scenario.target.grid_res,
+        scenario.target.width,
+        scenario.target.height,
+        &scenario.land,
+    )
+    .map_err(|error| NativeWarBootstrapError::BattlefieldMetadata(error.to_string()))?;
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let pair = entry.as_array().ok_or_else(|| {
+            NativeWarBootstrapError::BattlefieldMetadata(format!(
+                "mountainData[{entry_index}] must be [cell,intensity]"
+            ))
+        })?;
+        if pair.len() != 2 {
+            return Err(NativeWarBootstrapError::BattlefieldMetadata(format!(
+                "mountainData[{entry_index}] must have two values"
+            )));
+        }
+        let source_cell = pair[0]
+            .as_u64()
+            .and_then(|cell| usize::try_from(cell).ok())
+            .filter(|cell| *cell < source_cells)
+            .ok_or_else(|| {
+                NativeWarBootstrapError::BattlefieldMetadata(format!(
+                    "mountainData[{entry_index}] has an invalid source cell"
+                ))
+            })?;
+        let intensity = pair[1]
+            .as_f64()
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .ok_or_else(|| {
+                NativeWarBootstrapError::BattlefieldMetadata(format!(
+                    "mountainData[{entry_index}] has an invalid intensity"
+                ))
+            })? as f32;
+        let source_x = source_cell % scenario.source.width;
+        let source_y = source_cell / scenario.source.width;
+        let lat = -90.0 + (source_y as f64 + 0.5) * scenario.source.grid_res;
+        let lng = -180.0 + (source_x as f64 + 0.5) * scenario.source.grid_res;
+        let target_cell = world.grid_index(lat, lng).ok_or_else(|| {
+            NativeWarBootstrapError::BattlefieldMetadata(format!(
+                "mountainData[{entry_index}] cannot be projected to the target grid"
+            ))
+        })?;
+        terrain[target_cell] = terrain[target_cell].max(intensity);
+    }
+    Ok((true, terrain))
 }
 
 pub fn bootstrap_native_war(
@@ -257,14 +422,53 @@ pub fn bootstrap_native_war(
         .into_iter()
         .map(|(id, country)| {
             let mut p = RuntimeUnitPolicy::standard(id, country);
-            p.influence.as_mut().unwrap().owner_ally_country_ids = topology
-                [country_to_side[&country]]
+            let influence = p.influence.as_mut().unwrap();
+            influence.owner_ally_country_ids = topology[country_to_side[&country]]
                 .iter()
                 .copied()
                 .collect();
+            // Native-started formations still use the browser mobilization ramp and temporal
+            // noise. Sequential native IDs are the stable local seed at this boundary.
+            influence.browser_temporal_seed = Some(id as f64);
             p
         })
         .collect();
+    let (mountains_enabled, terrain_intensity) = bootstrap_terrain(scenario)?;
+    let battlefield = BattlefieldRuntimeState {
+        config: BattlefieldConfig::default(),
+        mountains_enabled,
+        terrain_intensity,
+        urban_centers: production
+            .cities
+            .iter()
+            .filter(|city| country_to_side.contains_key(&city.owner_id))
+            .map(|city| BattlefieldUrbanCenter {
+                id: city.city_id,
+                country_id: city.owner_id,
+                cell: city.cell,
+                lat: city.lat,
+                lng: city.lng,
+            })
+            .collect(),
+        countries: bootstrap_country_battlefield(scenario, &country_to_side)?,
+        units: simulation
+            .units
+            .iter()
+            .map(|unit| {
+                (
+                    unit.combat.id,
+                    BattlefieldUnitState {
+                        // Browser unit identifiers often carry a fractional component; the
+                        // four-way group is `floor(id * 1000) % 4`. Native bootstrap IDs are
+                        // integers, so use an equivalent stable seed that does not collapse every
+                        // formation into group zero.
+                        cohesion_seed: (unit.combat.id % 4) as f64 / 1_000.0,
+                        ..BattlefieldUnitState::default()
+                    },
+                )
+            })
+            .collect(),
+    };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
         RuntimeCheckpoint {
@@ -280,6 +484,7 @@ pub fn bootstrap_native_war(
                 active_sides: (0..n as u16).collect(),
             },
             unit_policies,
+            battlefield: Some(battlefield),
             objectives: Vec::new(),
             prior_objective_by_unit: BTreeMap::new(),
             front_prior_by_unit: BTreeMap::new(),
@@ -371,6 +576,103 @@ mod tests {
         assert_eq!(state.territory_config.maps.side_influence[0][0], 1.0);
         assert_eq!(state.territory_config.maps.side_influence[1][1], 1.0);
         assert_eq!(state.territory_config.cities.len(), 3);
+        let battlefield = state.battlefield.as_ref().unwrap();
+        assert_eq!(battlefield.terrain_intensity, vec![0.0; 8]);
+        assert!(!battlefield.mountains_enabled);
+        assert_eq!(battlefield.countries.len(), 3);
+        assert_eq!(battlefield.units.len(), a.frame_snapshot.units.len());
+        assert_eq!(battlefield.urban_centers.len(), 3);
+        for unit in a.frame_snapshot.units.iter() {
+            assert_eq!(
+                state
+                    .unit_policies
+                    .iter()
+                    .find(|policy| policy.unit_id == unit.id)
+                    .unwrap()
+                    .influence
+                    .as_ref()
+                    .unwrap()
+                    .browser_temporal_seed,
+                Some(unit.id as f64)
+            );
+            assert_eq!(
+                crate::battlefield::cohesion_group(battlefield.units[&unit.id].cohesion_seed),
+                Some((unit.id % 4) as u8)
+            );
+        }
+        assert!(battlefield.units.values().all(|unit| {
+            unit.encircled_ticks == 0
+                && unit.armor_support_last_tick.is_none()
+                && unit.last_ally_count == 1.0
+        }));
+    }
+
+    #[test]
+    fn bootstrap_projects_explicit_mountain_metadata_and_country_primitives() {
+        let mut scenario = scenario();
+        scenario.source = GridSpec::world(45.0).unwrap();
+        let metadata = scenario.metadata.as_object_mut().unwrap();
+        metadata.insert(
+            "mountainData".into(),
+            json!([[0, 0.25], [1, 0.75], [10, 0.5]]),
+        );
+        metadata
+            .get_mut("countries")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[1] = json!({
+            "id": 10,
+            "name": "Alpha",
+            "gdp": 100.0,
+            "population": 10_000.0,
+            "buffState": "buff",
+            "hiddenBuffState": "super",
+            "attackBuffPercent": 12.5,
+            "defenseBuffPercent": 8.0,
+            "aiSpeedMultiplier": 1.25
+        });
+
+        let mut runtime =
+            bootstrap_native_war(&scenario, &config(vec![vec![10], vec![20]])).unwrap();
+        let state = runtime.checkpoint_state().unwrap();
+        let battlefield = state.battlefield.unwrap();
+
+        assert!(battlefield.mountains_enabled);
+        // Source cells 0 and 1 both project into target cell zero, and max wins.
+        assert_eq!(
+            battlefield.terrain_intensity[0].to_bits(),
+            0.75_f32.to_bits()
+        );
+        assert_eq!(
+            battlefield.terrain_intensity[1].to_bits(),
+            0.5_f32.to_bits()
+        );
+        assert!(
+            battlefield.terrain_intensity[2..]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        let alpha = battlefield.countries[&10];
+        assert_eq!(alpha.combat_buff, BattlefieldBuff::Super);
+        assert_eq!(alpha.influence_buff, BattlefieldBuff::Buff);
+        assert_eq!(alpha.attack_buff_percent, 12.5);
+        assert_eq!(alpha.defense_buff_percent, 8.0);
+        assert_eq!(alpha.ai_speed_multiplier, 1.25);
+    }
+
+    #[test]
+    fn bootstrap_rejects_invalid_mountain_metadata() {
+        let mut scenario = scenario();
+        scenario
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("mountainData".into(), json!([[8, 0.5]]));
+
+        assert!(matches!(
+            bootstrap_native_war(&scenario, &config(vec![vec![10], vec![20]])),
+            Err(NativeWarBootstrapError::BattlefieldMetadata(_))
+        ));
     }
 
     #[test]

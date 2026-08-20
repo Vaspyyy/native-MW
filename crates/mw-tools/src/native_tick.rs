@@ -480,6 +480,8 @@ impl CombatOrderFixture {
             long_war_defense: self.long_war_defense.unwrap_or(1.0),
             mountain: self.mountain,
             urban: self.urban,
+            current_cell_mountain: None,
+            current_cell_urban: None,
         }
     }
 }

@@ -1318,6 +1318,7 @@ fn create_demo_runtime(
                 active_sides: vec![0, 1],
             },
             unit_policies,
+            battlefield: None,
             // Front objectives are derived by the runtime on its first step.
             objectives: Vec::new(),
             prior_objective_by_unit: BTreeMap::new(),
