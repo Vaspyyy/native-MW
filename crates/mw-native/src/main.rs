@@ -7,13 +7,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
+use mw_checkpoint::native_runtime::load_runtime_checkpoint;
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
-    ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeState,
-    RuntimeUnitPolicy, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
-    StrategicSimulation, TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps,
-    TerritoryRenderUpdate, TerritoryTilePixels, UnitKind, decode_mwsc_gzip_file,
-    derive_scenario_production,
+    ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeUnitPolicy,
+    ScenarioProduction, Simulation, SimulationConfig, SimulationUnit, StrategicSimulation,
+    TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps, TerritoryRenderUpdate,
+    TerritoryTilePixels, UnitKind, decode_mwsc_gzip_file, derive_scenario_production,
 };
 use serde_json::Value;
 use wgpu::util::DeviceExt;
@@ -26,14 +26,17 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 
+mod headless;
+mod options;
+mod runtime_worker;
 mod unit_renderer;
 
+use options::{AppOptions, help_text, parse_app_options};
+use runtime_worker::{RuntimeWorker, RuntimeWorkerStatus};
 use unit_renderer::{UnitRenderer, geographic_to_world};
 
-const DEFAULT_SCENARIO: &str = "../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz";
 const ROW_ALIGNMENT: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
 const DEMO_CAMERA_ZOOM_MULTIPLIER: f32 = 70.0;
-const DEMO_TICK_INTERVAL: Duration = Duration::from_millis(33);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -57,12 +60,6 @@ struct GpuState {
     unit_renderer: UnitRenderer,
 }
 
-struct DemoSimulation {
-    runtime: NativeRuntime,
-    next_step_at: Instant,
-    finished: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DemoBorder {
     first_owner: u16,
@@ -75,7 +72,10 @@ struct DemoBorder {
 
 struct App {
     scenario_path: PathBuf,
+    runtime_checkpoint_path: Option<PathBuf>,
     demo_units_requested: bool,
+    runtime_tick_interval: std::time::Duration,
+    runtime_queue_capacity: usize,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     ownership: Vec<u16>,
@@ -93,20 +93,27 @@ struct App {
     frame_count: u64,
     presented_frames: u64,
     smoke_frames: Option<u64>,
-    demo: Option<DemoSimulation>,
-    demo_center: Option<[f32; 2]>,
+    runtime_worker: Option<RuntimeWorker>,
+    runtime_center: Option<[f32; 2]>,
+    runtime_zoom: Option<f32>,
+    runtime_initial_tick: Option<u64>,
+    runtime_terminal: bool,
     latest_snapshot: Option<Arc<FrameSnapshot>>,
     snapshot_dirty: bool,
     territory_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
     fps_epoch: Instant,
     fps: f64,
+    fatal_error: Option<String>,
 }
 
 impl App {
-    fn new(scenario_path: PathBuf, smoke_frames: Option<u64>, demo_units_requested: bool) -> Self {
+    fn new(options: AppOptions) -> Self {
         Self {
-            scenario_path,
-            demo_units_requested,
+            scenario_path: options.scenario_path,
+            runtime_checkpoint_path: options.runtime_checkpoint_path,
+            demo_units_requested: options.demo_units,
+            runtime_tick_interval: options.runtime_tick_interval,
+            runtime_queue_capacity: options.runtime_queue_capacity,
             window: None,
             gpu: None,
             ownership: Vec::new(),
@@ -123,28 +130,83 @@ impl App {
             last_drag: PhysicalPosition::new(0.0, 0.0),
             frame_count: 0,
             presented_frames: 0,
-            smoke_frames,
-            demo: None,
-            demo_center: None,
+            smoke_frames: options.smoke_frames,
+            runtime_worker: None,
+            runtime_center: None,
+            runtime_zoom: None,
+            runtime_initial_tick: None,
+            runtime_terminal: false,
             latest_snapshot: None,
             snapshot_dirty: false,
             territory_updates: VecDeque::new(),
             fps_epoch: Instant::now(),
             fps: 0.0,
+            fatal_error: None,
         }
     }
 
     fn initialize(&mut self, window: Arc<Window>) -> Result<()> {
-        let decode_started = Instant::now();
-        let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
-        let decoded = decode_mwsc_gzip_file(&self.scenario_path, Some(target))
-            .with_context(|| format!("failed to decode {}", self.scenario_path.display()))?;
+        let load_started = Instant::now();
+        let checkpoint_path = self.runtime_checkpoint_path.clone();
+        let (decoded, mut pending_runtime, demo_border, runtime_label) = if let Some(
+            checkpoint_path,
+        ) =
+            checkpoint_path.as_ref()
+        {
+            let loaded = load_runtime_checkpoint(&self.scenario_path, checkpoint_path)
+                .with_context(|| {
+                    format!(
+                        "failed to load native runtime checkpoint {}",
+                        checkpoint_path.display()
+                    )
+                })?;
+            anyhow::ensure!(
+                loaded.resumable && loaded.checkpoint_boundary == "postStartWar",
+                "mw-native only renders resumable postStartWar checkpoints; {:?} is a synthetic replay boundary",
+                loaded.checkpoint_boundary
+            );
+            anyhow::ensure!(
+                loaded.exact_geography_supplied,
+                "production runtime checkpoint is missing exact geography"
+            );
+            let label = format!(
+                "checkpoint {} ({} units)",
+                checkpoint_path.display(),
+                loaded.unit_count
+            );
+            (loaded.decoded, Some(loaded.runtime), None, Some(label))
+        } else {
+            let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
+            let decoded = decode_mwsc_gzip_file(&self.scenario_path, Some(target))
+                .with_context(|| format!("failed to decode {}", self.scenario_path.display()))?;
+            if self.demo_units_requested {
+                let border = find_demo_border(
+                    &decoded.world_control,
+                    &decoded.land,
+                    decoded.target.width,
+                    decoded.target.height,
+                    decoded.target.grid_res,
+                )
+                .context("--demo-units requires an adjacent-country land border")?;
+                let production = derive_scenario_production(&decoded, &ProductionConfig::default())
+                    .context("failed to derive scenario production data for native runtime")?;
+                let runtime = create_demo_runtime(border, &decoded, production)?;
+                (
+                    decoded,
+                    Some(runtime),
+                    Some(border),
+                    Some("scenario-derived demo".to_owned()),
+                )
+            } else {
+                (decoded, None, None, None)
+            }
+        };
         log::info!(
-            "decoded {} entries into {}x{} in {:.1} ms",
+            "loaded {} entries into {}x{} in {:.1} ms",
             decoded.entry_count,
             decoded.target.width,
             decoded.target.height,
-            decode_started.elapsed().as_secs_f64() * 1_000.0
+            load_started.elapsed().as_secs_f64() * 1_000.0
         );
         self.grid_width =
             u32::try_from(decoded.target.width).context("scenario width exceeds GPU limits")?;
@@ -165,51 +227,43 @@ impl App {
             decoded.world_control.len()
         );
 
-        let demo_initialization = if self.demo_units_requested {
-            let border = find_demo_border(
-                &decoded.world_control,
-                &decoded.land,
-                decoded.target.width,
-                decoded.target.height,
-                decoded.target.grid_res,
-            )
-            .context("--demo-units requires an adjacent-country land border")?;
-            let production = derive_scenario_production(&decoded, &ProductionConfig::default())
-                .context("failed to derive scenario production data for native runtime")?;
-            Some((
-                border,
-                create_demo_simulation(border, &decoded, production)?,
-            ))
-        } else {
-            None
-        };
-
         self.ownership = decoded.world_control;
         self.land = decoded.land;
         self.metadata = decoded.metadata;
         self.palette = build_palette(&self.metadata, &self.ownership);
         let size = window.inner_size();
         self.zoom = reset_zoom(size);
-        if let Some((border, mut demo)) = demo_initialization {
-            let first_name = self.country_name(border.first_owner).to_owned();
-            let second_name = self.country_name(border.second_owner).to_owned();
-            let snapshot = demo.runtime.latest_snapshot().frame_snapshot.clone();
-            while let Some(update) = demo.runtime.pop_render_update() {
-                self.territory_updates.push_back(update);
+        if let Some(runtime) = pending_runtime.as_mut() {
+            let published = runtime.latest_snapshot();
+            // Apply the tick-zero full replacement before creating/presenting the GPU texture.
+            while let Some(update) = runtime.pop_render_update() {
+                apply_territory_update_to_grid(
+                    &mut self.ownership,
+                    self.grid_width as usize,
+                    self.grid_height as usize,
+                    &update,
+                )?;
             }
-            self.demo_center = Some(geographic_to_world(border.midpoint[0], border.midpoint[1]));
-            self.center = self.demo_center.expect("demo center was just assigned");
-            self.zoom = demo_zoom(size);
-            self.latest_snapshot = Some(snapshot);
-            self.demo = Some(demo);
+            let (center, zoom) = if let Some(border) = demo_border {
+                (
+                    geographic_to_world(border.midpoint[0], border.midpoint[1]),
+                    demo_zoom(size),
+                )
+            } else {
+                camera_for_runtime(&published.frame_snapshot, size)
+            };
+            self.runtime_center = Some(center);
+            self.runtime_zoom = Some(zoom);
+            self.center = center;
+            self.zoom = zoom;
+            self.runtime_initial_tick = Some(published.tick);
+            self.latest_snapshot = Some(published.frame_snapshot.clone());
+            self.snapshot_dirty = true;
             log::info!(
-                "demo units placed at border {} ({}) / {} ({}) near {:.3}, {:.3}",
-                border.first_owner,
-                first_name,
-                border.second_owner,
-                second_name,
-                border.midpoint[0],
-                border.midpoint[1]
+                "initialized {} at tick {} with {} rendered units",
+                runtime_label.as_deref().unwrap_or("native runtime"),
+                published.tick,
+                published.frame_snapshot.units.len()
             );
         }
 
@@ -414,6 +468,28 @@ impl App {
             unit_renderer,
         });
         self.window = Some(window);
+        if let Some(runtime) = pending_runtime {
+            let step_limit = self.smoke_frames.map(|_| 1);
+            let worker = if let Some(limit) = step_limit {
+                RuntimeWorker::spawn_with_limit(
+                    runtime,
+                    self.runtime_tick_interval,
+                    self.runtime_queue_capacity,
+                    Some(limit),
+                )?
+            } else {
+                RuntimeWorker::spawn(
+                    runtime,
+                    self.runtime_tick_interval,
+                    self.runtime_queue_capacity,
+                )?
+            };
+            log::debug!(
+                "runtime worker owns immutable snapshot at tick {}",
+                worker.latest_snapshot().tick
+            );
+            self.runtime_worker = Some(worker);
+        }
         Ok(())
     }
 
@@ -428,67 +504,108 @@ impl App {
     }
 
     fn reset_camera(&mut self, size: PhysicalSize<u32>) {
-        if let Some(center) = self.demo_center {
+        if let Some(center) = self.runtime_center {
             self.center = center;
-            self.zoom = demo_zoom(size);
+            self.zoom = self.runtime_zoom.unwrap_or_else(|| reset_zoom(size));
         } else {
             self.center = [1.0, 0.5];
             self.zoom = reset_zoom(size);
         }
     }
 
-    fn advance_demo(&mut self) -> Result<()> {
-        let Some(demo) = &mut self.demo else {
+    fn stop_runtime_worker(&mut self) {
+        let Some(mut worker) = self.runtime_worker.take() else {
+            return;
+        };
+        let join_panicked = worker.stop_and_join().is_err();
+        let mut worker_failure = None;
+        while let Some(status) = worker.poll_status() {
+            match status {
+                RuntimeWorkerStatus::Failed(error) => {
+                    worker_failure = Some(format!("native runtime worker failed: {error}"));
+                }
+                RuntimeWorkerStatus::Panicked(error) => {
+                    worker_failure = Some(format!("native runtime worker panicked: {error}"));
+                }
+                RuntimeWorkerStatus::Stopped
+                | RuntimeWorkerStatus::Terminal(_)
+                | RuntimeWorkerStatus::Completed { .. } => {}
+            }
+        }
+        if self.fatal_error.is_none() {
+            self.fatal_error = worker_failure.or_else(|| {
+                join_panicked.then(|| "native runtime worker panicked during shutdown".to_owned())
+            });
+        }
+    }
+
+    fn drain_runtime_worker(&mut self) -> Result<()> {
+        let Some(worker) = self.runtime_worker.as_ref() else {
             return Ok(());
         };
-        if demo.finished {
-            return Ok(());
+        let mut drained = worker.drain_render_state();
+        let mut statuses = Vec::new();
+        while let Some(status) = worker.poll_status() {
+            statuses.push(status);
         }
-        let now = Instant::now();
-        if demo.runtime.tick() > 0 && now < demo.next_step_at {
-            return Ok(());
+        if !statuses.is_empty() {
+            // Every successful terminal/completion status is sent after its final
+            // atomic publication. A second drain closes the cross-channel race
+            // without weakening the publication's delta/snapshot coherence.
+            let final_drain = worker.drain_render_state();
+            drained
+                .territory_updates
+                .extend(final_drain.territory_updates);
+            if final_drain.snapshot.is_some() {
+                drained.snapshot = final_drain.snapshot;
+            }
         }
-        demo.next_step_at = now + DEMO_TICK_INTERVAL;
-        let snapshot = demo.runtime.step()?;
-        while let Some(update) = demo.runtime.pop_render_update() {
-            self.territory_updates.push_back(update.clone());
+
+        for update in drained.territory_updates {
             apply_territory_update_to_grid(
                 &mut self.ownership,
                 self.grid_width as usize,
                 self.grid_height as usize,
                 &update,
             )?;
+            self.territory_updates.push_back(update);
         }
-
-        let units = &snapshot.frame_snapshot.units;
-        demo.finished = !matches!(snapshot.state, RuntimeState::Running)
-            || units.len() < 2
-            || snapshot
-                .frame_snapshot
-                .units
-                .first()
-                .is_none_or(|first| units.iter().all(|unit| unit.side == first.side));
-        if matches!(
-            snapshot.state,
-            RuntimeState::AwaitingStrategicEffects { .. }
-        ) {
-            log::warn!(
-                "demo runtime paused at tick {} for explicit strategic-effects application",
-                snapshot.tick
+        if let Some(snapshot) = drained.snapshot {
+            log::trace!(
+                "runtime tick {}: {} units, {} contacts, {} direct engagements, {} moves, {} influence cells, territory commit {}",
+                snapshot.tick,
+                snapshot.frame_snapshot.units.len(),
+                snapshot.counters.simulation.accepted_contacts,
+                snapshot.counters.simulation.direct_events,
+                snapshot.counters.simulation.moved_units,
+                snapshot.counters.influence.touched_influence_cells,
+                snapshot.counters.census.committed,
             );
+            self.latest_snapshot = Some(snapshot.frame_snapshot.clone());
+            self.snapshot_dirty = true;
         }
-        log::trace!(
-            "demo tick {}: {} units, {} contacts, {} direct engagements, {} moves, {} influence cells, territory commit {}",
-            snapshot.tick,
-            units.len(),
-            snapshot.counters.simulation.accepted_contacts,
-            snapshot.counters.simulation.direct_events,
-            snapshot.counters.simulation.moved_units,
-            snapshot.counters.influence.touched_influence_cells,
-            snapshot.counters.census.committed,
-        );
-        self.latest_snapshot = Some(snapshot.frame_snapshot.clone());
-        self.snapshot_dirty = true;
+        for status in statuses {
+            match status {
+                RuntimeWorkerStatus::Stopped => {
+                    self.runtime_terminal = true;
+                    log::info!("native runtime worker stopped");
+                }
+                RuntimeWorkerStatus::Terminal(state) => {
+                    self.runtime_terminal = true;
+                    log::warn!("native runtime reached terminal state: {state:?}");
+                }
+                RuntimeWorkerStatus::Completed { steps } => {
+                    self.runtime_terminal = true;
+                    log::info!("native runtime completed its {steps}-step limit");
+                }
+                RuntimeWorkerStatus::Failed(error) => {
+                    anyhow::bail!("native runtime worker failed: {error}");
+                }
+                RuntimeWorkerStatus::Panicked(error) => {
+                    anyhow::bail!("native runtime worker panicked: {error}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -537,26 +654,22 @@ impl App {
             .unwrap_or(if id == 0 { "Ocean" } else { "Unknown" })
     }
 
-    fn render(&mut self) {
-        if let Err(error) = self.advance_demo() {
-            log::error!("demo simulation stopped: {error:#}");
-            self.demo = None;
-        }
-        let Some(window) = &self.window else { return };
+    fn render(&mut self) -> Result<()> {
+        self.drain_runtime_worker()?;
+        let Some(window) = &self.window else {
+            return Ok(());
+        };
         let size = window.inner_size();
         let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
-        let Some(gpu) = &mut self.gpu else { return };
+        let Some(gpu) = &mut self.gpu else {
+            return Ok(());
+        };
         gpu.queue
             .write_buffer(&gpu.view_buffer, 0, bytemuck::bytes_of(&uniform));
         while let Some(update) = self.territory_updates.pop_front() {
-            if let Err(error) = upload_territory_update(&gpu.queue, &gpu.ownership_texture, &update)
-            {
-                log::error!("territory texture update failed: {error:#}");
-                self.territory_updates.push_front(update);
-                self.demo = None;
-                break;
-            }
+            upload_territory_update(&gpu.queue, &gpu.ownership_texture, &update)
+                .inspect_err(|_| self.territory_updates.push_front(Arc::clone(&update)))?;
         }
         if self.snapshot_dirty
             && let Some(snapshot) = &self.latest_snapshot
@@ -574,16 +687,16 @@ impl App {
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 gpu.surface.configure(&gpu.device, &gpu.config);
-                return;
+                return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Lost => {
-                log::error!("render surface lost");
-                return;
+                anyhow::bail!("render surface lost");
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
             wgpu::CurrentSurfaceTexture::Validation => {
-                log::error!("surface validation error");
-                return;
+                anyhow::bail!("surface validation error");
             }
         };
         let view = frame
@@ -649,6 +762,7 @@ impl App {
             ));
         }
         window.request_redraw();
+        Ok(())
     }
 }
 
@@ -663,13 +777,17 @@ impl ApplicationHandler for App {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
-                log::error!("window creation failed: {error}");
+                let message = format!("window creation failed: {error}");
+                log::error!("{message}");
+                self.fatal_error = Some(message);
                 event_loop.exit();
                 return;
             }
         };
         if let Err(error) = self.initialize(window) {
-            log::error!("initialization failed: {error:#}");
+            let message = format!("initialization failed: {error:#}");
+            log::error!("{message}");
+            self.fatal_error = Some(message);
             event_loop.exit();
         } else if let Some(window) = &self.window {
             window.request_redraw();
@@ -744,16 +862,30 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                self.render();
-                if self
-                    .smoke_frames
-                    .is_some_and(|target| self.presented_frames >= target)
-                {
+                if let Err(error) = self.render() {
+                    let message = format!("rendering failed: {error:#}");
+                    log::error!("{message}");
+                    self.fatal_error = Some(message);
                     event_loop.exit();
+                    return;
+                }
+                if let Some(target) = self.smoke_frames {
+                    let runtime_ready = self.runtime_initial_tick.is_none()
+                        || self.runtime_terminal
+                        || self.latest_snapshot.as_ref().is_some_and(|snapshot| {
+                            Some(snapshot.tick) > self.runtime_initial_tick
+                        });
+                    if self.presented_frames >= target && runtime_ready {
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.stop_runtime_worker();
     }
 }
 
@@ -763,6 +895,45 @@ fn reset_zoom(size: PhysicalSize<u32>) -> f32 {
 
 fn demo_zoom(size: PhysicalSize<u32>) -> f32 {
     (reset_zoom(size) * DEMO_CAMERA_ZOOM_MULTIPLIER).clamp(1.0, 100_000.0)
+}
+
+fn camera_for_runtime(snapshot: &FrameSnapshot, size: PhysicalSize<u32>) -> ([f32; 2], f32) {
+    if snapshot.units.is_empty() {
+        return ([1.0, 0.5], reset_zoom(size));
+    }
+    // The current map shader does not repeat at the antimeridian, so use the
+    // literal projected bounds. A circular fit could hide units on the other
+    // edge until world-wrap rendering itself is implemented.
+    let (min_x, max_x, min_y, max_y) = snapshot
+        .units
+        .iter()
+        .map(|unit| geographic_to_world(unit.lat, unit.lng))
+        .fold(
+            (
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ),
+            |(min_x, max_x, min_y, max_y), world| {
+                let x = f64::from(world[0]);
+                let y = f64::from(world[1]);
+                (min_x.min(x), max_x.max(x), min_y.min(y), max_y.max(y))
+            },
+        );
+    let horizontal_span = (max_x - min_x).max(0.02);
+    let vertical_span = (max_y - min_y).max(0.02);
+    let padding = 1.35_f64;
+    let horizontal_zoom = size.width.max(1) as f64 / (horizontal_span * padding);
+    let vertical_zoom = size.height.max(1) as f64 / (vertical_span * padding);
+    let zoom = horizontal_zoom.min(vertical_zoom).clamp(1.0, 100_000.0) as f32;
+    (
+        [
+            ((min_x + max_x) * 0.5) as f32,
+            ((min_y + max_y) * 0.5) as f32,
+        ],
+        zoom,
+    )
 }
 
 fn find_demo_border(
@@ -879,11 +1050,11 @@ fn cell_geographic_center(cell: [usize; 2], grid_res: f64) -> [f64; 2] {
     ]
 }
 
-fn create_demo_simulation(
+fn create_demo_runtime(
     border: DemoBorder,
     decoded: &DecodedScenario,
     production: ScenarioProduction,
-) -> Result<DemoSimulation> {
+) -> Result<NativeRuntime> {
     let normal = border.toward_second;
     let tangent = [-normal[1], normal[0]];
     let half_separation = 0.018;
@@ -1064,11 +1235,7 @@ fn create_demo_simulation(
             casualties: BTreeMap::new(),
         },
     )?;
-    Ok(DemoSimulation {
-        runtime,
-        next_step_at: Instant::now(),
-        finished: false,
-    })
+    Ok(runtime)
 }
 
 fn apply_territory_update_to_grid(
@@ -1342,24 +1509,23 @@ fn parse_color(value: &str) -> Option<[f32; 4]> {
 
 fn main() -> Result<()> {
     env_logger::init();
-    let mut scenario = None;
-    let mut smoke_frames = None;
-    let mut demo_units = false;
-    for argument in std::env::args_os().skip(1) {
-        if argument == "--smoke" {
-            smoke_frames = Some(3);
-        } else if argument == "--demo-units" {
-            demo_units = true;
-        } else if scenario.is_none() {
-            scenario = Some(PathBuf::from(argument));
-        } else {
-            anyhow::bail!("unexpected argument {:?}", argument);
-        }
+    let options = parse_app_options(std::env::args_os().skip(1))?;
+    if options.show_help {
+        println!("{}", help_text());
+        return Ok(());
     }
-    let scenario = scenario.unwrap_or_else(|| PathBuf::from(DEFAULT_SCENARIO));
+    if let Some(steps) = options.headless_ticks {
+        return headless::run_headless(&options, steps);
+    }
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    event_loop.run_app(&mut App::new(scenario, smoke_frames, demo_units))?;
+    let mut app = App::new(options);
+    let run_result = event_loop.run_app(&mut app);
+    app.stop_runtime_worker();
+    run_result?;
+    if let Some(error) = app.fatal_error {
+        anyhow::bail!(error);
+    }
     Ok(())
 }
 
@@ -1371,6 +1537,23 @@ mod tests {
     fn camera_fit_preserves_two_to_one_world_aspect() {
         assert_eq!(reset_zoom(PhysicalSize::new(1_280, 720)), 640.0);
         assert_eq!(reset_zoom(PhysicalSize::new(2_000, 600)), 600.0);
+    }
+
+    #[test]
+    fn runtime_camera_keeps_both_antimeridian_edges_visible() {
+        let simulation = Simulation::new(
+            SimulationConfig::default(),
+            vec![
+                demo_unit(1, 0, 1, UnitKind::Army, [0.0, -179.0], [0.0, 0.0]),
+                demo_unit(2, 1, 2, UnitKind::Army, [0.0, 179.0], [0.0, 0.0]),
+            ],
+        )
+        .unwrap();
+        let snapshot = simulation.initial_snapshot(0, 0);
+        let (center, zoom) = camera_for_runtime(&snapshot, PhysicalSize::new(1_280, 720));
+        assert!((center[0] - 1.0).abs() < 1.0e-6);
+        assert!((center[1] - 0.5).abs() < 1.0e-6);
+        assert!(zoom < reset_zoom(PhysicalSize::new(1_280, 720)));
     }
 
     #[test]
@@ -1447,8 +1630,8 @@ mod tests {
         };
         let production =
             derive_scenario_production(&decoded, &ProductionConfig::default()).unwrap();
-        let mut demo = create_demo_simulation(border, &decoded, production).unwrap();
-        let snapshot = demo.runtime.latest_snapshot();
+        let mut runtime = create_demo_runtime(border, &decoded, production).unwrap();
+        let snapshot = runtime.latest_snapshot();
         assert_eq!(snapshot.frame_snapshot.units.len(), 4);
         assert!(
             snapshot
@@ -1465,9 +1648,9 @@ mod tests {
                 .any(|unit| unit.side == 1 && unit.sovereign == 11)
         );
         assert_eq!(snapshot.territory_snapshot.land_cells, 4);
-        assert_eq!(demo.runtime.pending_render_updates(), 1);
+        assert_eq!(runtime.pending_render_updates(), 1);
 
-        let next = demo.runtime.step().unwrap();
+        let next = runtime.step().unwrap();
         assert!(next.counters.front_refreshed);
         assert_eq!(next.counters.front_objectives, 4);
     }

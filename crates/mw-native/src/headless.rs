@@ -1,0 +1,484 @@
+//! Deterministic, window-free validation of the production runtime worker.
+
+use std::{
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use mw_checkpoint::native_runtime::load_runtime_checkpoint;
+use mw_core::{
+    CombatEvent, CombatLayer, RuntimeSnapshot, RuntimeState, TerritoryRenderUpdate, UnitKind,
+};
+use serde_json::json;
+
+use crate::{
+    options::AppOptions,
+    runtime_worker::{RuntimeWorker, RuntimeWorkerStatus},
+};
+
+const HEADLESS_SCHEMA: &str = "mw-native-headless-v1";
+const EXPECTED_CHECKPOINT_BOUNDARY: &str = "postStartWar";
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MIN_WATCHDOG: Duration = Duration::from_secs(30);
+const MAX_WATCHDOG: Duration = Duration::from_secs(24 * 60 * 60);
+const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Load a strict production checkpoint, execute exactly `steps` worker ticks, and print a
+/// deterministic report. This path deliberately constructs no window or GPU state.
+pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
+    ensure!(steps > 0, "headless worker steps must be greater than zero");
+    let checkpoint_path = options
+        .runtime_checkpoint_path
+        .as_ref()
+        .context("headless mode requires a native runtime checkpoint")?;
+    let loaded =
+        load_runtime_checkpoint(&options.scenario_path, checkpoint_path).with_context(|| {
+            format!(
+                "failed to load native runtime checkpoint {}",
+                checkpoint_path.display()
+            )
+        })?;
+    ensure!(
+        loaded.resumable,
+        "checkpoint boundary {} is not resumable",
+        loaded.checkpoint_boundary
+    );
+    ensure!(
+        loaded.checkpoint_boundary == EXPECTED_CHECKPOINT_BOUNDARY,
+        "headless runtime requires a {EXPECTED_CHECKPOINT_BOUNDARY} checkpoint, got {}",
+        loaded.checkpoint_boundary
+    );
+    ensure!(
+        loaded.exact_geography_supplied,
+        "headless runtime requires checkpoint-supplied exact geography"
+    );
+
+    let boundary = loaded.checkpoint_boundary;
+    let initial = loaded.runtime.latest_snapshot();
+    ensure!(
+        initial.frame_snapshot.units.len() == loaded.unit_count,
+        "loaded unit count does not match the runtime's initial publication"
+    );
+    let initial_tick = initial.tick;
+    let initial_frame = initial.frame;
+    let expected_final_tick = initial_tick
+        .checked_add(steps)
+        .context("requested headless steps overflow the runtime tick")?;
+    let expected_final_frame = initial_frame
+        .checked_add(steps)
+        .context("requested headless steps overflow the runtime frame")?;
+
+    let mut worker = RuntimeWorker::spawn_with_limit(
+        loaded.runtime,
+        options.runtime_tick_interval,
+        options.runtime_queue_capacity,
+        Some(steps),
+    )
+    .context("failed to start the native runtime worker")?;
+
+    let watchdog = watchdog_duration(options.runtime_tick_interval, steps);
+    let outcome = monitor_worker(&worker, steps, watchdog);
+    let joined = worker.stop_and_join();
+    if joined.is_err() {
+        bail!("native runtime worker panicked while joining");
+    }
+    let completion = outcome?;
+
+    ensure!(
+        completion.final_snapshot.tick == expected_final_tick,
+        "headless worker ended at tick {}, expected {expected_final_tick}",
+        completion.final_snapshot.tick
+    );
+    ensure!(
+        completion.final_snapshot.frame == expected_final_frame,
+        "headless worker ended at frame {}, expected {expected_final_frame}",
+        completion.final_snapshot.frame
+    );
+
+    let units = completion.final_snapshot.frame_snapshot.units.len();
+    let checksum = semantic_checksum(ChecksumInput {
+        boundary,
+        requested_steps: steps,
+        completed_steps: completion.completed_steps,
+        initial_tick,
+        initial_frame,
+        final_snapshot: &completion.final_snapshot,
+        update_checksum: completion.update_checksum,
+        territory_updates: completion.territory_updates,
+    })?;
+
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema": HEADLESS_SCHEMA,
+                "checkpointBoundary": boundary,
+                "requestedSteps": steps,
+                "completedSteps": completion.completed_steps,
+                "initialTick": initial_tick,
+                "finalTick": completion.final_snapshot.tick,
+                "initialFrame": initial_frame,
+                "finalFrame": completion.final_snapshot.frame,
+                "units": units,
+                "territoryUpdates": completion.territory_updates,
+                "joined": true,
+                "checksum": checksum,
+            }))?
+        );
+    } else {
+        println!(
+            "{HEADLESS_SCHEMA} {boundary}: {}/{} steps, tick {}->{}, frame {}->{}, {} units, {} territory updates, joined, checksum {}",
+            completion.completed_steps,
+            steps,
+            initial_tick,
+            completion.final_snapshot.tick,
+            initial_frame,
+            completion.final_snapshot.frame,
+            units,
+            completion.territory_updates,
+            checksum,
+        );
+    }
+    Ok(())
+}
+
+struct WorkerCompletion {
+    completed_steps: u64,
+    final_snapshot: Arc<RuntimeSnapshot>,
+    territory_updates: usize,
+    update_checksum: Fnv64,
+}
+
+fn monitor_worker(
+    worker: &RuntimeWorker,
+    requested_steps: u64,
+    watchdog: Duration,
+) -> Result<WorkerCompletion> {
+    let started = Instant::now();
+    let mut latest_snapshot = None;
+    let mut territory_updates = 0_usize;
+    let mut update_checksum = Fnv64::new();
+
+    loop {
+        drain_worker(
+            worker,
+            &mut latest_snapshot,
+            &mut territory_updates,
+            &mut update_checksum,
+        );
+
+        if let Some(status) = worker.poll_status() {
+            match status {
+                RuntimeWorkerStatus::Completed { steps } => {
+                    ensure!(
+                        steps == requested_steps,
+                        "native runtime worker completed {steps} steps, expected {requested_steps}"
+                    );
+                    // The worker sends the final atomic publication before its completion status.
+                    // Drain once more so the final snapshot and every territory delta are observed.
+                    drain_worker(
+                        worker,
+                        &mut latest_snapshot,
+                        &mut territory_updates,
+                        &mut update_checksum,
+                    );
+                    let final_snapshot = latest_snapshot
+                        .context("worker completed without publishing a runtime snapshot")?;
+                    return Ok(WorkerCompletion {
+                        completed_steps: steps,
+                        final_snapshot,
+                        territory_updates,
+                        update_checksum,
+                    });
+                }
+                RuntimeWorkerStatus::Stopped => {
+                    bail!("native runtime worker stopped before its exact step limit")
+                }
+                RuntimeWorkerStatus::Terminal(state) => {
+                    bail!(
+                        "native runtime reached terminal state {state:?} before its exact step limit"
+                    )
+                }
+                RuntimeWorkerStatus::Failed(error) => {
+                    bail!("native runtime worker failed before its exact step limit: {error}")
+                }
+                RuntimeWorkerStatus::Panicked(error) => {
+                    bail!("native runtime worker panicked: {error}")
+                }
+            }
+        }
+
+        if started.elapsed() >= watchdog {
+            bail!(
+                "native runtime worker exceeded its {:?} headless watchdog after requesting {requested_steps} steps",
+                watchdog
+            );
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn drain_worker(
+    worker: &RuntimeWorker,
+    latest_snapshot: &mut Option<Arc<RuntimeSnapshot>>,
+    territory_updates: &mut usize,
+    update_checksum: &mut Fnv64,
+) {
+    let drained = worker.drain_render_state();
+    for update in drained.territory_updates {
+        checksum_territory_update(update_checksum, &update);
+        *territory_updates = territory_updates.saturating_add(1);
+    }
+    if let Some(snapshot) = drained.snapshot {
+        *latest_snapshot = Some(snapshot);
+    }
+}
+
+fn watchdog_duration(tick_interval: Duration, steps: u64) -> Duration {
+    // Allow twenty nominal tick intervals per requested step, plus startup/load scheduling
+    // latitude. Integer nanosecond arithmetic avoids overflow for adversarial CLI values.
+    let scaled_nanos = tick_interval
+        .as_nanos()
+        .saturating_mul(u128::from(steps))
+        .saturating_mul(20)
+        .saturating_add(Duration::from_secs(5).as_nanos());
+    let minimum = MIN_WATCHDOG.as_nanos();
+    let maximum = MAX_WATCHDOG.as_nanos();
+    let bounded = scaled_nanos.clamp(minimum, maximum);
+    Duration::new(
+        (bounded / 1_000_000_000) as u64,
+        (bounded % 1_000_000_000) as u32,
+    )
+}
+
+struct ChecksumInput<'a> {
+    boundary: &'a str,
+    requested_steps: u64,
+    completed_steps: u64,
+    initial_tick: u64,
+    initial_frame: u64,
+    final_snapshot: &'a RuntimeSnapshot,
+    update_checksum: Fnv64,
+    territory_updates: usize,
+}
+
+fn semantic_checksum(input: ChecksumInput<'_>) -> Result<String> {
+    let mut checksum = Fnv64::new();
+    checksum.write_bytes(HEADLESS_SCHEMA.as_bytes());
+    checksum.write_bytes(input.boundary.as_bytes());
+    checksum.write_u64(input.requested_steps);
+    checksum.write_u64(input.completed_steps);
+    checksum.write_u64(input.initial_tick);
+    checksum.write_u64(input.initial_frame);
+    checksum.write_u64(input.territory_updates as u64);
+    checksum.write_u64(input.update_checksum.value());
+    checksum_runtime_snapshot(&mut checksum, input.final_snapshot)?;
+    Ok(checksum.finish())
+}
+
+fn checksum_runtime_snapshot(checksum: &mut Fnv64, snapshot: &RuntimeSnapshot) -> Result<()> {
+    checksum.write_u64(snapshot.tick);
+    checksum.write_u64(snapshot.frame);
+    match snapshot.state {
+        RuntimeState::Running => checksum.write_u64(0),
+        RuntimeState::AwaitingStrategicEffects {
+            cycle,
+            tick,
+            desertion_commands,
+            surrender_commands,
+            conflict_resolution,
+        } => {
+            checksum.write_u64(1);
+            checksum.write_u64(cycle);
+            checksum.write_u64(tick);
+            checksum.write_u64(desertion_commands as u64);
+            checksum.write_u64(surrender_commands as u64);
+            checksum.write_bool(conflict_resolution);
+        }
+        RuntimeState::Poisoned => checksum.write_u64(2),
+    }
+
+    let frame = &snapshot.frame_snapshot;
+    checksum.write_u64(frame.units.len() as u64);
+    for unit in frame.units.iter() {
+        checksum.write_u64(unit.id);
+        checksum.write_u16(unit.side);
+        checksum.write_u64(unit.sovereign);
+        checksum.write_u64(match unit.kind {
+            UnitKind::Army => 0,
+            UnitKind::Armor => 1,
+        });
+        for value in [
+            unit.lat,
+            unit.lng,
+            unit.health,
+            unit.max_health,
+            f64::from(unit.health_fraction),
+            unit.dir_lat,
+            unit.dir_lng,
+        ] {
+            checksum.write_f64(value);
+        }
+        for value in [
+            unit.personnel,
+            unit.personnel_capacity,
+            unit.equipment,
+            unit.max_equipment,
+            unit.last_combat_tick,
+            unit.victory_boost_ticks,
+        ] {
+            checksum.write_u64(value);
+        }
+        checksum.write_u64(u64::from(unit.coast_stuck_ticks));
+        checksum.write_bool(unit.landing_penalty_active);
+        checksum.write_bool(unit.transport);
+        checksum.write_bool(unit.at_sea);
+    }
+
+    checksum.write_u64(frame.events.len() as u64);
+    for event in frame.events.iter() {
+        checksum_combat_event(checksum, event);
+    }
+    for ids in [frame.removed_ids.as_ref(), frame.abandoned_ids.as_ref()] {
+        checksum.write_u64(ids.len() as u64);
+        for &id in ids {
+            checksum.write_u64(id);
+        }
+    }
+
+    checksum.write_bytes(&serde_json::to_vec(snapshot.territory_snapshot.as_ref())?);
+    if let Some(strategic) = &snapshot.strategic_snapshot {
+        checksum.write_bool(true);
+        checksum.write_u64(strategic.cycle);
+        checksum.write_u64(strategic.tick);
+        checksum.write_u64(strategic.territory_generation);
+        checksum.write_u64(strategic.territory_commit_sequence);
+        checksum.write_bytes(&serde_json::to_vec(strategic.countries.as_ref())?);
+        checksum.write_bytes(&serde_json::to_vec(strategic.occupations.as_ref())?);
+        checksum.write_bytes(&serde_json::to_vec(
+            strategic.occupation_assessments.as_ref(),
+        )?);
+        checksum.write_bytes(&serde_json::to_vec(strategic.desertions.as_ref())?);
+        checksum.write_bytes(&serde_json::to_vec(strategic.surrenders.as_ref())?);
+        checksum.write_bytes(&serde_json::to_vec(strategic.events.as_ref())?);
+        checksum.write_bytes(&serde_json::to_vec(&strategic.conflict_resolution)?);
+    } else {
+        checksum.write_bool(false);
+    }
+    checksum.write_bytes(&serde_json::to_vec(snapshot.casualty_totals.as_ref())?);
+    Ok(())
+}
+
+fn checksum_combat_event(checksum: &mut Fnv64, event: &CombatEvent) {
+    checksum.write_u64(match event.layer {
+        CombatLayer::Proximity => 0,
+        CombatLayer::Direct => 1,
+    });
+    checksum.write_u64(event.attacker_id);
+    checksum.write_u64(event.target_id);
+    for value in [
+        event.target_damage,
+        event.attacker_damage,
+        event.transport_self_damage,
+        event.target_resulting_health,
+        event.attacker_resulting_health,
+    ] {
+        checksum.write_f64(value);
+    }
+    for value in [
+        event.target_personnel_loss,
+        event.attacker_personnel_loss,
+        event.target_equipment_loss,
+        event.attacker_equipment_loss,
+    ] {
+        checksum.write_u64(value);
+    }
+    checksum.write_bool(event.target_knockback_blocked);
+    checksum.write_bool(event.attacker_knockback_blocked);
+}
+
+fn checksum_territory_update(checksum: &mut Fnv64, update: &TerritoryRenderUpdate) {
+    checksum.write_bool(update.full_update);
+    checksum.write_u64(update.tiles.len() as u64);
+    for tile in &update.tiles {
+        checksum.write_u64(tile.bounds.tile as u64);
+        checksum.write_u64(tile.bounds.min_x as u64);
+        checksum.write_u64(tile.bounds.min_y as u64);
+        checksum.write_u64(tile.bounds.max_x as u64);
+        checksum.write_u64(tile.bounds.max_y as u64);
+        checksum.write_u64(tile.pixels.len() as u64);
+        for &pixel in &tile.pixels {
+            checksum.write_u16(pixel);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Fnv64(u64);
+
+impl Fnv64 {
+    const fn new() -> Self {
+        Self(FNV64_OFFSET)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(FNV64_PRIME);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    fn write_f64(&mut self, value: f64) {
+        self.write_u64(value.to_bits());
+    }
+
+    fn write_bool(&mut self, value: bool) {
+        self.write_bytes(&[u8::from(value)]);
+    }
+
+    const fn value(self) -> u64 {
+        self.0
+    }
+
+    fn finish(self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watchdog_has_a_floor_and_scales_without_overflow() {
+        assert_eq!(watchdog_duration(Duration::from_millis(1), 1), MIN_WATCHDOG);
+        assert_eq!(watchdog_duration(Duration::MAX, u64::MAX), MAX_WATCHDOG);
+    }
+
+    #[test]
+    fn fnv_checksum_is_stable_and_order_sensitive() {
+        let mut left = Fnv64::new();
+        left.write_bytes(b"territory");
+        left.write_u64(7);
+        let mut right = Fnv64::new();
+        right.write_bytes(b"territory");
+        right.write_u64(7);
+        let mut reordered = Fnv64::new();
+        reordered.write_u64(7);
+        reordered.write_bytes(b"territory");
+
+        assert_eq!(left.finish(), right.finish());
+        assert_ne!(left.finish(), reordered.finish());
+    }
+}

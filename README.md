@@ -20,8 +20,12 @@ reference while systems move into the renderer-independent `mw-core` crate.
   territory -> strategic settlement
 - reference-counted immutable snapshots, FIFO territory render deltas, and a
   native `wgpu` unit overlay
+- a named dedicated simulation worker with bounded, lossless atomic
+  publications and explicit stop/join shutdown
 - a versioned browser-to-native checkpoint contract with exact active-grid RLE
   geography for the post-`startWar()` boundary
+- production checkpoint loading in the native viewer plus an exact-step,
+  window-free worker validation mode
 - headless JavaScript parity fixtures and timing for every migrated slice
 
 The repository intentionally starts with the existing browser scenarios rather
@@ -60,6 +64,21 @@ RLE maps plus the live unit/economy handoff. `baselineReplay` exists for
 deterministic fixtures and benchmarks; it is synthetic and must not be treated
 as a saved game or mid-war resume point.
 
+Run a browser-exported production checkpoint in the native viewer, or exercise
+the same dedicated runtime worker without creating a window or GPU device:
+
+```bash
+scenario=../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
+checkpoint=/path/to/native-runtime-checkpoint.json
+cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" "$scenario"
+cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
+```
+
+Both production paths accept only the exact-geography `postStartWar` boundary.
+They reject the synthetic, non-resumable `baselineReplay` boundary. Normal
+startup remains a map-only viewer, and `--demo-units` remains available as the
+small scenario-derived runtime.
+
 For an automated three-frame GPU/window smoke test:
 
 ```bash
@@ -75,10 +94,20 @@ Native viewer controls:
 - left click: print the selected country and geographic cell
 - `Esc`: quit
 
-`mw-native --demo-units` now exercises the same shared `NativeRuntime` used by
-the headless tools. The viewer does not yet load production checkpoint JSON;
-the browser-exported `postStartWar` handoff is currently validated and replayed
-through `mw-tools`.
+`mw-native --demo-units`, production checkpoint viewing, native headless
+validation, and the `mw-tools` runners all exercise the shared `NativeRuntime`.
+Runtime modes give exclusive mutable ownership to the named
+`mw-native-runtime` simulation thread. Each completed tick enters one bounded,
+lossless FIFO publication containing its immutable snapshot and all associated
+territory deltas. Renderer drains may collapse intermediate snapshots to the
+newest snapshot only after receiving complete publications; every territory
+delta remains ordered and is applied. Shutdown explicitly requests stop and
+joins the worker, and initialization, worker, render, panic, and headless
+step-limit failures produce a nonzero process exit.
+
+Threading keeps the measured runtime work off the presentation thread; it does
+not make that work faster. The measured full-cap persistent runtime remains
+about 40 ms/tick, which misses both 60 Hz and the 33.33 ms 30 Hz budget.
 
 Run the complete cross-language parity matrix against the adjacent web checkout:
 

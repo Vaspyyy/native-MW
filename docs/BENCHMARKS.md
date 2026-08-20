@@ -291,12 +291,21 @@ persistent path advances one runtime for 27 measured ticks; it amortizes
 bootstrap and includes the strategic boundary only when the live clock reaches
 it. Neither number includes scenario decode, JSON serialization, or GPU upload.
 
-This complete single-threaded slice does **not** meet a 16.67 ms 60 Hz frame
-budget at the 4,800-unit cap. The measured next targets are direct
+This complete single-threaded tick does **not** meet a 16.67 ms 60 Hz frame
+budget at the 4,800-unit cap. Its measured persistent 40.03 ms/tick also misses
+the 33.33 ms 30 Hz budget. The measured next targets are direct
 territory-source stamping (roughly 13 ms/tick) and checked pair-combat dispatch
-(roughly 5 ms/tick). Production rendering should therefore consume snapshots
-from a dedicated simulation thread or a lower fixed simulation cadence instead
-of running this workload on the presentation thread.
+(roughly 5 ms/tick).
+
+`mw-native` now gives `NativeRuntime` to a named dedicated simulation thread,
+so a slow tick no longer executes on the presentation thread. This isolates
+rendering from tick latency but does not improve the measured simulation rate.
+The worker sends each tick's immutable snapshot and territory deltas as one
+bounded, lossless FIFO publication. Render drains retain every delta in order
+and collapse only intermediate snapshots, after complete publications have
+arrived, to the newest snapshot. Teardown explicitly stops and joins the
+worker; initialization, worker, render, panic, and headless validation failures
+exit nonzero.
 
 The report also publishes milliseconds per tick, completed steps, gate state,
 render updates drained, and deterministic final-state checksums. The benchmark
@@ -318,6 +327,15 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
+Run an exact browser-exported `postStartWar` checkpoint in the production
+viewer or validate an exact number of steps without a window:
+
+```bash
+checkpoint=/path/to/native-runtime-checkpoint.json
+target/release/mw-native --runtime-checkpoint "$checkpoint" "$scenario"
+target/release/mw-native --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
+```
+
 `postStartWar` is the separate production-resumable checkpoint boundary. It is
 accepted only at tick/frame/strategic-cycle zero with exact RLE land,
 world-control, and de-jure maps, zero casualties, no occupations, and
@@ -326,6 +344,6 @@ browser's logical-tick influence ramp and deterministic radius/delta noise from
 the exported unit seed. Other terrain-, urban-, cohesion-, and live-state
 modifiers are resolved at handoff and become native-owned inputs; this is a
 production boundary, not a claim that the remaining browser tick has already
-been ported. The current native viewer uses `NativeRuntime` for `--demo-units`
-but does not yet load that production checkpoint file; `mw-tools` is the v1
-handoff validator and headless runner.
+been ported. Both `mw-native` production modes require this exact-geography
+`postStartWar` boundary and reject `baselineReplay`. Map-only viewing and the
+small scenario-derived `--demo-units` runtime remain separate modes.

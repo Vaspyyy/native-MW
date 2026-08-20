@@ -7,9 +7,12 @@ browser runtime's shared mutable `main.js` structure.
 
 - `mw-core` owns deterministic, serializable simulation state and algorithms.
   It has no renderer, window, DOM, or platform dependencies.
-- `mw-native` owns the window, input mapping, GPU resources, camera, and frame
-  presentation. The renderer reads snapshots; it does not own game rules.
-- `mw-tools` owns headless validation, fixture inspection, and benchmarks.
+- `mw-native` owns the window, input mapping, GPU resources, camera, frame
+  presentation, and the named production runtime worker. The renderer reads
+  immutable publications; it does not own game rules. Its window-free mode
+  exercises the same worker for exact-step production validation.
+- `mw-tools` owns parity fixtures, fixture inspection, and benchmarks, and
+  exposes the strict checkpoint adapter shared with `mw-native`.
 - Existing `.mwsc.gz` scenarios are the compatibility boundary while the web
   and native versions coexist.
 
@@ -31,6 +34,9 @@ browser runtime's shared mutable `main.js` structure.
 8. Derive production country/city/economy inputs and production front layouts
    from an MWSC scenario, then connect the migrated kernels under one native
    tick owner.
+9. Load exact-geography `postStartWar` checkpoints into `mw-native`, run their
+   simulation on a dedicated worker, and present immutable runtime publications
+   without blocking rendering on a tick.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -48,12 +54,13 @@ the JavaScript and Rust implementations and benchmarks a 4,800-unit stress
 case.
 
 Normal `mw-native` startup remains map-only. The opt-in `--demo-units` mode
-finds a real adjacent-country land border in the decoded scenario, constructs a
-small explicit checkpoint, advances the shared `NativeRuntime`, and renders its
-immutable snapshots. This exercises the integration without adding synthetic
-work to normal viewer startup. The viewer does not yet deserialize production
-checkpoint JSON; production checkpoints are currently validated and replayed
-headlessly by `mw-tools`.
+finds a real adjacent-country land border in the decoded scenario and
+constructs a small explicit runtime. `--runtime-checkpoint PATH` instead loads
+the shared strict checkpoint adapter and requires an exact-geography,
+production-resumable `postStartWar` handoff. The viewer rejects
+`baselineReplay`; that boundary remains limited to deterministic fixtures and
+benchmarks. `--headless --ticks N` runs the same checkpoint and worker for
+exactly `N` successful steps without constructing a window or GPU device.
 
 The movement/combat slice ports the resolved per-unit hot path from the browser:
 final movement-distance multiplication, ordered coast deflection, stuck-target
@@ -117,6 +124,23 @@ new cross-kernel snapshot only after the step succeeds. Consumers receive an
 strategic components mutating underneath them. Territory upload payloads are
 also immutable and leave the runtime through a FIFO queue, so a later dirty
 tile cannot overtake an earlier one.
+
+In `mw-native`, the named `mw-native-runtime` thread has exclusive mutable
+ownership of `NativeRuntime`. Each initial state or completed tick is sent as
+one atomic publication containing its immutable snapshot and every territory
+render delta produced before that snapshot. The publication channel is bounded
+and lossless: a full FIFO backpressures simulation instead of dropping or
+reordering territory work. A renderer drain applies every delta in FIFO order
+and may retain only the newest snapshot among the complete publications it
+received. The separate latest-snapshot mailbox is newest-wins telemetry; it is
+not used to splice a snapshot onto unrelated delta state.
+
+Application teardown sends an explicit stop request and joins the worker. A
+blocked full-FIFO publication remains cancellable, and initialization, worker,
+render, panic, and exact-step failures are surfaced as nonzero process exits.
+This moves tick latency off the presentation thread but does not reduce the
+work itself: the measured full-cap persistent runtime is about 40 ms/tick and
+therefore still misses a 33.33 ms 30 Hz budget as well as 60 Hz.
 
 The browser/native handoff is versioned as
 `native-runtime-checkpoint-v1` and makes its semantic boundary explicit:
@@ -204,22 +228,26 @@ publication model for cities, frontlines, labels, and effects.
 4. Native tick orchestration: resolved-order adapter, tactical contact
    dispatch, immutable unit snapshots, and renderer consumption. **Complete.**
 5. Native AI order resolution and assignment publication. **Complete in
-   `mw-core`; connected to the opt-in demo tick.**
+   `mw-core`; connected through both the demo and production runtime paths.**
 6. Territory influence, control attribution, dirty render tiles, and atomic
-   census snapshots. **Complete in `mw-core`; connected to the opt-in demo
-   renderer path.**
+   census snapshots. **Complete in `mw-core`; connected to the demo and strict
+   production-checkpoint renderer paths.**
 7. Economy, occupation, surrender, and atomic strategic orchestration.
-   **Complete in `mw-core`.**
+   **Complete in `mw-core` and connected under `NativeRuntime`.**
 8. Derive production scenario inputs and front objectives, then connect AI,
    simulation, territory, and strategic kernels under one runtime owner.
-   **Complete for the bounded v1 checkpoint contract and headless runner.**
-9. Load production checkpoints in `mw-native`, then extend the checkpoint with
-   live territory/census state and port strategic consequence application for
-   resumable mid-war play.
-10. Move the production simulation onto a dedicated thread after measuring the
-    full-cap orchestration workload, keeping rendering on immutable snapshots.
+   **Complete for the bounded v1 checkpoint contract and runtime.**
+9. Load production checkpoints in `mw-native`. **Complete for strict,
+   exact-geography `postStartWar` viewer and exact-step headless operation;
+   `baselineReplay` is deliberately rejected.**
+10. Move production simulation onto a dedicated thread, keeping presentation
+    on immutable publications and every territory delta lossless. **Complete.**
 11. Native UI/editor/community parity only after the simulation benchmark shows
     the native core is worth continuing.
+
+The next checkpoint/runtime work is a new version carrying live influence,
+controller, and census state plus strategic consequence application for
+resumable mid-war play; v1 validation is not relaxed to simulate this.
 
 Air/naval simulation, the full gameplay HUD, map editor, online/community
 features, and satellite-map parity are still outside the native port.

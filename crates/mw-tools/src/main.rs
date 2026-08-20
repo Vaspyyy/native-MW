@@ -1,6 +1,7 @@
 use std::{env, fs, hint::black_box, path::PathBuf, process, time::Instant};
 
 use anyhow::{Context, Result, bail};
+use mw_checkpoint::native_runtime;
 use mw_core::{
     DecodedScenario, DirectionFieldInput, GridSpec, HostilityMatrix, NeighborOptions, PairOptions,
     TACTICAL_GRID_SCHEMA_VERSION, TacticalGrid, TacticalGridCounters, TacticalUnit,
@@ -11,7 +12,6 @@ use serde_json::{Value, json};
 
 mod ai_orders;
 mod front_layout;
-mod native_runtime;
 mod native_tick;
 mod strategic_cycle;
 mod territory_control;

@@ -407,6 +407,13 @@ enum CheckpointBoundary {
 }
 
 impl CheckpointBoundary {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PostStartWar => "postStartWar",
+            Self::BaselineReplay => "baselineReplay",
+        }
+    }
+
     const fn resumable(self) -> bool {
         matches!(self, Self::PostStartWar)
     }
@@ -624,6 +631,45 @@ struct PreparedRuntime {
     checkpoint: RuntimeCheckpointFixture,
     country_to_side: BTreeMap<u16, usize>,
     coalition_by_side: Vec<BTreeSet<u16>>,
+}
+
+/// Fully validated production handoff for native rendering and simulation.
+///
+/// `decoded` contains the checkpoint's authoritative exact geography. The
+/// runtime owns its independent mutable territory state, so the renderer can
+/// move these decoded maps into its immutable/GPU caches without decoding the
+/// scenario a second time.
+pub struct LoadedRuntime {
+    pub decoded: DecodedScenario,
+    pub runtime: NativeRuntime,
+    pub checkpoint_boundary: &'static str,
+    pub resumable: bool,
+    pub exact_geography_supplied: bool,
+    pub unit_count: usize,
+}
+
+/// Read, strictly validate, and build one browser-to-native runtime handoff.
+///
+/// This is the same path used by `native-runtime-fixture` and
+/// `native-runtime-bench`; the viewer does not have a weaker fallback parser.
+pub fn load_runtime_checkpoint(
+    scenario_path: &PathBuf,
+    checkpoint_path: &PathBuf,
+) -> Result<LoadedRuntime> {
+    let prepared = prepare_runtime(scenario_path, checkpoint_path)?;
+    let runtime = build_runtime(&prepared)?;
+    let checkpoint_boundary = prepared.checkpoint.checkpoint_boundary.as_str();
+    let resumable = prepared.checkpoint.checkpoint_boundary.resumable();
+    let exact_geography_supplied = prepared.checkpoint.geography.is_some();
+    let unit_count = prepared.checkpoint.units.len();
+    Ok(LoadedRuntime {
+        decoded: prepared.decoded,
+        runtime,
+        checkpoint_boundary,
+        resumable,
+        exact_geography_supplied,
+        unit_count,
+    })
 }
 
 type RuntimeTopology = (BTreeMap<u16, usize>, Vec<BTreeSet<u16>>);

@@ -10,6 +10,7 @@ bytemuck.workspace = true
 env_logger.workspace = true
 futures-lite.workspace = true
 log.workspace = true
+mw-checkpoint = { package = "mw-tools", path = "../mw-tools" }
 mw-core = { path = "../mw-core" }
 serde_json.workspace = true
 wgpu.workspace = true
