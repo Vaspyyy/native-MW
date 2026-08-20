@@ -26,6 +26,8 @@ reference while systems move into the renderer-independent `mw-core` crate.
   geography for the post-`startWar()` boundary
 - production checkpoint loading in the native viewer plus an exact-step,
   window-free worker validation mode
+- optimized full-cap territory and combat hot paths using dense lookup tables,
+  reusable cell tracking, and in-place prevalidated pair dispatch
 - headless JavaScript parity fixtures and timing for every migrated slice
 
 The repository intentionally starts with the existing browser scenarios rather
@@ -105,9 +107,18 @@ delta remains ordered and is applied. Shutdown explicitly requests stop and
 joins the worker, and initialization, worker, render, panic, and headless
 step-limit failures produce a nonzero process exit.
 
-Threading keeps the measured runtime work off the presentation thread; it does
-not make that work faster. The measured full-cap persistent runtime remains
-about 40 ms/tick, which misses both 60 Hz and the 33.33 ms 30 Hz budget.
+Threading keeps the measured runtime work off the presentation thread. The
+optimized full-cap persistent runtime has a 30.456 ms/tick median, 24.4% below
+the same-turn 40.310 ms/tick baseline, so it meets the 33.33 ms 30 Hz median
+budget. Its conservative p95 is still 131.183 ms per three-tick sample, or
+about 43.7 ms/tick, and it does not meet a 16.67 ms 60 Hz budget.
+
+The hot path maps every `u16` country ID to a side through a dense lookup,
+checks cities through a dense cell mask, and records influenced cells in
+reused masks and vectors. Combat configuration is validated at the simulation
+boundary, after which accepted attacker/target pairs are mutated directly by
+the prevalidated kernels. War-grace bypass applies only to proximity contacts;
+eligible direct engagements still execute during grace.
 
 Run the complete cross-language parity matrix against the adjacent web checkout:
 

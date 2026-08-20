@@ -13,8 +13,8 @@ use thiserror::Error;
 use crate::{
     combat::{
         CombatConfig, CombatContext, CombatError, CombatEvent, CombatUnit, UnitKind,
-        formation_strength, resolve_direct_engagement, resolve_proximity_contact,
-        wrapped_longitude_delta,
+        formation_strength, resolve_direct_engagement_prevalidated,
+        resolve_proximity_contact_prevalidated, wrapped_longitude_delta,
     },
     direction::HostilityMatrix,
     movement::{MovementError, MovementFactors, MovementInput, MovementState, integrate_unit_step},
@@ -286,6 +286,7 @@ impl Simulation {
             (self.config.combat.proximity_radius / self.grid.cell_size).ceil() as usize;
         let proximity_radius_sq =
             self.config.combat.proximity_radius * self.config.combat.proximity_radius;
+        let in_war_grace = input.frame < input.war_grace_end;
 
         // This preserves the browser simulation's reverse stable-array loop.
         for attacker_idx in (0..self.units.len()).rev() {
@@ -359,30 +360,32 @@ impl Simulation {
                 })
                 .or_else(|| self.accepted.first().copied());
 
-            // Keep the reusable accepted buffer while mutating unit state.
-            for position in 0..self.accepted.len() {
-                let target_idx = self.accepted[position];
-                // Mirrors `b && b.health > 0` in the reference orchestration.
-                if self.units[target_idx].combat.health <= 0.0 {
-                    continue;
-                }
-                let context = combat_context(input, order.combat);
-                if let Some(event) = self.resolve_pair(attacker_idx, target_idx, false, &context)? {
-                    counters.proximity_events += 1;
-                    self.events.push(event);
+            let mut direct_engaged = false;
+            let context = combat_context(input, order.combat);
+            if !in_war_grace {
+                // Keep the reusable accepted buffer while mutating unit state.
+                for position in 0..self.accepted.len() {
+                    let target_idx = self.accepted[position];
+                    // Mirrors `b && b.health > 0` in the reference orchestration.
+                    if self.units[target_idx].combat.health <= 0.0 {
+                        continue;
+                    }
+                    if let Some(event) =
+                        self.resolve_pair(attacker_idx, target_idx, false, &context)
+                    {
+                        counters.proximity_events += 1;
+                        self.events.push(event);
+                    }
                 }
             }
 
-            let mut direct_engaged = false;
             if let Some(target_idx) = selected_target
                 && self.units[target_idx].combat.health > 0.0
+                && let Some(event) = self.resolve_pair(attacker_idx, target_idx, true, &context)
             {
-                let context = combat_context(input, order.combat);
-                if let Some(event) = self.resolve_pair(attacker_idx, target_idx, true, &context)? {
-                    counters.direct_events += 1;
-                    self.events.push(event);
-                    direct_engaged = true;
-                }
+                counters.direct_events += 1;
+                self.events.push(event);
+                direct_engaged = true;
             }
 
             if !direct_engaged && order.movement_enabled {
@@ -532,21 +535,26 @@ impl Simulation {
         target_idx: usize,
         direct: bool,
         context: &CombatContext<'_>,
-    ) -> Result<Option<CombatEvent>, SimulationError> {
-        // Combat kernels own pair mutation. Copying two records keeps this
-        // adapter O(1) while avoiding a full-unit-vector clone per contact.
-        let mut pair = [
-            self.units[attacker_idx].combat.clone(),
-            self.units[target_idx].combat.clone(),
-        ];
-        let event = if direct {
-            resolve_direct_engagement(&mut pair, 0, 1, context, &self.config.combat)?
+    ) -> Option<CombatEvent> {
+        debug_assert_ne!(attacker_idx, target_idx);
+        let config = self.config.combat;
+        let (attacker, target) =
+            two_simulation_units_mut(&mut self.units, attacker_idx, target_idx);
+        if direct {
+            resolve_direct_engagement_prevalidated(
+                &mut attacker.combat,
+                &mut target.combat,
+                context,
+                &config,
+            )
         } else {
-            resolve_proximity_contact(&mut pair, 0, 1, context, &self.config.combat)?
-        };
-        self.units[attacker_idx].combat = pair[0].clone();
-        self.units[target_idx].combat = pair[1].clone();
-        Ok(event)
+            resolve_proximity_contact_prevalidated(
+                &mut attacker.combat,
+                &mut target.combat,
+                context,
+                &config,
+            )
+        }
     }
 
     fn make_snapshot(&self, tick: u64, frame: u64) -> FrameSnapshot {
@@ -588,6 +596,20 @@ impl Simulation {
             removed_ids: self.removed.clone().into(),
             abandoned_ids: self.abandoned.clone().into(),
         }
+    }
+}
+
+fn two_simulation_units_mut(
+    units: &mut [SimulationUnit],
+    attacker_idx: usize,
+    target_idx: usize,
+) -> (&mut SimulationUnit, &mut SimulationUnit) {
+    if attacker_idx < target_idx {
+        let (left, right) = units.split_at_mut(target_idx);
+        (&mut left[attacker_idx], &mut right[0])
+    } else {
+        let (left, right) = units.split_at_mut(attacker_idx);
+        (&mut right[0], &mut left[target_idx])
     }
 }
 
@@ -712,6 +734,7 @@ fn defeated(unit: &CombatUnit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::combat::{resolve_direct_engagement, resolve_proximity_contact};
 
     fn army(id: u64, side: u64, lat: f64, lng: f64) -> SimulationUnit {
         SimulationUnit {
@@ -1008,5 +1031,168 @@ mod tests {
                 .unwrap()
                 .landing_penalty_active
         );
+    }
+
+    #[test]
+    fn war_grace_skips_proximity_but_preserves_preferred_direct_engagement() {
+        let mask = all_land();
+        let relations = [0, 1, 0, 0];
+        let mut config = SimulationConfig::default();
+        config.combat.direct_radius = 0.3;
+        config.combat.target_jitter_scale = 0.0;
+        let initial = vec![
+            army(10, 0, 0.0, 0.0),
+            army(30, 1, 0.1, 0.0),
+            army(20, 1, 0.2, 0.0),
+        ];
+        let mut expected_pair = [initial[0].combat.clone(), initial[1].combat.clone()];
+        let expected_context = CombatContext {
+            sim_tick: 10,
+            frame: 9,
+            war_grace_end: 10,
+            world: Some(world(&mask)),
+            ..CombatContext::default()
+        };
+        let expected_direct =
+            resolve_direct_engagement(&mut expected_pair, 0, 1, &expected_context, &config.combat)
+                .unwrap()
+                .unwrap();
+        let mut simulation = Simulation::new(config, initial.clone()).unwrap();
+        let mut attacker_order = move_order(10);
+        attacker_order.preferred_target_id = Some(30);
+        attacker_order.factors.base_speed = 0.001;
+        let orders = [attacker_order];
+        let grace_input = TickInput {
+            frame: 9,
+            war_grace_end: 10,
+            ..input(&mask, &orders, Some(&relations))
+        };
+
+        let (grace, counters) = simulation.step(grace_input).unwrap();
+        assert_eq!(counters.candidate_contacts, 2);
+        assert_eq!(counters.accepted_contacts, 2);
+        assert_eq!(counters.proximity_events, 0);
+        assert_eq!(counters.direct_events, 1);
+        assert_eq!(counters.moved_units, 0);
+        assert_eq!(counters.held_units, 3);
+        assert_eq!(&*grace.events, &[expected_direct]);
+        assert_eq!(simulation.units[0].combat, expected_pair[0]);
+        assert_eq!(simulation.units[1].combat, expected_pair[1]);
+        assert_eq!(simulation.units[2].combat, initial[2].combat);
+
+        let active_input = TickInput {
+            frame: 10,
+            war_grace_end: 10,
+            ..input(&mask, &orders, Some(&relations))
+        };
+        let (active, active_counters) = simulation.step(active_input).unwrap();
+        assert_eq!(active_counters.candidate_contacts, 2);
+        assert_eq!(active_counters.accepted_contacts, 2);
+        assert_eq!(active_counters.moved_units, 0);
+        assert_eq!(
+            active
+                .events
+                .iter()
+                .map(|event| (event.layer, event.target_id))
+                .collect::<Vec<_>>(),
+            [
+                (crate::combat::CombatLayer::Proximity, 20),
+                (crate::combat::CombatLayer::Proximity, 30),
+                (crate::combat::CombatLayer::Direct, 30),
+            ]
+        );
+    }
+
+    #[test]
+    fn prevalidated_pair_dispatch_matches_public_kernel_events_exactly() {
+        let mask = all_land();
+        let mut config = SimulationConfig::default();
+        config.combat.direct_radius = 0.3;
+        config.combat.target_jitter_scale = 0.0;
+        let initial = vec![army(1, 0, 0.0, 0.0), army(2, 1, 0.1, 0.0)];
+        let mut expected_units = initial
+            .iter()
+            .map(|unit| unit.combat.clone())
+            .collect::<Vec<_>>();
+        let context = CombatContext {
+            sim_tick: 10,
+            frame: 10,
+            world: Some(world(&mask)),
+            ..CombatContext::default()
+        };
+        let mut expected_events = Vec::new();
+        for (attacker_idx, target_idx) in [(1, 0), (0, 1)] {
+            if expected_units[attacker_idx].health <= 0.0 {
+                continue;
+            }
+            if expected_units[target_idx].health > 0.0
+                && let Some(event) = resolve_proximity_contact(
+                    &mut expected_units,
+                    attacker_idx,
+                    target_idx,
+                    &context,
+                    &config.combat,
+                )
+                .unwrap()
+            {
+                expected_events.push(event);
+            }
+            if expected_units[target_idx].health > 0.0
+                && let Some(event) = resolve_direct_engagement(
+                    &mut expected_units,
+                    attacker_idx,
+                    target_idx,
+                    &context,
+                    &config.combat,
+                )
+                .unwrap()
+            {
+                expected_events.push(event);
+            }
+        }
+
+        let mut simulation = Simulation::new(config, initial).unwrap();
+        let (snapshot, counters) = simulation.step(input(&mask, &[], None)).unwrap();
+        assert_eq!(&*snapshot.events, expected_events);
+        assert_eq!(
+            counters.proximity_events + counters.direct_events,
+            expected_events.len()
+        );
+        for expected in expected_units {
+            let actual = simulation
+                .units
+                .iter()
+                .find(|unit| unit.combat.id == expected.id)
+                .unwrap();
+            assert_eq!(actual.combat, expected);
+        }
+    }
+
+    #[test]
+    fn lethal_same_tick_contact_preserves_casualties_and_deferred_removal() {
+        let mask = all_land();
+        let mut config = SimulationConfig::default();
+        config.combat.combat_damage = 1_000.0;
+        config.combat.target_jitter_scale = 0.0;
+        let mut simulation =
+            Simulation::new(config, vec![army(1, 0, 0.0, 0.0), army(2, 1, 0.0, 0.0)]).unwrap();
+
+        let (snapshot, counters) = simulation.step(input(&mask, &[], None)).unwrap();
+        assert_eq!(counters.proximity_events, 1);
+        assert_eq!(counters.direct_events, 0);
+        assert_eq!(counters.removed_units, 1);
+        assert_eq!(&*snapshot.removed_ids, &[1]);
+        assert_eq!(snapshot.events.len(), 1);
+        let event = &snapshot.events[0];
+        assert_eq!(event.attacker_id, 2);
+        assert_eq!(event.target_id, 1);
+        assert_eq!(event.target_personnel_loss, 1_000);
+        assert_eq!(event.attacker_personnel_loss, 0);
+        assert_eq!(event.target_resulting_health, 0.0);
+        assert_eq!(event.attacker_resulting_health, 100.0);
+        assert_eq!(snapshot.units.len(), 1);
+        assert_eq!(snapshot.units[0].id, 2);
+        assert_eq!(snapshot.units[0].personnel, 1_000);
+        assert_eq!(snapshot.units[0].victory_boost_ticks, 240);
     }
 }

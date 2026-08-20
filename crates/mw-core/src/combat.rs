@@ -358,18 +358,29 @@ pub fn resolve_proximity_contact(
     config: &CombatConfig,
 ) -> Result<Option<CombatEvent>, CombatError> {
     validate_pair(units, attacker_idx, target_idx, context, config)?;
-    let distance_squared = {
-        let (attacker, target) = (&units[attacker_idx], &units[target_idx]);
-        wrapped_distance_squared(attacker, target)
-    };
+    let (attacker, target) = two_units_mut(units, attacker_idx, target_idx);
+    Ok(resolve_proximity_contact_prevalidated(
+        attacker, target, context, config,
+    ))
+}
+
+/// Resolve proximity combat for a pair validated by the enclosing simulation
+/// boundary. This keeps the checked public API while avoiding repeated world,
+/// config, and unit validation in the per-contact dispatch path.
+pub(crate) fn resolve_proximity_contact_prevalidated(
+    attacker: &mut CombatUnit,
+    target: &mut CombatUnit,
+    context: &CombatContext<'_>,
+    config: &CombatConfig,
+) -> Option<CombatEvent> {
+    let distance_squared = wrapped_distance_squared(attacker, target);
     // Browser proximity contact uses a strict `< 0.09` gate.
     if distance_squared >= config.proximity_radius * config.proximity_radius
         || context.frame < context.war_grace_end
     {
-        return Ok(None);
+        return None;
     }
 
-    let (attacker, target) = two_units_mut(units, attacker_idx, target_idx);
     let mut proximity_damage = config.combat_damage
         * 0.45
         * context.attacker_damage_dealt_multiplier
@@ -419,7 +430,7 @@ pub fn resolve_proximity_contact(
         attacker.victory_boost_ticks = 240;
     }
 
-    Ok(Some(CombatEvent {
+    Some(CombatEvent {
         schema_version: COMBAT_SCHEMA_VERSION,
         layer: CombatLayer::Proximity,
         attacker_id: attacker.id,
@@ -439,7 +450,7 @@ pub fn resolve_proximity_contact(
         attacker_resulting_health: attacker.health,
         target_knockback_blocked: false,
         attacker_knockback_blocked: false,
-    }))
+    })
 }
 
 pub fn resolve_direct_engagement(
@@ -450,16 +461,26 @@ pub fn resolve_direct_engagement(
     config: &CombatConfig,
 ) -> Result<Option<CombatEvent>, CombatError> {
     validate_pair(units, attacker_idx, target_idx, context, config)?;
-    let distance = {
-        let (attacker, target) = (&units[attacker_idx], &units[target_idx]);
-        jittered_target_distance(attacker, target, config.target_jitter_scale)
-    };
+    let (attacker, target) = two_units_mut(units, attacker_idx, target_idx);
+    Ok(resolve_direct_engagement_prevalidated(
+        attacker, target, context, config,
+    ))
+}
+
+/// Resolve direct combat for a pair validated by the enclosing simulation
+/// boundary. Public callers continue to use [`resolve_direct_engagement`].
+pub(crate) fn resolve_direct_engagement_prevalidated(
+    attacker: &mut CombatUnit,
+    target: &mut CombatUnit,
+    context: &CombatContext<'_>,
+    config: &CombatConfig,
+) -> Option<CombatEvent> {
+    let distance = jittered_target_distance(attacker, target, config.target_jitter_scale);
     // Browser moves only when `dist > 0.05`; equality enters direct combat.
     if distance > config.direct_radius {
-        return Ok(None);
+        return None;
     }
 
-    let (attacker, target) = two_units_mut(units, attacker_idx, target_idx);
     let target_damage = combined_arms_damage(
         config.combat_damage * context.attacker_damage_dealt_multiplier * 0.7,
         attacker,
@@ -498,7 +519,7 @@ pub fn resolve_direct_engagement(
         attacker.victory_boost_ticks = 180;
     }
 
-    Ok(Some(CombatEvent {
+    Some(CombatEvent {
         schema_version: COMBAT_SCHEMA_VERSION,
         layer: CombatLayer::Direct,
         attacker_id: attacker.id,
@@ -514,7 +535,7 @@ pub fn resolve_direct_engagement(
         attacker_resulting_health: attacker.health,
         target_knockback_blocked: target_blocked,
         attacker_knockback_blocked: attacker_blocked,
-    }))
+    })
 }
 
 fn apply_direct_knockback(
@@ -1064,6 +1085,55 @@ mod tests {
         };
         assert_eq!(
             resolve_direct_engagement(&mut units, 0, 1, &bad_context, &CombatConfig::default()),
+            Err(CombatError::InvalidWorld)
+        );
+    }
+
+    #[test]
+    fn public_entry_points_still_reject_invalid_inputs_before_pair_dispatch() {
+        let mut units = vec![army(1, 0.0, 0.0), army(2, 0.0, 0.0)];
+        let nonfinite_context = CombatContext {
+            defense_bonus: f64::NAN,
+            ..CombatContext::default()
+        };
+        assert_eq!(
+            resolve_direct_engagement(
+                &mut units,
+                0,
+                1,
+                &nonfinite_context,
+                &CombatConfig::default(),
+            ),
+            Err(CombatError::NonFiniteInput)
+        );
+
+        let invalid_config = CombatConfig {
+            direct_radius: 0.0,
+            ..CombatConfig::default()
+        };
+        assert_eq!(
+            resolve_direct_engagement(&mut units, 0, 1, &CombatContext::default(), &invalid_config,),
+            Err(CombatError::InvalidConfig)
+        );
+
+        let invalid_world = WorldGridView {
+            grid_res: 1.0,
+            width: 2,
+            height: 2,
+            land_mask: &[1],
+        };
+        let invalid_world_context = CombatContext {
+            world: Some(invalid_world),
+            ..CombatContext::default()
+        };
+        assert_eq!(
+            resolve_proximity_contact(
+                &mut units,
+                0,
+                1,
+                &invalid_world_context,
+                &CombatConfig::default(),
+            ),
             Err(CombatError::InvalidWorld)
         );
     }

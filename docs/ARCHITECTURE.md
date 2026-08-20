@@ -69,6 +69,14 @@ formation and equipment losses, combined-arms modifiers, and guarded
 knockback. The fixture runner replays the same ordered operations through the
 JavaScript reference and Rust.
 
+The optimized orchestration validates combat configuration at the simulation
+boundary and then dispatches accepted pairs through internal prevalidated
+kernels. Those kernels borrow the two live unit records mutably and in place,
+avoiding temporary pair clones and repeated per-contact validation while the
+checked public combat API remains unchanged. War-grace short-circuiting skips
+only the proximity-contact loop; target selection and eligible direct combat
+still run, preserving the browser behavior.
+
 Terrain and country modifiers remain explicit caller inputs to the movement and
 combat kernels. The AI planner now owns deterministic contact selection,
 retreat decisions, sticky/capacity-limited frontline assignment,
@@ -138,9 +146,11 @@ not used to splice a snapshot onto unrelated delta state.
 Application teardown sends an explicit stop request and joins the worker. A
 blocked full-FIFO publication remains cancellable, and initialization, worker,
 render, panic, and exact-step failures are surfaced as nonzero process exits.
-This moves tick latency off the presentation thread but does not reduce the
-work itself: the measured full-cap persistent runtime is about 40 ms/tick and
-therefore still misses a 33.33 ms 30 Hz budget as well as 60 Hz.
+This moves tick latency off the presentation thread. The subsequent hot-path
+optimization reduced the full-cap persistent median from 40.310 to 30.456
+ms/tick, meeting a 33.33 ms 30 Hz median budget. The conservative p95 remains
+131.183 ms per three-tick sample, or about 43.7 ms/tick, so 30 Hz is not yet a
+tail-latency guarantee and the runtime still misses a 16.67 ms 60 Hz budget.
 
 The browser/native handoff is versioned as
 `native-runtime-checkpoint-v1` and makes its semantic boundary explicit:
@@ -176,6 +186,14 @@ implicit relaxation of v1 validation.
 updated with browser-compatible Float32 rounding, hostile decay, reclaim rules,
 primary occupier credit, and controller hysteresis. Mutations mark census and
 render tiles instead of forcing a whole-map rescan or texture upload.
+
+Country-to-side resolution uses a dense table covering the complete `u16` ID
+space, and city membership uses a dense cell mask. Influence application
+deduplicates touched, controller-changed, and credit-changed cells with
+persistent masks and reusable vectors; only recorded bits are cleared between
+applications. The published cell lists retain their sorted, unique contract,
+but ordered-tree lookup and allocation are removed from the source-stamping hot
+loop.
 
 The current territory boundary covers direct source stamping and attribution.
 The browser's separate frontier-diffusion pass and active-combat exclusion are
@@ -242,8 +260,11 @@ publication model for cities, frontlines, labels, and effects.
    `baselineReplay` is deliberately rejected.**
 10. Move production simulation onto a dedicated thread, keeping presentation
     on immutable publications and every territory delta lossless. **Complete.**
-11. Native UI/editor/community parity only after the simulation benchmark shows
-    the native core is worth continuing.
+11. Optimize full-cap territory stamping and combat-pair dispatch without
+    changing parity outputs. **Complete; the persistent median now meets the
+    30 Hz tick budget, while p95 and 60 Hz do not.**
+12. Native UI/editor/community parity remains later work after the remaining
+    simulation boundaries are chosen and measured.
 
 The next checkpoint/runtime work is a new version carrying live influence,
 controller, and census state plus strategic consequence application for

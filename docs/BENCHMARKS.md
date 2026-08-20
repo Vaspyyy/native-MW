@@ -1,9 +1,10 @@
-# Port baseline benchmarks
+# Native port benchmarks
 
-Measured on 2026-08-19 with an AMD Ryzen 7 5800X (8 cores / 16 threads),
-Rust 1.96.0, and Node 26.4.0. Both implementations decoded or processed the
-same Modern 2022 scenario at the web game's 0.15 degree target grid
-(2400x1200). Each result is the median of nine warm runs.
+Unless a section says otherwise, measurements were captured on 2026-08-19
+with an AMD Ryzen 7 5800X (8 cores / 16 threads), Rust 1.96.0, and Node 26.4.0.
+Both implementations decoded or processed the same Modern 2022 scenario at
+the web game's 0.15 degree target grid (2400x1200). Each result is the median
+of nine warm runs.
 
 | Workload | JavaScript reference | Rust release | Speedup |
 |---|---:|---:|---:|
@@ -266,36 +267,48 @@ includes the tick-600 strategic boundary. This boundary is synthetic and
 non-resumable; it is suitable for repeatable measurements, not for loading a
 mid-war browser save.
 
-Two complete release validation runs used 3 warmups and 9 measured samples.
-The values below are the median of the two run medians; p95 is the more
-conservative of the two observed p95 values.
+This comparison was captured on 2026-08-20. Its baseline came from unmodified
+commit `95cf6f1` in the same optimization turn. The optimized result aggregates
+five independent release runs; every run used 3 warmups, 9 measured samples,
+and 3 ticks per sample. Optimized medians are the median of the five run
+medians, while p95 is the conservative maximum observed across those runs.
 
-| Complete three-tick runtime sample | Rust release |
-|---|---:|
-| Fresh checkpoint median | 156.23 ms (52.08 ms/tick) |
-| Fresh checkpoint p95 | 166.34 ms |
-| Persistent runtime median | 120.08 ms (40.03 ms/tick) |
-| Persistent runtime p95 | 159.05 ms |
+| Complete three-tick runtime sample | `95cf6f1` baseline | Optimized | Median improvement |
+|---|---:|---:|---:|
+| Fresh checkpoint median | 158.711605 ms (52.903868 ms/tick) | 131.427569 ms (43.809190 ms/tick) | 17.2% |
+| Fresh checkpoint p95 | 163.776105 ms | 143.111286 ms | — |
+| Persistent runtime median | 120.929678 ms (40.309893 ms/tick) | 91.368914 ms (30.456305 ms/tick) | 24.4% |
+| Persistent runtime p95 | 159.519743 ms | 131.182571 ms | — |
 
-Both runs produced the same semantic benchmark checksum
-(`e3a00ede1aef3d2e`), fresh final-state checksum
-(`76a31ed4472b0d44`), and persistent final-state checksum
-(`225367174534d753`). A representative active tick retained 4,708 authoritative
-front slots, assigned 92 reinforcements, traversed about 385,000 hostile
-tactical candidates, accepted 46,052 contacts, and evaluated 128,007 territory
-source/cell applications. No work was skipped to obtain the timing.
+The optimized pass replaces hot-path ordered country-side lookup with a dense
+table for the complete `u16` ID space, city lookup with a dense cell mask, and
+per-call touched-cell sets with reusable bitset masks and vectors. Combat
+dispatch validates the enclosing simulation boundary once, then mutates
+accepted attacker/target pairs directly through prevalidated kernels instead
+of cloning and rechecking each pair. The war-grace fast path bypasses proximity
+contacts only; eligible direct combat still runs.
+
+The semantic benchmark checksum remained `e3a00ede1aef3d2e`, the fresh
+final-state checksum remained `76a31ed4472b0d44`, and the persistent
+final-state checksum remained `225367174534d753`. A representative active tick
+retained 4,708 authoritative front slots, assigned 92 reinforcements, traversed
+about 385,000 hostile tactical candidates, accepted 46,052 contacts, and
+evaluated 128,007 territory source/cell applications. No work was skipped to
+obtain the timing.
 
 The fresh path reconstructs the checkpoint for every sample, so all nine
-samples include front bootstrap and the tick-600 strategic boundary. The
-persistent path advances one runtime for 27 measured ticks; it amortizes
-bootstrap and includes the strategic boundary only when the live clock reaches
-it. Neither number includes scenario decode, JSON serialization, or GPU upload.
+samples in each run include front bootstrap and the tick-600 strategic
+boundary. Each persistent run advances one runtime for 27 measured ticks; it
+amortizes bootstrap and includes the strategic boundary only when the live
+clock reaches it. Neither number includes scenario decode, JSON serialization,
+or GPU upload.
 
-This complete single-threaded tick does **not** meet a 16.67 ms 60 Hz frame
-budget at the 4,800-unit cap. Its measured persistent 40.03 ms/tick also misses
-the 33.33 ms 30 Hz budget. The measured next targets are direct
-territory-source stamping (roughly 13 ms/tick) and checked pair-combat dispatch
-(roughly 5 ms/tick).
+The optimized persistent median of 30.456305 ms/tick meets the 33.33 ms 30 Hz
+tick budget at the 4,800-unit cap. Its conservative p95 is 131.182571 ms per
+three-tick sample, equivalent to about 43.7 ms/tick, so 30 Hz is not yet met at
+that tail percentile. The complete tick also remains above the 16.67 ms 60 Hz
+budget. Further performance work should be chosen from a fresh profile of the
+optimized runtime; these results do not claim a new dominant hotspot.
 
 `mw-native` now gives `NativeRuntime` to a named dedicated simulation thread,
 so a slow tick no longer executes on the presentation thread. This isolates

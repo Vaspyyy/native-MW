@@ -13,6 +13,7 @@ pub const TERRITORY_SCHEMA_VERSION: &str = "territory-control-v1";
 pub const DEFAULT_TERRITORY_TILE_SIZE: usize = 32;
 const CONTROL_HYSTERESIS: f64 = 0.15;
 const CREDIT_THRESHOLD: f64 = 0.05;
+const COUNTRY_ID_COUNT: usize = u16::MAX as usize + 1;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TerritoryError {
@@ -270,6 +271,59 @@ struct InfluenceApplyCounts {
     credit_change_count: usize,
 }
 
+#[derive(Default)]
+struct InfluenceCellChanges {
+    touched_mask: Vec<bool>,
+    controller_mask: Vec<bool>,
+    credit_mask: Vec<bool>,
+    touched: Vec<usize>,
+    controllers: Vec<usize>,
+    credits: Vec<usize>,
+}
+
+impl InfluenceCellChanges {
+    fn new(total_cells: usize) -> Self {
+        Self {
+            touched_mask: vec![false; total_cells],
+            controller_mask: vec![false; total_cells],
+            credit_mask: vec![false; total_cells],
+            touched: Vec::new(),
+            controllers: Vec::new(),
+            credits: Vec::new(),
+        }
+    }
+
+    fn record_touched(&mut self, cell: usize) {
+        record_cell(&mut self.touched_mask, &mut self.touched, cell);
+    }
+
+    fn record_controller(&mut self, cell: usize) {
+        record_cell(&mut self.controller_mask, &mut self.controllers, cell);
+    }
+
+    fn record_credit(&mut self, cell: usize) {
+        record_cell(&mut self.credit_mask, &mut self.credits, cell);
+    }
+
+    fn finish(&mut self, counts: InfluenceApplyCounts) -> InfluenceApplyResult {
+        self.touched.sort_unstable();
+        self.controllers.sort_unstable();
+        self.credits.sort_unstable();
+        let result = InfluenceApplyResult {
+            processed_source_cells: counts.processed_source_cells,
+            controller_change_count: counts.controller_change_count,
+            credit_change_count: counts.credit_change_count,
+            touched_influence_cells: self.touched.clone(),
+            changed_controller_cells: self.controllers.clone(),
+            changed_credit_cells: self.credits.clone(),
+        };
+        clear_recorded_cells(&mut self.touched_mask, &mut self.touched);
+        clear_recorded_cells(&mut self.controller_mask, &mut self.controllers);
+        clear_recorded_cells(&mut self.credit_mask, &mut self.credits);
+        result
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct CountryCounts {
     owned: i64,
@@ -344,10 +398,12 @@ pub struct TerritoryControl {
     tile_size: usize,
     maps: TerritoryMaps,
     country_to_side: BTreeMap<u16, usize>,
+    country_side_index: Box<[i16]>,
     hostility_matrix: Vec<u8>,
     cities: Vec<CityRef>,
     cities_by_tile: BTreeMap<usize, Vec<CityRef>>,
-    city_cells: BTreeSet<usize>,
+    city_cell_mask: Vec<bool>,
+    influence_cell_changes: InfluenceCellChanges,
     protected_owner_ids: BTreeSet<u16>,
     census_dirty: BTreeSet<usize>,
     render_dirty: BTreeSet<usize>,
@@ -372,8 +428,11 @@ impl TerritoryControl {
     pub fn new(config: TerritoryConfig) -> Result<Self, TerritoryError> {
         validate_config(&config)?;
         let total_tiles = tile_count(config.width, config.height, config.tile_size);
+        let total_cells = config.maps.land.len();
         let cities = normalize_cities(&config.cities, config.width, config.height)?;
-        let (cities_by_tile, city_cells) = index_cities(&cities, config.width, config.tile_size);
+        let (cities_by_tile, city_cell_mask) =
+            index_cities(&cities, config.width, config.tile_size, total_cells);
+        let country_side_index = index_country_sides(&config.country_to_side);
         let all_tiles = (0..total_tiles).collect::<BTreeSet<_>>();
         Ok(Self {
             width: config.width,
@@ -383,10 +442,12 @@ impl TerritoryControl {
             tile_size: config.tile_size,
             maps: config.maps,
             country_to_side: config.country_to_side,
+            country_side_index,
             hostility_matrix: config.hostility_matrix,
             cities,
             cities_by_tile,
-            city_cells,
+            city_cell_mask,
+            influence_cell_changes: InfluenceCellChanges::new(total_cells),
             protected_owner_ids: config.protected_owner_ids,
             census_dirty: all_tiles.clone(),
             render_dirty: all_tiles,
@@ -560,6 +621,7 @@ impl TerritoryControl {
             return Ok(false);
         }
         self.country_to_side = mapping;
+        self.country_side_index = index_country_sides(&self.country_to_side);
         self.hostility_matrix = hostility;
         self.topology_revision = revision;
         self.invalidate_all_census();
@@ -572,10 +634,11 @@ impl TerritoryControl {
         revision: u64,
     ) -> Result<(), TerritoryError> {
         let normalized = normalize_cities(&cities, self.width, self.height)?;
-        let (by_tile, cells) = index_cities(&normalized, self.width, self.tile_size);
+        let (by_tile, cell_mask) =
+            index_cities(&normalized, self.width, self.tile_size, self.total_cells());
         self.cities = normalized;
         self.cities_by_tile = by_tile;
-        self.city_cells = cells;
+        self.city_cell_mask = cell_mask;
         self.city_revision = revision;
         self.invalidate_all_census();
         Ok(())
@@ -751,35 +814,20 @@ impl TerritoryControl {
         for source in sources {
             validate_source(source, self.max_sides)?;
         }
-        let mut touched = BTreeSet::new();
-        let mut controllers = BTreeSet::new();
-        let mut credits = BTreeSet::new();
+        let mut changes = std::mem::take(&mut self.influence_cell_changes);
         let mut counts = InfluenceApplyCounts::default();
         for source in sources {
-            self.apply_source(
-                source,
-                &mut touched,
-                &mut controllers,
-                &mut credits,
-                &mut counts,
-            );
+            self.apply_source(source, &mut changes, &mut counts);
         }
-        Ok(InfluenceApplyResult {
-            processed_source_cells: counts.processed_source_cells,
-            controller_change_count: counts.controller_change_count,
-            credit_change_count: counts.credit_change_count,
-            touched_influence_cells: touched.into_iter().collect(),
-            changed_controller_cells: controllers.into_iter().collect(),
-            changed_credit_cells: credits.into_iter().collect(),
-        })
+        let result = changes.finish(counts);
+        self.influence_cell_changes = changes;
+        Ok(result)
     }
 
     fn apply_source(
         &mut self,
         source: &InfluenceSource,
-        touched: &mut BTreeSet<usize>,
-        controllers: &mut BTreeSet<usize>,
-        credits: &mut BTreeSet<usize>,
+        changes: &mut InfluenceCellChanges,
         counts: &mut InfluenceApplyCounts,
     ) {
         // Exact browser floor-and-clamp bounds and lower-edge cell coordinates.
@@ -808,7 +856,7 @@ impl TerritoryControl {
                     continue;
                 }
                 let owner = self.maps.world_control[i];
-                let owner_side = self.country_to_side.get(&owner).copied();
+                let owner_side = mapped_side(&self.country_side_index, owner);
                 let owner_ally = source.owner_ally_country_ids.contains(&owner);
                 if owner_side
                     .is_some_and(|s| s != source.side && !self.sides_hostile(source.side, s))
@@ -828,7 +876,7 @@ impl TerritoryControl {
                 counts.processed_source_cells += 1;
 
                 let mut cell_delta = source.delta;
-                if self.city_cells.contains(&i) {
+                if self.city_cell_mask[i] {
                     cell_delta *= 0.35;
                 }
                 let weight =
@@ -845,7 +893,7 @@ impl TerritoryControl {
                 let old_controller = self.maps.dominant_side[i];
                 let old_credit = self.maps.primary_occupier[i];
                 if !owner_ally
-                    && self.country_to_side.get(&old_credit).copied() != Some(source.side)
+                    && mapped_side(&self.country_side_index, old_credit) != Some(source.side)
                 {
                     let neighbor = self.select_neighbor_credit(x as usize, y as usize, source.side);
                     let fallback = if source.beneficiary > 0 {
@@ -865,7 +913,7 @@ impl TerritoryControl {
                     }
                 }
                 if write_f32(&mut self.maps.side_influence[source.side][i], next) {
-                    touched.insert(i);
+                    changes.record_touched(i);
                 }
                 for hostile in 0..self.max_sides {
                     if !self.sides_hostile(source.side, hostile) {
@@ -878,14 +926,14 @@ impl TerritoryControl {
                             (old - cell_delta * 0.5).max(0.0),
                         )
                     {
-                        touched.insert(i);
+                        changes.record_touched(i);
                     }
                 }
                 // Reclaim follows the min-clamped write and intentionally has no re-clamp.
                 if owner == source.sovereign {
                     let own = f64::from(self.maps.side_influence[source.side][i]);
                     if write_f32(&mut self.maps.side_influence[source.side][i], own * 1.5) {
-                        touched.insert(i);
+                        changes.record_touched(i);
                     }
                 }
                 self.sync_occupation(i);
@@ -899,11 +947,11 @@ impl TerritoryControl {
                 }
                 if credit_changed {
                     counts.credit_change_count += 1;
-                    credits.insert(i);
+                    changes.record_credit(i);
                 }
                 if controller_changed {
                     counts.controller_change_count += 1;
-                    controllers.insert(i);
+                    changes.record_controller(i);
                 }
             }
         }
@@ -930,7 +978,7 @@ impl TerritoryControl {
                 continue;
             }
             let id = self.maps.primary_occupier[ny as usize * self.width + nx as usize];
-            if id == 0 || self.country_to_side.get(&id).copied() != Some(side) {
+            if id == 0 || mapped_side(&self.country_side_index, id) != Some(side) {
                 continue;
             }
             if let Some(slot) = ids[..unique].iter().position(|candidate| *candidate == id) {
@@ -1272,8 +1320,8 @@ impl TerritoryControl {
         // is absent, not when a present entry is zero).
         let core = self.maps.de_jure[i];
         let controller = self.maps.dominant_side[i];
-        let owner_side = self.country_to_side.get(&owner).copied();
-        let core_side = self.country_to_side.get(&core).copied();
+        let owner_side = mapped_side(&self.country_side_index, owner);
+        let core_side = mapped_side(&self.country_side_index, core);
         let credited = if self.maps.primary_occupier[i] > 0 {
             self.maps.primary_occupier[i]
         } else {
@@ -1342,7 +1390,7 @@ impl TerritoryControl {
             return;
         }
         let controller = self.maps.dominant_side[city.cell];
-        let owner_side = self.country_to_side.get(&city.owner).copied();
+        let owner_side = mapped_side(&self.country_side_index, city.owner);
         if city.owner > 0 {
             let owner = summary.countries.entry(city.owner).or_default();
             owner.cities_total += 1;
@@ -1451,10 +1499,7 @@ impl TerritoryControl {
                 let capitals_held = nonnegative(c.capitals_held);
                 CountryAggregate {
                     country_id: id,
-                    side_index: self
-                        .country_to_side
-                        .get(&id)
-                        .map_or(-1, |side| *side as i16),
+                    side_index: self.country_side_index[id as usize],
                     owned: nonnegative(c.owned),
                     controlled: nonnegative(c.controlled),
                     credited_territory: nonnegative(c.credited_territory),
@@ -1719,15 +1764,46 @@ fn index_cities(
     cities: &[CityRef],
     width: usize,
     tile_size: usize,
-) -> (BTreeMap<usize, Vec<CityRef>>, BTreeSet<usize>) {
+    total_cells: usize,
+) -> (BTreeMap<usize, Vec<CityRef>>, Vec<bool>) {
     let tw = width.div_ceil(tile_size);
-    let (mut by_tile, mut cells) = (BTreeMap::<usize, Vec<CityRef>>::new(), BTreeSet::new());
+    let mut by_tile = BTreeMap::<usize, Vec<CityRef>>::new();
+    let mut cell_mask = vec![false; total_cells];
     for c in cities {
         let tile = ((c.cell / width) / tile_size) * tw + (c.cell % width) / tile_size;
         by_tile.entry(tile).or_default().push(c.clone());
-        cells.insert(c.cell);
+        cell_mask[c.cell] = true;
     }
-    (by_tile, cells)
+    (by_tile, cell_mask)
+}
+
+fn index_country_sides(mapping: &BTreeMap<u16, usize>) -> Box<[i16]> {
+    let mut index = vec![-1; COUNTRY_ID_COUNT].into_boxed_slice();
+    for (&country, &side) in mapping {
+        index[country as usize] = side as i16;
+    }
+    index
+}
+
+#[inline]
+fn mapped_side(index: &[i16], country: u16) -> Option<usize> {
+    let side = index[country as usize];
+    (side >= 0).then_some(side as usize)
+}
+
+#[inline]
+fn record_cell(mask: &mut [bool], cells: &mut Vec<usize>, cell: usize) {
+    if !mask[cell] {
+        mask[cell] = true;
+        cells.push(cell);
+    }
+}
+
+fn clear_recorded_cells(mask: &mut [bool], cells: &mut Vec<usize>) {
+    for &cell in cells.iter() {
+        mask[cell] = false;
+    }
+    cells.clear();
 }
 
 fn tile_count(w: usize, h: usize, s: usize) -> usize {
@@ -2053,6 +2129,101 @@ mod tests {
         );
         assert_eq!(t.side_influence(0).unwrap()[1], 0.);
         assert_eq!(result.touched_influence_cells, vec![0]);
+    }
+
+    #[test]
+    fn overlapping_sources_preserve_exact_maps_counts_and_sorted_unique_outputs() {
+        let mut c = config(3, 1, 2, 1);
+        c.maps.world_control.fill(3);
+        c.maps.de_jure.fill(3);
+        let mut first = source(0, 1, -90.0, -178.0);
+        first.radius = 0.5;
+        first.delta = 0.4;
+        let mut opposing = source(1, 2, -90.0, -178.0);
+        opposing.id = 2;
+        opposing.radius = 0.5;
+        opposing.delta = 1.0;
+        opposing.owner_ally_country_ids.clear();
+        let mut reclaim = source(0, 1, -90.0, -178.0);
+        reclaim.id = 3;
+        reclaim.radius = 0.5;
+        reclaim.delta = 1.0;
+        let mut lower_cell = source(0, 1, -90.0, -180.0);
+        lower_cell.id = 4;
+        lower_cell.radius = 0.5;
+        lower_cell.delta = 0.4;
+
+        let mut t = TerritoryControl::new(c).unwrap();
+        let result = t
+            .apply_influence_sources(&[first, opposing, reclaim, lower_cell])
+            .unwrap();
+        assert_eq!(
+            result,
+            InfluenceApplyResult {
+                processed_source_cells: 4,
+                controller_change_count: 4,
+                credit_change_count: 4,
+                touched_influence_cells: vec![0, 2],
+                changed_controller_cells: vec![0, 2],
+                changed_credit_cells: vec![0, 2],
+            }
+        );
+        assert_eq!(t.side_influence(0).unwrap(), &[0.4, 0.0, 1.0]);
+        assert_eq!(t.side_influence(1).unwrap(), &[0.0, 0.0, 0.5]);
+        assert_eq!(t.primary_occupier(), &[1, 0, 1]);
+        assert_eq!(t.dominant_side(), &[0, -1, 0]);
+        assert_eq!(t.occupation(), &[0.4, 0.0, 1.0]);
+
+        let mut next = source(0, 1, -90.0, -179.0);
+        next.radius = 0.5;
+        let result = t.apply_influence_sources(&[next]).unwrap();
+        assert_eq!(result.touched_influence_cells, vec![1]);
+        assert_eq!(result.changed_controller_cells, vec![1]);
+        assert_eq!(result.changed_credit_cells, vec![1]);
+    }
+
+    #[test]
+    fn topology_and_city_updates_rebuild_hot_path_indexes() {
+        let mut c = config(1, 1, 2, 1);
+        c.maps.world_control[0] = 2;
+        c.maps.de_jure[0] = 2;
+        c.hostility_matrix.fill(0);
+        let mut t = TerritoryControl::new(c).unwrap();
+        let mut s = source(0, 1, -90.0, -180.0);
+        s.radius = 0.5;
+
+        let skipped = t.apply_influence_sources(&[s.clone()]).unwrap();
+        assert_eq!(skipped.processed_source_cells, 0);
+        assert_eq!(t.side_influence(0).unwrap(), &[0.0]);
+
+        let mapping = [(1, 0), (2, 0)].into_iter().collect();
+        assert!(t.set_topology(mapping, vec![0; 4], 2).unwrap());
+        let applied = t.apply_influence_sources(&[s.clone()]).unwrap();
+        assert_eq!(applied.processed_source_cells, 1);
+        assert_eq!(t.side_influence(0).unwrap()[0].to_bits(), 0.2_f32.to_bits());
+
+        t.reset();
+        t.set_cities(
+            vec![TerritoryCity {
+                id: 9,
+                cell: 0,
+                owner: 2,
+                population: 10.0,
+                capital: false,
+            }],
+            4,
+        )
+        .unwrap();
+        t.apply_influence_sources(&[s.clone()]).unwrap();
+        assert_eq!(
+            t.side_influence(0).unwrap()[0].to_bits(),
+            ((0.2_f64 * 0.35) as f32).to_bits()
+        );
+
+        t.reset();
+        t.set_cities(Vec::new(), 5).unwrap();
+        t.apply_influence_sources(&[s]).unwrap();
+        assert_eq!(t.side_influence(0).unwrap()[0].to_bits(), 0.2_f32.to_bits());
     }
 
     #[test]
