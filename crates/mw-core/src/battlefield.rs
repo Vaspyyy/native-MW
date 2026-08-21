@@ -524,6 +524,7 @@ pub struct BattlefieldLocalUnitInput {
     /// Heading published by the preceding tick, sampled before new AI orders.
     pub previous_dir_lat: f64,
     pub previous_dir_lng: f64,
+    pub task_force_key: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -554,6 +555,7 @@ pub struct BattlefieldLocalUnitResult {
     pub armor_support_last_tick: Option<u64>,
     pub last_ally_count: f64,
     pub repulsion: Option<BattlefieldVector>,
+    pub task_force_key: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -745,6 +747,7 @@ pub fn resolve_local_tactics(
             armor_support_last_tick,
             last_ally_count: strength,
             repulsion: None,
+            task_force_key: unit.task_force_key,
         });
         groups.entry((unit.side, group)).or_default().add(*unit);
         sides.insert(unit.side);
@@ -811,18 +814,25 @@ pub fn resolve_local_tactics(
                 let distance = pair.distance_sq.sqrt();
                 let delta_lat = units[left].lat - units[right].lat;
                 let delta_lng = wrapped_longitude_delta(units[right].lng, units[left].lng);
+                let repulsion_scale = if units[left].task_force_key.is_some()
+                    && units[left].task_force_key == units[right].task_force_key
+                {
+                    0.35
+                } else {
+                    1.0
+                };
                 if !excluded[left] {
                     add_repulsion(
                         &mut results[left].repulsion,
-                        delta_lat / distance,
-                        delta_lng / distance,
+                        delta_lat / distance * repulsion_scale,
+                        delta_lng / distance * repulsion_scale,
                     );
                 }
                 if !excluded[right] {
                     add_repulsion(
                         &mut results[right].repulsion,
-                        -delta_lat / distance,
-                        -delta_lng / distance,
+                        -delta_lat / distance * repulsion_scale,
+                        -delta_lng / distance * repulsion_scale,
                     );
                 }
             },
@@ -1882,6 +1892,7 @@ mod tests {
             refuses_offense: false,
             previous_dir_lat: 0.0,
             previous_dir_lng: 0.0,
+            task_force_key: None,
         }
     }
 
@@ -1944,6 +1955,28 @@ mod tests {
         let result = resolve_local_tactics(10, &state, &[first, second]).unwrap();
         assert_close(result.units[0].last_ally_count, 2.0 + 3.0);
         assert_close(result.units[1].last_ally_count, 3.0 + 2.0 * 50.0);
+    }
+
+    #[test]
+    fn shared_task_force_reduces_only_its_pairwise_repulsion() {
+        let countries = BTreeMap::from([(1, CountryBattlefieldPrimitives::default())]);
+        let state = battlefield_state(
+            countries,
+            [
+                (1, BattlefieldUnitState::default()),
+                (2, BattlefieldUnitState::default()),
+            ],
+        );
+        let mut first = local_unit(1, 1, UnitKind::Army, 0.0, 0.0, 1.0);
+        let mut second = local_unit(2, 1, UnitKind::Army, 0.0, 0.2, 1.0);
+        first.task_force_key = Some(7);
+        second.task_force_key = Some(7);
+        let shared = resolve_local_tactics(10, &state, &[first, second]).unwrap();
+        assert_close(shared.units[0].repulsion.unwrap().lng.abs(), 0.35);
+
+        second.task_force_key = Some(8);
+        let distinct = resolve_local_tactics(10, &state, &[first, second]).unwrap();
+        assert_close(distinct.units[0].repulsion.unwrap().lng.abs(), 1.0);
     }
 
     #[test]

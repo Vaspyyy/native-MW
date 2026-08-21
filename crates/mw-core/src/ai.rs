@@ -240,7 +240,16 @@ pub struct AiPlanningResult {
     pub schema_version: &'static str,
     pub orders: Vec<ResolvedUnitOrder>,
     pub assignments: Vec<FrontAssignmentRecord>,
+    pub contacts: Vec<AiTacticalContactRecord>,
     pub counters: AiPlanningCounters,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AiTacticalContactRecord {
+    pub unit_id: u64,
+    pub target_unit_id: Option<u64>,
+    pub friendly_power: f64,
+    pub hostile_power: f64,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -297,6 +306,21 @@ pub fn resolve_ai_orders(
     let mut sorted_units = units.to_vec();
     sorted_units.sort_unstable_by_key(|unit| unit.id);
     let contacts = discover_contacts(config, &sorted_units, world.hostility)?;
+    let contact_records = sorted_units
+        .iter()
+        .zip(&contacts)
+        .map(|(unit, contact)| {
+            if !contact.friendly_power.is_finite() || !contact.hostile_power.is_finite() {
+                return Err(AiOrderError::InvalidUnit(unit.id));
+            }
+            Ok(AiTacticalContactRecord {
+                unit_id: unit.id,
+                target_unit_id: contact.preferred_target_id,
+                friendly_power: contact.friendly_power,
+                hostile_power: contact.hostile_power,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let reinforcement = sorted_units
         .iter()
         .map(|unit| {
@@ -460,6 +484,7 @@ pub fn resolve_ai_orders(
         schema_version: AI_ORDER_SCHEMA_VERSION,
         orders,
         assignments,
+        contacts: contact_records,
         counters,
     })
 }
@@ -1216,6 +1241,21 @@ mod tests {
             .unwrap();
         assert_eq!(order.preferred_target_id, Some(2));
         assert_eq!((order.dir_lat, order.dir_lng), (0.0, -1.0));
+        let contact = result
+            .contacts
+            .iter()
+            .find(|contact| contact.unit_id == 10)
+            .unwrap();
+        assert_eq!(contact.target_unit_id, Some(2));
+        assert!(contact.hostile_power > 0.0);
+        assert_eq!(
+            result
+                .contacts
+                .iter()
+                .map(|contact| contact.unit_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 10]
+        );
     }
 
     #[test]

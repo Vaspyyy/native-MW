@@ -15,6 +15,7 @@ pub mod economy;
 pub mod front;
 pub mod movement;
 pub mod occupation;
+pub mod operations;
 pub mod production;
 pub mod runtime;
 pub mod scenario;
@@ -27,8 +28,8 @@ pub mod world;
 
 pub use ai::{
     AI_ORDER_SCHEMA_VERSION, AiOrderConfig, AiOrderError, AiPlanningCounters, AiPlanningResult,
-    AiUnitInput, AiWorldInput, AssignmentReason, FrontAssignmentRecord, FrontObjective,
-    ResolvedCombatModifiers, ResolvedMovementModifiers, resolve_ai_orders,
+    AiTacticalContactRecord, AiUnitInput, AiWorldInput, AssignmentReason, FrontAssignmentRecord,
+    FrontObjective, ResolvedCombatModifiers, ResolvedMovementModifiers, resolve_ai_orders,
 };
 pub use battlefield::{
     ATTRITION_DAMAGE, BATTLEFIELD_SCHEMA_VERSION, BattlefieldAttritionResult, BattlefieldBuff,
@@ -86,6 +87,7 @@ pub use occupation::{
     garrison_priority, required_garrison, resistance_delta, select_occupation_controller,
     select_rebellion_candidates,
 };
+pub use operations::*;
 pub use production::{
     ARMOR_PAYROLL_PER_100, PRODUCTION_SCHEMA_VERSION, ProductionCity, ProductionConfig,
     ProductionCountry, ProductionError, ScenarioProduction, ScenarioProductionCounters,

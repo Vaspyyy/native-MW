@@ -182,6 +182,39 @@ impl SideDynamics {
         }
         self.posture = posture;
     }
+
+    /// Recompute continuation posture from observer-scoped operational intel.
+    ///
+    /// The supplied estimate may include the observer's persisted prewar baseline, but this path
+    /// never substitutes authoritative live all-map strength. A genuinely missing estimate stays
+    /// missing. Legacy checkpoints continue through [`Self::refresh_posture`].
+    pub fn refresh_posture_from_intel(
+        &mut self,
+        has_deployed_units: bool,
+        own_strength: f64,
+        known_hostile_strength: Option<f64>,
+    ) {
+        if !has_deployed_units {
+            self.posture = WarPosture::Balanced;
+            return;
+        }
+
+        let mut posture = self.posture_override.unwrap_or(WarPosture::Balanced);
+        if self.posture_override.is_none()
+            && let Some(hostile_strength) = known_hostile_strength
+        {
+            let ratio = own_strength.max(0.0) / hostile_strength.max(1.0);
+            if ratio > 1.5 {
+                posture = WarPosture::Offensive;
+            } else if ratio < 0.7 {
+                posture = WarPosture::Defensive;
+            }
+        }
+        if self.initial_personnel > 0.0 && self.current_personnel / self.initial_personnel < 0.15 {
+            posture = WarPosture::Defensive;
+        }
+        self.posture = posture;
+    }
 }
 
 pub fn bootstrap_sides<I>(side_count: usize, units: I) -> BTreeMap<usize, SideDynamics>
@@ -281,6 +314,25 @@ mod tests {
 
         side.refresh_posture(false, 0.0, true, 1.0);
         assert_eq!(side.posture, WarPosture::Balanced);
+    }
+
+    #[test]
+    fn observer_intel_path_does_not_substitute_missing_hostile_strength() {
+        let mut side = SideDynamics::bootstrap(0, 100.0);
+        side.refresh_posture_from_intel(true, 100.0, None);
+        assert_eq!(side.posture, WarPosture::Balanced);
+
+        side.refresh_posture_from_intel(true, 100.0, Some(50.0));
+        assert_eq!(side.posture, WarPosture::Offensive);
+        side.refresh_posture_from_intel(true, 10.0, Some(100.0));
+        assert_eq!(side.posture, WarPosture::Defensive);
+
+        side.posture_override = Some(WarPosture::Offensive);
+        side.refresh_posture_from_intel(true, 1.0, Some(100.0));
+        assert_eq!(side.posture, WarPosture::Offensive);
+        side.current_personnel = 14.0;
+        side.refresh_posture_from_intel(true, 100.0, Some(1.0));
+        assert_eq!(side.posture, WarPosture::Defensive);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
-    write_runtime_checkpoint_state_v4,
+    write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
 };
 use mw_core::{
     CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
@@ -175,7 +175,9 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.side_dynamics.is_some() {
+        let writer = if state.operations.is_some() {
+            write_runtime_checkpoint_state_v5
+        } else if state.side_dynamics.is_some() {
             write_runtime_checkpoint_state_v4
         } else if state.influence_runtime.is_some() {
             write_runtime_checkpoint_state_v3

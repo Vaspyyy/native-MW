@@ -110,6 +110,7 @@ fn restored_runtime(state: NativeRuntimeCheckpointState) -> NativeRuntime {
             casualties: state.casualties,
             casualties_by_victim: state.casualties_by_victim,
             side_dynamics: state.side_dynamics,
+            operations: state.operations,
         },
     )
     .unwrap()

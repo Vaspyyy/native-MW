@@ -8,11 +8,12 @@ use crate::{
         BattlefieldBuff, BattlefieldConfig, BattlefieldRuntimeState, BattlefieldUnitState,
         BattlefieldUrbanCenter, BattlefieldWarPhase, CountryBattlefieldPrimitives,
     },
-    combat::{CombatUnit, UnitKind},
+    combat::{CombatUnit, UnitKind, formation_strength},
     dynamics::bootstrap_sides,
     economy::{
         EconomyState, PAYROLL_PER_UNIT, STARTING_RESERVE_CYCLES, TARGET_STARTING_PAYROLL_SHARE,
     },
+    operations::{CountryDesperationMode, CountryDesperationState, OperationalRuntimeState},
     production::{ProductionConfig, derive_scenario_production},
     runtime::{
         NativeRuntime, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeUnitPolicy,
@@ -492,6 +493,42 @@ pub fn bootstrap_native_war(
             (unit.combat.side as usize, personnel)
         }),
     );
+    let mut operational_strength = vec![0.0; n];
+    let mut personnel_by_country = BTreeMap::<u16, f64>::new();
+    for unit in &simulation.units {
+        operational_strength[unit.combat.side as usize] += formation_strength(&unit.combat);
+        let country = unit.combat.sovereign as u16;
+        let personnel = if unit.combat.kind == UnitKind::Armor {
+            unit.combat.equipment.saturating_mul(armor_crew_per_vehicle) as f64
+        } else {
+            unit.combat.personnel as f64
+        };
+        *personnel_by_country.entry(country).or_default() += personnel;
+    }
+    let mut operations = OperationalRuntimeState::bootstrap(n, &hostility, &operational_strength);
+    operations.country_desperation = production
+        .countries
+        .iter()
+        .map(|country| CountryDesperationState {
+            country_id: country.country_id,
+            mode: CountryDesperationMode::Normal,
+            initial_cities: Some(
+                production
+                    .cities
+                    .iter()
+                    .filter(|city| city.owner_id == country.country_id)
+                    .count() as u64,
+            ),
+            initial_manpower: Some(
+                personnel_by_country
+                    .get(&country.country_id)
+                    .copied()
+                    .unwrap_or(0.0),
+            ),
+            previous_controlled: Some(u64::from(country.initial_core_cells)),
+            stall_ticks: 0,
+        })
+        .collect();
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
         RuntimeCheckpoint {
@@ -515,6 +552,7 @@ pub fn bootstrap_native_war(
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
             side_dynamics: Some(side_dynamics),
+            operations: Some(operations),
         },
     )?)
 }

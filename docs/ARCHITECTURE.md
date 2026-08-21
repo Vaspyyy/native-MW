@@ -179,7 +179,7 @@ ms/tick, meeting a 33.33 ms 30 Hz median budget. The conservative p95 remains
 131.183 ms per three-tick sample, or about 43.7 ms/tick, so 30 Hz is not yet a
 tail-latency guarantee and the runtime still misses a 16.67 ms 60 Hz budget.
 
-The browser/native handoff has four strict versions with explicit semantic
+The browser/native handoff has five strict versions with explicit semantic
 boundaries:
 
 - `native-runtime-checkpoint-v1` retains `postStartWar` as its only
@@ -217,7 +217,13 @@ boundaries:
   defender-reaction decision. V4 also requires the live battlefield block
   because phase and posture are consumed by that resolver.
 
-The browser keeps v1 as the default export. V2, v3, and v4 are explicit and act as
+Checkpoint v5 retains v4 and requires `native-operational-ai-v1`. Its
+`operationalAi` block is observer-scoped and deterministic: intel decay/config
+and contacts, stable task-force identity/membership/objective/route progress,
+country desperation counters, and ordered posture override events. Naval and
+air execution, and complete defender reaction planning, remain deferred.
+
+The browser keeps v1 as the default export. V2 through v5 are explicit and act as
 quiescent save barriers: they synchronously flush census work, then refuse the
 export if any census generation or dirty tile remains. They do not
 serialize partially processed tile work, private tile summaries, or pending

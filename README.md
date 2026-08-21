@@ -34,8 +34,9 @@ reference while systems move into the renderer-independent `mw-core` crate.
   native `wgpu` unit overlay
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
-- versioned browser-to-native checkpoints: loadable legacy v1-v3 state plus
-  strict v4 mid-war continuation with exact influence work and side dynamics
+- versioned browser-to-native checkpoints: loadable legacy v1-v4 state plus
+  strict v5 mid-war continuation with exact influence work, side dynamics, and
+  observer-scoped operational-AI state
 - production checkpoint loading in the native viewer plus bounded-step,
   window-free worker validation with clean terminal-conflict completion
 - optimized full-cap territory and combat hot paths using dense lookup tables,
@@ -82,12 +83,16 @@ Checkpoint v3 keeps that boundary and requires a strict `influenceRuntime`
 block containing the frontier work needed for exact continuation.
 Checkpoint v4 retains v3 and adds the strict `sideDynamics` state needed to
 continue momentum sampling, phase, posture, and side personnel without reset.
+Checkpoint v5 retains v4 and adds `operationalAi` (`native-operational-ai-v1`):
+observer-scoped intel/contact decay, stable task-force membership/objectives and
+route progress, country desperation memory, and deterministic override events.
+Naval and air execution, plus full defender reaction planning, remain deferred.
 
 The browser exports v1 by default for compatibility. After a war has advanced,
-request the current v4 handoff explicitly from its console:
+request the current v5 handoff explicitly from its console:
 
 ```js
-await window.downloadNativeRuntimeCheckpoint({ version: 4, steps: 5 });
+await window.downloadNativeRuntimeCheckpoint({ version: 5, steps: 5 });
 ```
 
 The mid-war exporter synchronously flushes census work and refuses to save if a
@@ -97,7 +102,9 @@ first and only then overlays the committed live territory maps. V3 and v4
 preserve the ordered priority/regular frontier queues, including observable
 duplicate and stale entries. V4 also preserves every stable side's personnel,
 ten-entry momentum window, current war phase, AI posture, and the nullable
-captured browser desperation/reaction posture override.
+captured browser desperation/reaction posture override. V5 additionally carries
+the operational-AI wire contract; naval/air execution and full defender reaction
+planning are intentionally not claimed as native behavior.
 
 Mid-war exports may also carry a strict optional `native-battlefield-v1` block
 with the exact Float32 terrain plane, urban centers, country primitives, and

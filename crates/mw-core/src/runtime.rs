@@ -13,9 +13,9 @@ use thiserror::Error;
 
 use crate::{
     ai::{
-        AiOrderConfig, AiOrderError, AiPlanningCounters, AiUnitInput, AiWorldInput,
-        AssignmentReason, FrontAssignmentRecord, FrontObjective, ResolvedCombatModifiers,
-        ResolvedMovementModifiers, resolve_ai_orders,
+        AiOrderConfig, AiOrderError, AiPlanningCounters, AiPlanningResult, AiUnitInput,
+        AiWorldInput, AssignmentReason, FrontAssignmentRecord, FrontObjective,
+        ResolvedCombatModifiers, ResolvedMovementModifiers, resolve_ai_orders,
     },
     battlefield::{
         BattlefieldDirectionInput, BattlefieldError, BattlefieldLocalTacticsResult,
@@ -30,13 +30,17 @@ use crate::{
     },
     diffusion::DiffusionQueueResult,
     direction::HostilityMatrix,
-    dynamics::{SideDynamics, WarPhase, WarPosture},
+    dynamics::{MOMENTUM_SAMPLE_INTERVAL, SideDynamics, WarPhase, WarPosture},
     economy::{CommandBand, EconomyState, PAY_CYCLE_TICKS},
     front::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
         derive_front_layout,
     },
     occupation::{OccupationState, required_garrison},
+    operations::{
+        CountryOperationalInput, OperationalError, OperationalPoint, OperationalRuntimeState,
+        OperationalSnapshot, OperationalUnitInput, TacticalContactObservation,
+    },
     production::{
         ProductionConfig, ProductionError, ScenarioProduction, StrategicDerivationCounters,
         StrategicDerivationInput, TerritoryCommitMarker, derive_strategic_cycle_input,
@@ -296,6 +300,8 @@ pub struct RuntimeSnapshot {
     pub frame_snapshot: Arc<FrameSnapshot>,
     pub territory_snapshot: Arc<TerritorySnapshot>,
     pub strategic_snapshot: Option<Arc<StrategicSnapshot>>,
+    /// Immutable observer intel, task-force membership, and operational intent for renderers.
+    pub operational_snapshot: Option<Arc<OperationalSnapshot>>,
     pub counters: RuntimeStepCounters,
     pub pending_render_updates: usize,
     pub casualty_totals: Arc<BTreeMap<u16, f64>>,
@@ -338,6 +344,8 @@ pub enum RuntimeError {
     Strategic(#[from] StrategicError),
     #[error("production input derivation: {0}")]
     Production(#[from] ProductionError),
+    #[error("operational AI: {0}")]
+    Operational(#[from] OperationalError),
 }
 
 fn influence_counters(sources: usize, result: &InfluenceApplyResult) -> RuntimeInfluenceCounters {
@@ -519,6 +527,7 @@ fn stage_side_dynamics(
     side_count: usize,
     simulation: &Simulation,
     policies: &BTreeMap<u64, RuntimeUnitPolicy>,
+    operations: Option<&OperationalRuntimeState>,
 ) -> Result<Option<BTreeMap<usize, SideDynamics>>, RuntimeError> {
     let Some(mut next) = current.clone() else {
         return Ok(None);
@@ -574,12 +583,21 @@ fn stage_side_dynamics(
                 hostile_units += deployed_units[other];
             }
         }
-        dynamics.refresh_posture(
-            deployed_units[side] > 0,
-            strength[side],
-            hostile_units > 0,
-            hostile_strength,
-        );
+        if let Some(operations) = operations {
+            dynamics.posture_override = operations.posture_override(side);
+            dynamics.refresh_posture_from_intel(
+                deployed_units[side] > 0,
+                strength[side],
+                operations.known_hostile_strength(side),
+            );
+        } else {
+            dynamics.refresh_posture(
+                deployed_units[side] > 0,
+                strength[side],
+                hostile_units > 0,
+                hostile_strength,
+            );
+        }
     }
     Ok(Some(next))
 }
@@ -1122,6 +1140,8 @@ pub struct RuntimeCheckpoint {
     pub casualties: BTreeMap<u16, f64>,
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
+    /// Required by checkpoint v5; absent checkpoints retain legacy planning semantics.
+    pub operations: Option<OperationalRuntimeState>,
 }
 
 /// Owned state captured at a committed, serialization-ready runtime boundary.
@@ -1153,6 +1173,7 @@ pub struct NativeRuntimeCheckpointState {
     pub casualties: BTreeMap<u16, f64>,
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
+    pub operations: Option<OperationalRuntimeState>,
 }
 
 /// Shared native simulation owner. No mutable kernel state is exposed to renderers.
@@ -1177,6 +1198,7 @@ pub struct NativeRuntime {
     casualties: BTreeMap<u16, f64>,
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
+    operations: Option<OperationalRuntimeState>,
     state: RuntimeState,
     latest: Arc<RuntimeSnapshot>,
     render_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
@@ -1223,6 +1245,176 @@ impl StagedBattlefieldTick {
     fn local_unit(&self, unit_id: u64) -> Option<&crate::battlefield::BattlefieldLocalUnitResult> {
         self.local_by_id.get(&unit_id)
     }
+}
+
+fn operational_unit_inputs(
+    simulation: &Simulation,
+    battlefield: Option<&StagedBattlefieldTick>,
+) -> Result<Vec<OperationalUnitInput>, RuntimeError> {
+    simulation
+        .units
+        .iter()
+        .map(|unit| {
+            let country_id = u16::try_from(unit.combat.sovereign)
+                .map_err(|_| RuntimeError::InvalidCheckpoint("invalid unit sovereign"))?;
+            let battlefield = battlefield.and_then(|stage| stage.resolved_unit(unit.combat.id));
+            Ok(OperationalUnitInput {
+                unit_id: unit.combat.id,
+                side_index: unit.combat.side as usize,
+                country_id,
+                position: OperationalPoint {
+                    lat: unit.combat.lat,
+                    lng: unit.combat.lng,
+                },
+                power: formation_strength(&unit.combat).max(0.0),
+                readiness: if unit.combat.max_health > 0.0 {
+                    (unit.combat.health / unit.combat.max_health).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+                supply_collapsed: battlefield
+                    .is_some_and(|result| result.attrition.supply_collapsed),
+                encircled: battlefield.is_some_and(|result| result.encircled),
+            })
+        })
+        .collect()
+}
+
+fn tactical_contact_observations(
+    planning: &AiPlanningResult,
+    units: &[OperationalUnitInput],
+    simulation: &Simulation,
+) -> Vec<TacticalContactObservation> {
+    let operational_by_id = units
+        .iter()
+        .map(|unit| (unit.unit_id, *unit))
+        .collect::<BTreeMap<_, _>>();
+    let kind_by_id = simulation
+        .units
+        .iter()
+        .map(|unit| {
+            (
+                unit.combat.id,
+                match unit.combat.kind {
+                    UnitKind::Army => "army",
+                    UnitKind::Armor => "armor",
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut observed = BTreeMap::new();
+    for contact in &planning.contacts {
+        let Some(target_id) = contact.target_unit_id else {
+            continue;
+        };
+        let Some(observer) = operational_by_id.get(&contact.unit_id) else {
+            continue;
+        };
+        let Some(target) = operational_by_id.get(&target_id) else {
+            continue;
+        };
+        observed.insert(
+            (observer.side_index, target_id),
+            TacticalContactObservation {
+                observer_side: observer.side_index,
+                enemy_side: target.side_index,
+                target_unit_id: target_id,
+                target_country_id: target.country_id,
+                target_position: target.position,
+                observed_power: target.power,
+                kind: kind_by_id
+                    .get(&target_id)
+                    .copied()
+                    .unwrap_or("army")
+                    .to_owned(),
+            },
+        );
+    }
+    observed.into_values().collect()
+}
+
+fn apply_operational_steering(
+    planning: &mut AiPlanningResult,
+    operations: &OperationalRuntimeState,
+    units: &[OperationalUnitInput],
+) -> Result<BTreeSet<u64>, RuntimeError> {
+    let protected = planning
+        .assignments
+        .iter()
+        .filter(|assignment| {
+            matches!(
+                assignment.reason,
+                AssignmentReason::Contact | AssignmentReason::Retreat
+            )
+        })
+        .map(|assignment| assignment.unit_id)
+        .collect::<BTreeSet<_>>();
+    let steering = operations
+        .steering(units)
+        .into_iter()
+        .map(|steering| (steering.unit_id, steering))
+        .collect::<BTreeMap<_, _>>();
+    for order in &mut planning.orders {
+        let Some(steering) = steering.get(&order.unit_id) else {
+            continue;
+        };
+        if protected.contains(&order.unit_id) {
+            continue;
+        }
+        order.preferred_target_id = None;
+        order.movement_enabled = steering.movement_enabled;
+        order.dir_lat = steering.dir_lat;
+        order.dir_lng = steering.dir_lng;
+        order.factors.plan_speed_mult *= steering.speed_multiplier;
+        if !order.factors.plan_speed_mult.is_finite() {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "operational steering produced an invalid speed multiplier",
+            ));
+        }
+    }
+    Ok(steering.keys().copied().collect())
+}
+
+fn operational_country_inputs(
+    simulation: &Simulation,
+    scenario: &ScenarioProduction,
+    territory: &TerritorySnapshot,
+) -> Result<Vec<CountryOperationalInput>, RuntimeError> {
+    let crew_per_vehicle = simulation.config().combat.armor_crew_per_vehicle;
+    let mut personnel = BTreeMap::<u16, f64>::new();
+    for unit in &simulation.units {
+        let country = u16::try_from(unit.combat.sovereign)
+            .map_err(|_| RuntimeError::InvalidCheckpoint("invalid unit sovereign"))?;
+        let amount = if unit.combat.kind == UnitKind::Armor {
+            unit.combat.equipment.saturating_mul(crew_per_vehicle) as f64
+        } else {
+            unit.combat.personnel as f64
+        };
+        *personnel.entry(country).or_default() += amount;
+    }
+    let aggregate = territory
+        .countries
+        .iter()
+        .map(|country| (country.country_id, country))
+        .collect::<BTreeMap<_, _>>();
+    Ok(scenario
+        .countries
+        .iter()
+        .map(|country| {
+            let current = aggregate.get(&country.country_id).copied();
+            CountryOperationalInput {
+                country_id: country.country_id,
+                initial_land: u64::from(country.initial_core_cells.max(1)),
+                controlled: current.map_or(0, |state| state.controlled),
+                cities_controlled: current.map_or(0, |state| state.cities_controlled),
+                current_personnel: personnel.get(&country.country_id).copied().unwrap_or(0.0),
+                // Browser role metadata is not part of the native scenario contract. Treat a
+                // country as offense-capable; viable task-force gating still prevents a phantom
+                // offensive override.
+                offensive_role: true,
+            }
+        })
+        .collect())
 }
 
 impl NativeRuntime {
@@ -1323,6 +1515,40 @@ impl NativeRuntime {
             checkpoint.frame,
             controlled_cell_limit,
         )?;
+        if let Some(operations) = &checkpoint.operations {
+            let live_units = checkpoint
+                .simulation
+                .units
+                .iter()
+                .map(|unit| (unit.combat.id, unit.combat.side as usize))
+                .collect::<BTreeMap<_, _>>();
+            let countries = checkpoint
+                .scenario
+                .countries
+                .iter()
+                .map(|country| country.country_id)
+                .collect::<BTreeSet<_>>();
+            operations.validate(
+                checkpoint.territory.max_sides(),
+                &live_units,
+                &countries,
+                checkpoint.tick,
+            )?;
+            for side in &operations.sides {
+                let declared = (0..checkpoint.territory.max_sides())
+                    .filter(|enemy| {
+                        checkpoint.diplomacy.hostility
+                            [side.side_index * checkpoint.territory.max_sides() + *enemy]
+                            == 1
+                    })
+                    .collect::<Vec<_>>();
+                if side.hostile_side_indices != declared {
+                    return Err(RuntimeError::InvalidCheckpoint(
+                        "operational intel hostility disagrees with runtime diplomacy",
+                    ));
+                }
+            }
+        }
 
         // A checkpoint may have an in-progress bounded census. Construction finishes it before
         // exposing the first cross-kernel publication.
@@ -1396,6 +1622,10 @@ impl NativeRuntime {
             frame_snapshot,
             territory_snapshot,
             strategic_snapshot,
+            operational_snapshot: checkpoint
+                .operations
+                .as_ref()
+                .map(|operations| Arc::new(operations.snapshot(checkpoint.tick))),
             counters: RuntimeStepCounters::default(),
             pending_render_updates: render_updates.len(),
             casualty_totals: Arc::new(checkpoint.casualties.clone()),
@@ -1423,6 +1653,7 @@ impl NativeRuntime {
             casualties: checkpoint.casualties,
             casualties_by_victim: checkpoint.casualties_by_victim,
             side_dynamics: checkpoint.side_dynamics,
+            operations: checkpoint.operations,
             state: initial_state,
             latest,
             render_updates,
@@ -1511,6 +1742,7 @@ impl NativeRuntime {
             casualties: self.casualties.clone(),
             casualties_by_victim: self.casualties_by_victim.clone(),
             side_dynamics: self.side_dynamics.clone(),
+            operations: self.operations.clone(),
         })
     }
 
@@ -1532,6 +1764,11 @@ impl NativeRuntime {
             territory.land(),
         )
         .map_err(BattlefieldError::from)?;
+        let task_force_keys = self
+            .operations
+            .as_ref()
+            .map(OperationalRuntimeState::task_force_key_by_unit)
+            .unwrap_or_default();
         let local_inputs = self
             .simulation
             .units
@@ -1559,6 +1796,7 @@ impl NativeRuntime {
                         .is_some_and(|influence| influence.refuses_offense),
                     previous_dir_lat: unit.dir_lat,
                     previous_dir_lng: unit.dir_lng,
+                    task_force_key: task_force_keys.get(&unit.combat.id).copied(),
                 })
             })
             .collect::<Result<Vec<_>, RuntimeError>>()?;
@@ -2057,6 +2295,10 @@ impl NativeRuntime {
             .frame
             .checked_add(1)
             .ok_or(RuntimeError::ClockOverflow)?;
+        let mut staged_operations = self.operations.clone();
+        if let Some(operations) = &mut staged_operations {
+            operations.pre_tick(next_tick);
+        }
         let mut staged_side_dynamics = stage_side_dynamics(
             &self.side_dynamics,
             next_tick,
@@ -2068,6 +2310,7 @@ impl NativeRuntime {
             self.territory.max_sides(),
             &self.simulation,
             &self.unit_policies,
+            staged_operations.as_ref(),
         )?;
         // Browser influence runs before the current tick resolves controller-dependent policy,
         // fronts, AI, movement, and combat. Build influence from the pre-tick unit/map snapshot,
@@ -2318,6 +2561,45 @@ impl NativeRuntime {
                 objectives: planning_objectives,
             },
         ));
+        let operational_inputs = if staged_operations.is_some() {
+            Some(rollback_try!(operational_unit_inputs(
+                &self.simulation,
+                staged_battlefield.as_ref(),
+            )))
+        } else {
+            None
+        };
+        let operational_plan_unit_ids = if let (Some(operations), Some(inputs)) =
+            (&mut staged_operations, operational_inputs.as_ref())
+        {
+            let observations = tactical_contact_observations(&planning, inputs, &self.simulation);
+            operations.ingest_tactical_contacts(next_tick, &observations);
+            operations.advance_task_forces(next_tick, inputs);
+            operations.evolve_overrides(next_tick, self.territory.country_to_side());
+            let live_units = inputs
+                .iter()
+                .map(|unit| (unit.unit_id, unit.side_index))
+                .collect::<BTreeMap<_, _>>();
+            let countries = self
+                .scenario
+                .countries
+                .iter()
+                .map(|country| country.country_id)
+                .collect::<BTreeSet<_>>();
+            rollback_try!(operations.validate(
+                self.territory.max_sides(),
+                &live_units,
+                &countries,
+                next_tick,
+            ));
+            rollback_try!(apply_operational_steering(
+                &mut planning,
+                operations,
+                inputs,
+            ))
+        } else {
+            BTreeSet::new()
+        };
         planning.orders.extend(rollback_try!(garrison_hold_orders(
             &self.simulation,
             planning_policies,
@@ -2421,10 +2703,11 @@ impl NativeRuntime {
                         unit_id: order.unit_id,
                         dir_lat: order.dir_lat,
                         dir_lng: order.dir_lng,
-                        is_plan_unit: matches!(
-                            reason,
-                            AssignmentReason::Front | AssignmentReason::Reinforce
-                        ),
+                        is_plan_unit: operational_plan_unit_ids.contains(&order.unit_id)
+                            || matches!(
+                                reason,
+                                AssignmentReason::Front | AssignmentReason::Reinforce
+                            ),
                         at_sea,
                         active_retreat: reason == AssignmentReason::Retreat,
                         occupation_garrison_holding: policy.ai.garrison_excluded
@@ -2737,6 +3020,46 @@ impl NativeRuntime {
             strategic_counters = Some(counters);
         }
 
+        if let Some(operations) = &mut staged_operations {
+            let committed_units = operational_unit_inputs(&self.simulation, None)?;
+            operations.post_movement(next_tick, &committed_units);
+            if SideDynamics::sample_due(next_tick) {
+                let countries = operational_country_inputs(
+                    &self.simulation,
+                    &self.scenario,
+                    &territory_snapshot,
+                )?;
+                operations.update_country_desperation(
+                    next_tick,
+                    MOMENTUM_SAMPLE_INTERVAL,
+                    &countries,
+                );
+            }
+            operations.evolve_overrides(next_tick, self.territory.country_to_side());
+            let live_units = committed_units
+                .iter()
+                .map(|unit| (unit.unit_id, unit.side_index))
+                .collect::<BTreeMap<_, _>>();
+            let countries = self
+                .scenario
+                .countries
+                .iter()
+                .map(|country| country.country_id)
+                .collect::<BTreeSet<_>>();
+            if let Err(error) = operations.validate(
+                self.territory.max_sides(),
+                &live_units,
+                &countries,
+                next_tick,
+            ) {
+                // All recoverable operational validation happens before simulation commits.
+                // A failure here means a post-mutation invariant was violated, matching the
+                // runtime's existing strategic poison semantics.
+                self.state = RuntimeState::Poisoned;
+                return Err(RuntimeError::Operational(error));
+            }
+        }
+
         let attrition_counters =
             attrition_counters(attrition_outcome.as_ref(), staged_battlefield.as_ref());
         let mut next_prior = assignments_by_unit(&planning.assignments);
@@ -2787,6 +3110,7 @@ impl NativeRuntime {
         self.casualties = next_casualties;
         self.casualties_by_victim = next_casualties_by_victim;
         self.side_dynamics = staged_side_dynamics;
+        self.operations = staged_operations;
         self.tick = next_tick;
         self.frame = next_frame;
         self.state = next_state;
@@ -2838,6 +3162,10 @@ impl NativeRuntime {
             frame_snapshot: Arc::new(frame_snapshot),
             territory_snapshot,
             strategic_snapshot,
+            operational_snapshot: self
+                .operations
+                .as_ref()
+                .map(|operations| Arc::new(operations.snapshot(self.tick))),
             counters,
             pending_render_updates: self.render_updates.len(),
             casualty_totals: Arc::new(self.casualties.clone()),
@@ -3477,6 +3805,10 @@ mod tests {
         battlefield::{BattlefieldConfig, CountryBattlefieldPrimitives},
         combat::{CombatConfig, CombatEvent, CombatLayer, CombatUnit, UnitKind},
         economy::{CommandBand, EconomySeed, create_economy_state},
+        operations::{
+            CountryDesperationMode, CountryDesperationState, OperationalTaskForce, TaskForceMember,
+            TaskForcePhase, TaskForcePosture, TaskForceRole,
+        },
         production::{PRODUCTION_SCHEMA_VERSION, ProductionCountry, ScenarioProductionCounters},
         simulation::{SimulationConfig, SimulationUnit},
         territory::{CellStateUpdate, TerritoryConfig, TerritoryMaps},
@@ -3737,6 +4069,7 @@ mod tests {
                 casualties: BTreeMap::new(),
                 casualties_by_victim: BTreeMap::new(),
                 side_dynamics: None,
+                operations: None,
             },
         )
         .unwrap()
@@ -3770,6 +4103,7 @@ mod tests {
             casualties: state.casualties,
             casualties_by_victim: state.casualties_by_victim,
             side_dynamics: state.side_dynamics,
+            operations: state.operations,
         }
     }
 
@@ -3824,6 +4158,109 @@ mod tests {
                 )
             }),
         ));
+    }
+
+    fn with_operational_state(mut runtime: NativeRuntime) -> NativeRuntime {
+        let config = runtime.config;
+        let mut captured = runtime.checkpoint_state().unwrap();
+        let strengths = (0..captured.territory_config.max_sides)
+            .map(|side| {
+                captured
+                    .units
+                    .iter()
+                    .filter(|unit| unit.combat.side as usize == side)
+                    .map(|unit| formation_strength(&unit.combat))
+                    .sum()
+            })
+            .collect::<Vec<_>>();
+        let mut operations = OperationalRuntimeState::bootstrap(
+            captured.territory_config.max_sides,
+            &captured.diplomacy.hostility,
+            &strengths,
+        );
+        operations.country_desperation = vec![
+            CountryDesperationState {
+                country_id: 1,
+                mode: CountryDesperationMode::LastStand,
+                initial_cities: Some(1),
+                initial_manpower: Some(1_000.0),
+                previous_controlled: Some(4),
+                stall_ticks: 0,
+            },
+            CountryDesperationState {
+                country_id: 2,
+                mode: CountryDesperationMode::Normal,
+                initial_cities: Some(1),
+                initial_manpower: Some(1_000.0),
+                previous_controlled: Some(4),
+                stall_ticks: 0,
+            },
+        ];
+        operations.task_forces.push(OperationalTaskForce {
+            id: "force-a".to_owned(),
+            signature: "force-a".to_owned(),
+            side_index: 0,
+            plan_signature: "plan-a".to_owned(),
+            plan_type: "FRONTLINE_PUSH".to_owned(),
+            theater_id: None,
+            target: Some(OperationalPoint {
+                lat: -90.0,
+                lng: 0.0,
+            }),
+            staging_anchor: Some(OperationalPoint {
+                lat: -90.0,
+                lng: 0.0,
+            }),
+            route: vec![OperationalPoint {
+                lat: -90.0,
+                lng: 0.0,
+            }],
+            phase: TaskForcePhase::Attacking,
+            posture: TaskForcePosture::Balanced,
+            members: vec![TaskForceMember {
+                unit_id: 1,
+                role: TaskForceRole::Spearhead,
+                assigned_tick: captured.tick,
+                route_progress: 0.2,
+            }],
+            reserve_unit_ids: Vec::new(),
+            desired_power: 1.0,
+            launch_power: 1.0,
+            current_power: 1.0,
+            peak_power: 1.0,
+            readiness: 1.0,
+            max_assigned_units: 1,
+            created_tick: captured.tick,
+            phase_started_tick: captured.tick,
+            last_progress_tick: captured.tick,
+            last_recovery_tick: captured.tick,
+            recovery_power: 0.0,
+            progress: 0.2,
+            withdrawal_anchor: None,
+            completion_reason: None,
+            outcome: None,
+            severe_surprise: false,
+            parent_task_force_id: None,
+            supply_invalidated_tick: None,
+            intent_revision: 0,
+        });
+        operations.ingest_tactical_contacts(
+            captured.tick,
+            &[TacticalContactObservation {
+                observer_side: 0,
+                enemy_side: 1,
+                target_unit_id: 2,
+                target_country_id: 2,
+                target_position: OperationalPoint {
+                    lat: -90.0,
+                    lng: 90.0,
+                },
+                observed_power: strengths[1],
+                kind: "army".to_owned(),
+            }],
+        );
+        captured.operations = Some(operations);
+        NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap()
     }
 
     #[test]
@@ -3923,6 +4360,7 @@ mod tests {
             runtime.territory.max_sides(),
             &runtime.simulation,
             &runtime.unit_policies,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -3953,6 +4391,51 @@ mod tests {
         let actual = resumed.step().unwrap();
         assert_eq!(actual, expected);
         assert_eq!(resumed.side_dynamics, uninterrupted.side_dynamics);
+    }
+
+    #[test]
+    fn operational_state_and_renderer_snapshot_continue_exactly_across_split() {
+        let mut uninterrupted =
+            with_operational_state(with_live_battlefield(fixture(0, false), vec![0.0; 8]));
+        let initial = uninterrupted.latest_snapshot();
+        let initial_operations = initial.operational_snapshot.clone().unwrap();
+
+        uninterrupted.step().unwrap();
+        let config = uninterrupted.config;
+        let captured = uninterrupted.checkpoint_state().unwrap();
+        let mut resumed = NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap();
+
+        let expected = uninterrupted.step().unwrap();
+        let actual = resumed.step().unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(resumed.operations, uninterrupted.operations);
+        assert_eq!(actual.operational_snapshot, expected.operational_snapshot);
+        assert!(!Arc::ptr_eq(
+            actual.operational_snapshot.as_ref().unwrap(),
+            &initial_operations
+        ));
+        assert_eq!(initial_operations.tick, 0);
+        assert_eq!(
+            initial_operations.task_forces[0].phase,
+            TaskForcePhase::Attacking
+        );
+    }
+
+    #[test]
+    fn failed_staged_tick_does_not_advance_operational_state_or_publication() {
+        let mut runtime =
+            with_operational_state(with_live_battlefield(fixture(0, false), vec![0.0; 8]));
+        let published = runtime.latest_snapshot();
+        let operations = runtime.operations.clone();
+        let queued = runtime.pending_render_updates();
+        runtime.config.front.max_grid_cells = 0;
+
+        assert!(matches!(runtime.step(), Err(RuntimeError::Front(_))));
+        assert_eq!(runtime.operations, operations);
+        assert!(Arc::ptr_eq(&runtime.latest_snapshot(), &published));
+        assert_eq!(runtime.tick(), 0);
+        assert_eq!(runtime.frame(), 0);
+        assert_eq!(runtime.pending_render_updates(), queued);
     }
 
     #[test]

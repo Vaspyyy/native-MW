@@ -25,13 +25,14 @@ use mw_core::{
     CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand, CommandHomeTarget,
     ConflictResolutionPlan, CountryBattlefieldPrimitives, DecodedScenario, EconomyState,
     FrontLayoutPrior, FrontObjective, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
-    OccupationState, PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers,
-    ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot,
-    RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation,
-    SimulationConfig, SimulationUnit, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE,
-    TerritoryCity, TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps,
-    UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy, UnitKind, WorldGridView,
-    browser_discipline, command_refusal_share, decode_mwsc_gzip, derive_scenario_production,
+    OccupationState, OperationalRuntimeState, PAYROLL_PER_UNIT, ProductionConfig,
+    ResolvedCombatModifiers, ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig,
+    RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES,
+    ScenarioProduction, Simulation, SimulationConfig, SimulationUnit, StrategicSimulation,
+    TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState, TerritoryConfig,
+    TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
+    UnitKind, WorldGridView, browser_discipline, command_refusal_share, decode_mwsc_gzip,
+    derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -40,6 +41,7 @@ pub const NATIVE_RUNTIME_CHECKPOINT_SCHEMA: &str = "native-runtime-checkpoint-v1
 pub const NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA: &str = "native-runtime-checkpoint-v2";
 pub const NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA: &str = "native-runtime-checkpoint-v3";
 pub const NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA: &str = "native-runtime-checkpoint-v4";
+pub const NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA: &str = "native-runtime-checkpoint-v5";
 pub const NATIVE_SIDE_DYNAMICS_SCHEMA: &str = "native-side-dynamics-v1";
 pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
 
@@ -171,6 +173,83 @@ pub fn write_runtime_checkpoint_state_v4(
         NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
         Some(influence_runtime),
         Some(side_dynamics),
+        None,
+    )
+}
+
+/// Serialize a v5 checkpoint with the complete operational-AI continuation state.
+pub fn write_runtime_checkpoint_state_v5(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    state
+        .battlefield
+        .as_ref()
+        .context("checkpoint-v5 writer requires live battlefield state")?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    let influence_runtime = state
+        .influence_runtime
+        .as_ref()
+        .context("checkpoint-v5 writer requires influence runtime state")?;
+    let cell_count = state
+        .territory_config
+        .width
+        .checked_mul(state.territory_config.height)
+        .context("checkpoint-v5 territory cell count overflows")?;
+    let influence_runtime = influence_runtime_fixture(influence_runtime, cell_count)?;
+    let dynamics = state
+        .side_dynamics
+        .as_ref()
+        .context("checkpoint-v5 writer requires side dynamics state")?;
+    let side_dynamics = side_dynamics_fixture(dynamics)?;
+    validate_side_dynamics(
+        &side_dynamics,
+        state.territory_config.max_sides,
+        state.frame,
+        u64::try_from(cell_count).context("checkpoint-v5 territory cell count exceeds u64")?,
+    )?;
+    let operational_ai = state
+        .operations
+        .as_ref()
+        .context("checkpoint-v5 writer requires operational AI state")?;
+    let live_units = state
+        .units
+        .iter()
+        .map(|unit| {
+            usize::try_from(unit.combat.side)
+                .context("unit side exceeds the checkpoint platform")
+                .map(|side| (unit.combat.id, side))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let countries = state
+        .scenario
+        .countries
+        .iter()
+        .map(|country| country.country_id)
+        .collect::<BTreeSet<_>>();
+    validate_operational_ai(
+        operational_ai,
+        state.territory_config.max_sides,
+        &live_units,
+        &countries,
+        state.tick,
+        &state.diplomacy.hostility,
+    )?;
+    write_runtime_checkpoint_state_with_hash(
+        &raw,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+        Some(influence_runtime),
+        Some(side_dynamics),
+        Some(operational_ai.clone()),
     )
 }
 
@@ -234,6 +313,7 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
         None,
         None,
+        None,
     )
 }
 
@@ -263,6 +343,7 @@ fn write_runtime_checkpoint_state_v3_with_hash(
         NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
         Some(influence_runtime),
         None,
+        None,
     )
 }
 
@@ -276,6 +357,7 @@ fn write_runtime_checkpoint_state_with_hash(
     schema: &'static str,
     influence_runtime: Option<InfluenceRuntimeFixture>,
     side_dynamics: Option<SideDynamicsFixture>,
+    operational_ai: Option<OperationalRuntimeState>,
 ) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
     if state.runtime_config != RuntimeConfig::default() {
@@ -521,6 +603,22 @@ fn write_runtime_checkpoint_state_with_hash(
                 serde_json::to_value(side_dynamics)?,
             );
     }
+    if let Some(operational_ai) = operational_ai {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert(
+                "operationalAi".to_owned(),
+                serde_json::to_value(operational_ai)?,
+            );
+    }
+    if schema == NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA {
+        validate_checkpoint_v5_required_nullable_fields(&body)
+            .context("checkpoint-v5 writer omitted required nullable operational fields")?;
+        let fixture: RuntimeCheckpointFixture = serde_json::from_value(body.clone())
+            .context("checkpoint-v5 writer produced an invalid wire object")?;
+        validate_checkpoint_shape(&fixture)
+            .context("checkpoint-v5 writer produced an invalid checkpoint shape")?;
+    }
     let bytes = serde_json::to_vec(&body)?;
     let parent = checkpoint_output_parent(output);
     if !parent.exists() {
@@ -552,6 +650,122 @@ fn write_runtime_checkpoint_state_with_hash(
         bytes: bytes.len(),
         schema,
     })
+}
+
+fn deserialize_optional_operational_ai<'de, D>(
+    deserializer: D,
+) -> Result<Option<OperationalRuntimeState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<OperationalRuntimeState>::deserialize(deserializer)?;
+    if value.is_none() {
+        return Err(serde::de::Error::custom(
+            "operationalAi must be an object, not null",
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_operational_ai(
+    operations: &OperationalRuntimeState,
+    side_count: usize,
+    live_units: &BTreeMap<u64, usize>,
+    countries: &BTreeSet<u16>,
+    tick: u64,
+    hostility: &[u8],
+) -> Result<()> {
+    operations
+        .validate(side_count, live_units, countries, tick)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    if hostility.len() != side_count.saturating_mul(side_count) {
+        bail!("operationalAi cannot validate against a malformed hostilityMatrix");
+    }
+    for side in &operations.sides {
+        let expected = (0..side_count)
+            .filter(|other| hostility[side.side_index * side_count + *other] == 1)
+            .collect::<Vec<_>>();
+        if side.hostile_side_indices != expected {
+            bail!("operationalAi hostile side coverage disagrees with hostilityMatrix");
+        }
+    }
+    Ok(())
+}
+
+fn require_object_key<'a>(object: &'a Value, key: &str, path: &str) -> Result<&'a Value> {
+    object
+        .as_object()
+        .with_context(|| format!("{path} must be an object"))?
+        .get(key)
+        .with_context(|| format!("{path}.{key} is required (use null when unset)"))
+}
+
+fn validate_checkpoint_v5_required_nullable_fields(checkpoint: &Value) -> Result<()> {
+    let operational = require_object_key(checkpoint, "operationalAi", "checkpoint")?;
+    let sides = require_object_key(operational, "sides", "checkpoint.operationalAi")?
+        .as_array()
+        .context("checkpoint.operationalAi.sides must be an array")?;
+    for (index, side) in sides.iter().enumerate() {
+        let path = format!("checkpoint.operationalAi.sides[{index}]");
+        let override_value = require_object_key(side, "override", &path)?;
+        if !override_value.is_null() {
+            require_object_key(override_value, "expiresTick", &format!("{path}.override"))?;
+        }
+        let intel = require_object_key(side, "intel", &path)?;
+        let contacts = require_object_key(intel, "contacts", &format!("{path}.intel"))?
+            .as_array()
+            .with_context(|| format!("{path}.intel.contacts must be an array"))?;
+        for (contact_index, contact) in contacts.iter().enumerate() {
+            require_object_key(
+                contact,
+                "countryId",
+                &format!("{path}.intel.contacts[{contact_index}]"),
+            )?;
+        }
+    }
+
+    let task_forces = require_object_key(operational, "taskForces", "checkpoint.operationalAi")?
+        .as_array()
+        .context("checkpoint.operationalAi.taskForces must be an array")?;
+    for (index, task_force) in task_forces.iter().enumerate() {
+        let path = format!("checkpoint.operationalAi.taskForces[{index}]");
+        for key in [
+            "theaterId",
+            "target",
+            "stagingAnchor",
+            "withdrawalAnchor",
+            "completionReason",
+            "outcome",
+            "parentTaskForceId",
+            "supplyInvalidatedTick",
+        ] {
+            require_object_key(task_force, key, &path)?;
+        }
+    }
+
+    let desperation = require_object_key(
+        operational,
+        "countryDesperation",
+        "checkpoint.operationalAi",
+    )?
+    .as_array()
+    .context("checkpoint.operationalAi.countryDesperation must be an array")?;
+    for (index, country) in desperation.iter().enumerate() {
+        let path = format!("checkpoint.operationalAi.countryDesperation[{index}]");
+        for key in ["initialCities", "initialManpower", "previousControlled"] {
+            require_object_key(country, key, &path)?;
+        }
+    }
+
+    let events = require_object_key(operational, "overrideEvents", "checkpoint.operationalAi")?
+        .as_array()
+        .context("checkpoint.operationalAi.overrideEvents must be an array")?;
+    for (index, event) in events.iter().enumerate() {
+        let path = format!("checkpoint.operationalAi.overrideEvents[{index}]");
+        require_object_key(event, "posture", &path)?;
+        require_object_key(event, "expiresTick", &path)?;
+    }
+    Ok(())
 }
 
 fn validate_checkpoint_write_steps(steps: usize) -> Result<()> {
@@ -1227,6 +1441,8 @@ struct RuntimeCheckpointFixture {
     casualties: BTreeMap<u16, f64>,
     #[serde(default)]
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+    #[serde(default, deserialize_with = "deserialize_optional_operational_ai")]
+    operational_ai: Option<OperationalRuntimeState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2014,6 +2230,7 @@ struct PreparedRuntime {
     battlefield: Option<BattlefieldRuntimeState>,
     influence_runtime: Option<mw_core::diffusion::InfluenceRuntimeState>,
     side_dynamics: Option<BTreeMap<usize, mw_core::SideDynamics>>,
+    operational_ai: Option<OperationalRuntimeState>,
 }
 
 /// Fully validated production handoff for native rendering and simulation.
@@ -2068,7 +2285,19 @@ struct DecodedGeography {
 
 fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result<PreparedRuntime> {
     let checkpoint_bytes = read_file(checkpoint_path)?;
-    let checkpoint: RuntimeCheckpointFixture = serde_json::from_slice(&checkpoint_bytes)
+    let checkpoint_value: Value = serde_json::from_slice(&checkpoint_bytes)
+        .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
+    if checkpoint_value.get("schema").and_then(Value::as_str)
+        == Some(NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA)
+    {
+        validate_checkpoint_v5_required_nullable_fields(&checkpoint_value).with_context(|| {
+            format!(
+                "failed to validate required v5 fields in {}",
+                checkpoint_path.display()
+            )
+        })?;
+    }
+    let checkpoint: RuntimeCheckpointFixture = serde_json::from_value(checkpoint_value)
         .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
     validate_checkpoint_shape(&checkpoint)?;
 
@@ -2161,6 +2390,27 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         .as_ref()
         .map(decode_side_dynamics)
         .transpose()?;
+    let operational_ai = checkpoint.operational_ai.clone();
+    if let Some(operations) = operational_ai.as_ref() {
+        let live = checkpoint
+            .units
+            .iter()
+            .map(|unit| (unit.id, usize::from(unit.side)))
+            .collect::<BTreeMap<_, _>>();
+        let countries = production
+            .countries
+            .iter()
+            .map(|country| country.country_id)
+            .collect();
+        validate_operational_ai(
+            operations,
+            checkpoint.sides.len(),
+            &live,
+            &countries,
+            checkpoint.tick,
+            &checkpoint.hostility_matrix,
+        )?;
+    }
 
     Ok(PreparedRuntime {
         raw_sha256,
@@ -2175,6 +2425,7 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         battlefield,
         influence_runtime,
         side_dynamics,
+        operational_ai,
     })
 }
 
@@ -2575,13 +2826,17 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || !checkpoint.casualties_by_victim.is_empty()
                 || checkpoint.planner.is_some()
                 || checkpoint.side_dynamics.is_some()
+                || checkpoint.operational_ai.is_some()
             {
                 bail!("checkpoint-v1 cannot contain checkpoint-v2 live state");
             }
         }
         NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => {
-            if checkpoint.influence_runtime.is_some() || checkpoint.side_dynamics.is_some() {
-                bail!("checkpoint-v2 cannot contain checkpoint-v3/v4 runtime state");
+            if checkpoint.influence_runtime.is_some()
+                || checkpoint.side_dynamics.is_some()
+                || checkpoint.operational_ai.is_some()
+            {
+                bail!("checkpoint-v2 cannot contain checkpoint-v3/v4/v5 runtime state");
             }
             if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
                 || checkpoint.territory.is_none()
@@ -2601,6 +2856,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.geography.is_none()
                 || checkpoint.influence_runtime.is_none()
                 || checkpoint.side_dynamics.is_some()
+                || checkpoint.operational_ai.is_some()
             {
                 bail!(
                     "checkpoint-v3 requires boundary midWar, immutable baseline geography, live territory, and influence runtime state"
@@ -2617,22 +2873,37 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.influence_runtime.is_none()
                 || checkpoint.side_dynamics.is_none()
                 || checkpoint.battlefield.is_none()
+                || checkpoint.operational_ai.is_some()
             {
-                bail!(
-                    "checkpoint-v4 requires boundary midWar, geography, territory, battlefield, influence runtime, and side dynamics"
-                );
+                bail!("checkpoint-v4 requires its complete live state and forbids operationalAi");
             }
             if checkpoint.strategic_cycle == u64::MAX {
                 bail!("checkpoint-v4 strategicCycle must leave room for a later cycle");
             }
         }
+        NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+                || checkpoint.influence_runtime.is_none()
+                || checkpoint.side_dynamics.is_none()
+                || checkpoint.battlefield.is_none()
+                || checkpoint.operational_ai.is_none()
+            {
+                bail!("checkpoint-v5 requires all live runtime state and operationalAi");
+            }
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v5 strategicCycle must leave room for a later cycle");
+            }
+        }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -3421,6 +3692,7 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         casualties: checkpoint.casualties.clone(),
         casualties_by_victim: checkpoint.casualties_by_victim.clone(),
         side_dynamics: prepared.side_dynamics.clone(),
+        operations: prepared.operational_ai.clone(),
     };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
@@ -3943,6 +4215,7 @@ impl PreparedRuntime {
     fn schema(&self) -> &'static str {
         match self.checkpoint.schema.as_str() {
             NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
             _ => NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
@@ -4059,6 +4332,8 @@ struct RuntimeSnapshotReport {
     territory: TerritorySnapshotReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     strategic: Option<StrategicSnapshotReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operational: Option<Value>,
     counters: Value,
     casualty_totals: BTreeMap<u16, f64>,
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
@@ -4298,6 +4573,11 @@ fn snapshot_report(
             countries,
         },
         strategic,
+        operational: snapshot
+            .operational_snapshot
+            .as_ref()
+            .map(|operational| serde_json::to_value(operational.as_ref()))
+            .transpose()?,
         counters: counters_json(snapshot),
         casualty_totals: snapshot.casualty_totals.as_ref().clone(),
         casualties_by_victim: snapshot.casualties_by_victim.as_ref().clone(),
@@ -4478,6 +4758,12 @@ fn snapshot_checksum(snapshot: &RuntimeSnapshot) -> Result<String> {
         checksum.write_bytes(&serde_json::to_vec(strategic.surrenders.as_ref())?);
         checksum.write_bytes(&serde_json::to_vec(strategic.events.as_ref())?);
         checksum.write_bytes(&serde_json::to_vec(&strategic.conflict_resolution)?);
+    } else {
+        checksum.write_bool(false);
+    }
+    if let Some(operational) = &snapshot.operational_snapshot {
+        checksum.write_bool(true);
+        checksum.write_bytes(&serde_json::to_vec(operational.as_ref())?);
     } else {
         checksum.write_bool(false);
     }
@@ -4840,6 +5126,7 @@ mod tests {
             occupations: Vec::new(),
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
+            operational_ai: None,
         }
     }
 
@@ -5106,6 +5393,173 @@ mod tests {
         let mut unknown_schema = valid;
         unknown_schema.schema = "native-side-dynamics-v0".to_owned();
         assert!(validate_side_dynamics(&unknown_schema, 1, 1, 4).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v5_requires_operational_ai_and_v4_forbids_it() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OptionalOperationalAi {
+            #[serde(default, deserialize_with = "deserialize_optional_operational_ai")]
+            operational_ai: Option<OperationalRuntimeState>,
+        }
+
+        let absent: OptionalOperationalAi = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.operational_ai.is_none());
+        assert!(
+            serde_json::from_value::<OptionalOperationalAi>(json!({"operationalAi": null}))
+                .is_err()
+        );
+        let operations = OperationalRuntimeState::bootstrap(1, &[0], &[0.0]);
+        let present: OptionalOperationalAi = serde_json::from_value(json!({
+            "operationalAi": serde_json::to_value(&operations).unwrap()
+        }))
+        .unwrap();
+        assert_eq!(present.operational_ai, Some(operations.clone()));
+
+        let dynamics = SideDynamicsFixture {
+            schema: NATIVE_SIDE_DYNAMICS_SCHEMA.to_owned(),
+            sides: vec![SideDynamicsSideFixture {
+                side_index: 0,
+                initial_personnel: 100.0,
+                personnel: 90.0,
+                momentum_history: Vec::new(),
+                war_phase: SideDynamicsWarPhaseFixture::Stalemate,
+                posture: SideDynamicsPostureFixture::Balanced,
+                posture_override: None,
+            }],
+        };
+        let mut checkpoint = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+            CheckpointBoundary::MidWar,
+            Some(valid_v2_territory()),
+        );
+        checkpoint.battlefield = Some(valid_battlefield());
+        checkpoint.influence_runtime = Some(valid_influence_runtime());
+        checkpoint.side_dynamics = Some(dynamics);
+        checkpoint.operational_ai = Some(operations);
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut missing = checkpoint.clone();
+        missing.operational_ai = None;
+        assert!(validate_checkpoint_shape(&missing).is_err());
+        let mut v4_with_operations = checkpoint.clone();
+        v4_with_operations.schema = NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA.to_owned();
+        assert!(validate_checkpoint_shape(&v4_with_operations).is_err());
+        let mut overflowing_cycle = checkpoint;
+        overflowing_cycle.strategic_cycle = u64::MAX;
+        assert!(validate_checkpoint_shape(&overflowing_cycle).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v5_requires_every_nullable_operational_key() {
+        let valid = json!({
+            "schema": NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+            "operationalAi": {
+                "sides": [{
+                    "override": {"expiresTick": null},
+                    "intel": {"contacts": [{"countryId": null}]}
+                }],
+                "taskForces": [{
+                    "theaterId": null,
+                    "target": null,
+                    "stagingAnchor": null,
+                    "withdrawalAnchor": null,
+                    "completionReason": null,
+                    "outcome": null,
+                    "parentTaskForceId": null,
+                    "supplyInvalidatedTick": null
+                }],
+                "countryDesperation": [{
+                    "initialCities": null,
+                    "initialManpower": null,
+                    "previousControlled": null
+                }],
+                "overrideEvents": [{"posture": null, "expiresTick": null}]
+            }
+        });
+        validate_checkpoint_v5_required_nullable_fields(&valid).unwrap();
+
+        for (parent, key) in [
+            ("/operationalAi/sides/0", "override"),
+            ("/operationalAi/sides/0/override", "expiresTick"),
+            ("/operationalAi/sides/0/intel/contacts/0", "countryId"),
+            ("/operationalAi/taskForces/0", "theaterId"),
+            ("/operationalAi/taskForces/0", "target"),
+            ("/operationalAi/taskForces/0", "stagingAnchor"),
+            ("/operationalAi/taskForces/0", "withdrawalAnchor"),
+            ("/operationalAi/taskForces/0", "completionReason"),
+            ("/operationalAi/taskForces/0", "outcome"),
+            ("/operationalAi/taskForces/0", "parentTaskForceId"),
+            ("/operationalAi/taskForces/0", "supplyInvalidatedTick"),
+            ("/operationalAi/countryDesperation/0", "initialCities"),
+            ("/operationalAi/countryDesperation/0", "initialManpower"),
+            ("/operationalAi/countryDesperation/0", "previousControlled"),
+            ("/operationalAi/overrideEvents/0", "posture"),
+            ("/operationalAi/overrideEvents/0", "expiresTick"),
+        ] {
+            let mut missing = valid.clone();
+            missing
+                .pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+            assert!(
+                validate_checkpoint_v5_required_nullable_fields(&missing).is_err(),
+                "missing {parent}/{key} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_v5_operational_wire_rejects_recursive_unknown_fields() {
+        let operations = OperationalRuntimeState::bootstrap(1, &[0], &[0.0]);
+        let encoded = serde_json::to_value(operations).unwrap();
+
+        let mut unknown_root = encoded.clone();
+        unknown_root["unknown"] = json!(true);
+        assert!(serde_json::from_value::<OperationalRuntimeState>(unknown_root).is_err());
+
+        let mut unknown_side = encoded;
+        unknown_side["sides"][0]["unknown"] = json!(true);
+        assert!(serde_json::from_value::<OperationalRuntimeState>(unknown_side).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v5_operational_hostility_is_exact_and_directed() {
+        let operations = OperationalRuntimeState::bootstrap(2, &[0, 1, 1, 0], &[1.0, 1.0]);
+        validate_operational_ai(
+            &operations,
+            2,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            0,
+            &[0, 1, 1, 0],
+        )
+        .unwrap();
+        assert!(
+            validate_operational_ai(
+                &operations,
+                2,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                0,
+                &[0, 1, 0, 0],
+            )
+            .is_err()
+        );
+        assert!(
+            validate_operational_ai(
+                &operations,
+                2,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                0,
+                &[1, 1, 1, 0],
+            )
+            .is_err()
+        );
     }
 
     #[test]

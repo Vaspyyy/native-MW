@@ -401,7 +401,7 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or v2/v3/v4 `midWar` checkpoint in
+Run an exact browser-exported v1 `postStartWar` or v2/v3/v4/v5 `midWar` checkpoint in
 the production viewer, or validate steps without a window:
 
 ```bash

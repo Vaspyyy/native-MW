@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
-    write_runtime_checkpoint_state_v4,
+    write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
 };
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
@@ -604,7 +604,9 @@ impl App {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.side_dynamics.is_some() {
+        let writer = if state.operations.is_some() {
+            write_runtime_checkpoint_state_v5
+        } else if state.side_dynamics.is_some() {
             write_runtime_checkpoint_state_v4
         } else if state.influence_runtime.is_some() {
             write_runtime_checkpoint_state_v3
@@ -1336,6 +1338,7 @@ fn create_demo_runtime(
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
             side_dynamics: None,
+            operations: None,
         },
     )?;
     Ok(runtime)
