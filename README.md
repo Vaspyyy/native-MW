@@ -27,12 +27,15 @@ reference while systems move into the renderer-independent `mw-core` crate.
   browser-parity sea/supply/encirclement attrition
 - deterministic command-band feedback: pay-cycle bands refresh per-unit refusal,
   return-home, self-defense, influence eligibility, and planning policy
+- transactional side dynamics: browser-cadence momentum history, four live war
+  phases, visible-strength AI posture, combat/defense policy overlays, and
+  casualty/desertion manpower continuation
 - reference-counted immutable snapshots, FIFO territory render deltas, and a
   native `wgpu` unit overlay
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
-- versioned browser-to-native checkpoints: loadable legacy v1/v2 state plus
-  strict v3 mid-war continuation with exact history-dependent influence work
+- versioned browser-to-native checkpoints: loadable legacy v1-v3 state plus
+  strict v4 mid-war continuation with exact influence work and side dynamics
 - production checkpoint loading in the native viewer plus bounded-step,
   window-free worker validation with clean terminal-conflict completion
 - optimized full-cap territory and combat hot paths using dense lookup tables,
@@ -68,7 +71,7 @@ cargo run --release -p mw-tools -- native-runtime-fixture ../modern-wars/assets/
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
-`native-runtime-fixture` accepts three deliberately different checkpoint
+`native-runtime-fixture` accepts four deliberately different checkpoint
 boundaries. Checkpoint v1 retains `postStartWar`, which is
 production-resumable only at tick, frame, and strategic cycle zero, and the
 synthetic non-resumable `baselineReplay` fixture/benchmark boundary.
@@ -77,20 +80,24 @@ units, economies, occupations, total and victim-by-attacker casualties, every
 territory plane, revision markers, and the last fully committed census.
 Checkpoint v3 keeps that boundary and requires a strict `influenceRuntime`
 block containing the frontier work needed for exact continuation.
+Checkpoint v4 retains v3 and adds the strict `sideDynamics` state needed to
+continue momentum sampling, phase, posture, and side personnel without reset.
 
 The browser exports v1 by default for compatibility. After a war has advanced,
-request the current v3 handoff explicitly from its console:
+request the current v4 handoff explicitly from its console:
 
 ```js
-await window.downloadNativeRuntimeCheckpoint({ version: 3, steps: 5 });
+await window.downloadNativeRuntimeCheckpoint({ version: 4, steps: 5 });
 ```
 
 The mid-war exporter synchronously flushes census work and refuses to save if a
 census remains active or dirty. It retains immutable baseline geography for
 scenario production derivation; the loader derives those immutable baselines
-first and only then overlays the committed live territory maps. V3 additionally
-preserves the ordered priority/regular frontier queues, including observable
-duplicate and stale entries.
+first and only then overlays the committed live territory maps. V3 and v4
+preserve the ordered priority/regular frontier queues, including observable
+duplicate and stale entries. V4 also preserves every stable side's personnel,
+ten-entry momentum window, current war phase, AI posture, and the nullable
+captured browser desperation/reaction posture override.
 
 Mid-war exports may also carry a strict optional `native-battlefield-v1` block
 with the exact Float32 terrain plane, urban centers, country primitives, and
@@ -99,7 +106,7 @@ rebuilds position-dependent movement, combat, and influence policy every tick
 from live maps and units. Checkpoints without the block remain valid and
 continue under their frozen resolved-policy contract.
 
-The browser v2/v3 handoff supplies that exact terrain plane. Stock standalone
+The browser v2/v3/v4 handoff supplies that exact terrain plane. Stock standalone
 MWSC files do not contain the browser's `mountainData`, so native-only bootstrap
 explicitly disables mountain handling and uses flat terrain rather than
 inventing elevation data.
@@ -114,9 +121,10 @@ cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" "$scenari
 cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
 ```
 
-Both production paths accept exact-state v1 `postStartWar` and v2/v3 `midWar`
-checkpoints. V1/v2 remain loadable under their legacy influence behavior; v3
-restores the strict `influenceRuntime` state. They reject the synthetic,
+Both production paths accept exact-state v1 `postStartWar` and v2/v3/v4
+`midWar` checkpoints. V1/v2 remain loadable under their legacy influence
+behavior; v3 restores the strict `influenceRuntime` state and v4 additionally
+enables live side dynamics. They reject the synthetic,
 non-resumable `baselineReplay` boundary. Normal startup remains a map-only
 viewer, and `--demo-units` remains available as the small scenario-derived
 runtime.
@@ -140,22 +148,23 @@ Native viewer controls:
 Native-only startup accepts repeated `--side` selectors (country ID or unique
 case-insensitive name) and uses deterministic all-Army bootstrap forces. Use
 `--save-checkpoint PATH` for exact-step headless saves; windowed mode also
-supports `S` and save-on-exit when a path is configured. New saves use v3 when
-the runtime owns influence-dynamics state and fall back to legacy v2 otherwise.
-Both retain frontline objectives, assignment priors, and the refresh phase; v3
-also retains the frontier queues, so resumed runs follow the same deterministic
-trajectory as an uninterrupted run. Stock MWSC bootstrap uses the explicit
+supports `S` and save-on-exit when a path is configured. New saves use v4 when
+the runtime owns side dynamics, v3 when it owns only influence dynamics, and
+fall back to legacy v2 otherwise. All retain frontline objectives, assignment
+priors, and the refresh phase; v3/v4 also retain the frontier queues, while v4
+retains momentum, phase, posture, and personnel. Stock MWSC bootstrap uses the
+explicit
 flat-terrain fallback described above. This path does not yet cover every
 browser AI/combat resolver or non-land force system.
 
-Checkpoints v2/v3 are resumable-running-state formats. If a requested headless
+Checkpoints v2/v3/v4 are resumable-running-state formats. If a requested headless
 or windowed save reaches `ConflictResolved`, the runtime finishes cleanly and
 reports that the save was skipped instead of writing a terminal file that the
 loader could not resume.
 
 ```bash
-cargo run --release -p mw-native -- --side Germany --side Czechia --headless --ticks 2 --save-checkpoint /tmp/mw-v3.json "$scenario"
-cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v3.json --headless --ticks 3 --save-checkpoint /tmp/mw-v3-resumed.json "$scenario"
+cargo run --release -p mw-native -- --side Germany --side Czechia --headless --ticks 2 --save-checkpoint /tmp/mw-v4.json "$scenario"
+cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v4.json --headless --ticks 3 --save-checkpoint /tmp/mw-v4-resumed.json "$scenario"
 ```
 
 `mw-native --demo-units`, production checkpoint viewing, native headless
@@ -251,9 +260,10 @@ map. Conflict resolution publishes a final immutable result and enters a clean
 terminal state instead of requiring an external acknowledge-and-continue
 step.
 
-This remains a bounded simulation port. Mid-war v2/v3 do not serialize a
-partial census or render queues; v3 separately preserves pending influence
-frontier work. The surrender path does not yet include the browser's
+This remains a bounded simulation port. Mid-war v2/v3/v4 do not serialize a
+partial census or render queues; v3/v4 preserve pending influence frontier
+work, and v4 preserves side dynamics. The surrender path does not yet include
+the browser's
 releasables, province-border smoothing, equipment-reserve or air
 cleanup, or treaty/UI presentation. The live battlefield resolver now applies
 browser-parity attrition as one validated batch after staged influence and
@@ -277,8 +287,9 @@ tick rather than the already-staged tick.
 
 Remaining bounded omissions are supply-collapse reactions that rebuild
 task-force intent, naval exile/recovery RNG, task-force identity-aware
-repulsion, live war-phase and posture transitions, air/naval simulation, and
-the full gameplay UI. Native `frame` advances once per runtime step; a browser
+repulsion, observer-scoped CONQUEST posture intel, live evolution of captured
+country-desperation/defender-reaction posture overrides, air/naval simulation,
+and the full gameplay UI. Native `frame` advances once per runtime step; a browser
 speed mode may execute
 several logical ticks in one RAF frame, so frame-window mechanics after
 handoff follow deterministic native cadence. These contracts are not a claim

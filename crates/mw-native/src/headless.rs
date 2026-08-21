@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
+    write_runtime_checkpoint_state_v4,
 };
 use mw_core::{
     CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
@@ -31,7 +32,7 @@ const MAX_WATCHDOG: Duration = Duration::from_secs(24 * 60 * 60);
 const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
 const TERMINAL_SAVE_SKIP_REASON: &str =
-    "conflictResolved is terminal and cannot be resumed as checkpoint-v2";
+    "conflictResolved is terminal and cannot be resumed as a mid-war checkpoint";
 
 fn resolve_sides(
     selectors: &[Vec<String>],
@@ -174,7 +175,9 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.influence_runtime.is_some() {
+        let writer = if state.side_dynamics.is_some() {
+            write_runtime_checkpoint_state_v4
+        } else if state.influence_runtime.is_some() {
             write_runtime_checkpoint_state_v3
         } else {
             write_runtime_checkpoint_state_v2

@@ -39,6 +39,8 @@ use serde_json::{Value, json};
 pub const NATIVE_RUNTIME_CHECKPOINT_SCHEMA: &str = "native-runtime-checkpoint-v1";
 pub const NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA: &str = "native-runtime-checkpoint-v2";
 pub const NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA: &str = "native-runtime-checkpoint-v3";
+pub const NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA: &str = "native-runtime-checkpoint-v4";
+pub const NATIVE_SIDE_DYNAMICS_SCHEMA: &str = "native-side-dynamics-v1";
 pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
 
 const INFLUENCE_REGULAR_QUEUE_LIMIT: usize = 16_384;
@@ -51,7 +53,7 @@ pub struct NativeCheckpointWriteReport {
     pub schema: &'static str,
 }
 
-/// Serialize a quiescent runtime using the same strict v2 object consumed by the loader.
+/// Serialize a quiescent runtime using the strict versioned object consumed by the loader.
 /// Core owns the barrier and snapshot extraction; this adapter owns JSON and filesystem policy.
 pub fn write_runtime_checkpoint_v2(
     scenario_path: &Path,
@@ -123,6 +125,99 @@ pub fn write_runtime_checkpoint_state_v3(
     write_runtime_checkpoint_state_v3_with_hash(&raw, baseline, state, output, steps)
 }
 
+/// Serialize a v4 checkpoint. The core runtime supplies the already validated
+/// side-dynamics snapshot; this adapter validates its wire representation.
+pub fn write_runtime_checkpoint_state_v4(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    state
+        .battlefield
+        .as_ref()
+        .context("checkpoint-v4 writer requires live battlefield state")?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    let influence_runtime = state
+        .influence_runtime
+        .as_ref()
+        .context("checkpoint-v4 writer requires influence runtime state")?;
+    let cell_count = state
+        .territory_config
+        .width
+        .checked_mul(state.territory_config.height)
+        .context("checkpoint-v4 territory cell count overflows")?;
+    let influence_runtime = influence_runtime_fixture(influence_runtime, cell_count)?;
+    let dynamics = state
+        .side_dynamics
+        .as_ref()
+        .context("checkpoint-v4 writer requires side dynamics state")?;
+    let side_dynamics = side_dynamics_fixture(dynamics)?;
+    validate_side_dynamics(
+        &side_dynamics,
+        state.territory_config.max_sides,
+        state.frame,
+        u64::try_from(cell_count).context("checkpoint-v4 territory cell count exceeds u64")?,
+    )?;
+    write_runtime_checkpoint_state_with_hash(
+        &raw,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+        Some(influence_runtime),
+        Some(side_dynamics),
+    )
+}
+
+fn side_dynamics_fixture(
+    dynamics: &BTreeMap<usize, mw_core::SideDynamics>,
+) -> Result<SideDynamicsFixture> {
+    let mut sides = Vec::with_capacity(dynamics.len());
+    for (&index, side) in dynamics {
+        if side.side_index != index {
+            bail!("side dynamics map key does not match its embedded side index");
+        }
+        sides.push(SideDynamicsSideFixture {
+            side_index: u16::try_from(index).context("side dynamics index exceeds u16")?,
+            initial_personnel: side.initial_personnel,
+            personnel: side.current_personnel,
+            momentum_history: side
+                .momentum_samples
+                .iter()
+                .map(|sample| SideDynamicsSampleFixture {
+                    frame: sample.frame,
+                    controlled: sample.controlled,
+                })
+                .collect(),
+            war_phase: match side.phase {
+                mw_core::WarPhase::Advancing => SideDynamicsWarPhaseFixture::Advancing,
+                mw_core::WarPhase::Stalemate => SideDynamicsWarPhaseFixture::Stalemate,
+                mw_core::WarPhase::Retreating => SideDynamicsWarPhaseFixture::Retreating,
+                mw_core::WarPhase::Collapsing => SideDynamicsWarPhaseFixture::Collapsing,
+            },
+            posture: match side.posture {
+                mw_core::WarPosture::Offensive => SideDynamicsPostureFixture::Offensive,
+                mw_core::WarPosture::Balanced => SideDynamicsPostureFixture::Balanced,
+                mw_core::WarPosture::Defensive => SideDynamicsPostureFixture::Defensive,
+            },
+            posture_override: side.posture_override.map(|posture| match posture {
+                mw_core::WarPosture::Offensive => SideDynamicsPostureFixture::Offensive,
+                mw_core::WarPosture::Balanced => SideDynamicsPostureFixture::Balanced,
+                mw_core::WarPosture::Defensive => SideDynamicsPostureFixture::Defensive,
+            }),
+        });
+    }
+    Ok(SideDynamicsFixture {
+        schema: NATIVE_SIDE_DYNAMICS_SCHEMA.to_owned(),
+        sides,
+    })
+}
+
 fn write_runtime_checkpoint_state_v2_with_hash(
     raw: &[u8],
     baseline: &DecodedScenario,
@@ -137,6 +232,7 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         output,
         steps,
         NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+        None,
         None,
     )
 }
@@ -166,9 +262,11 @@ fn write_runtime_checkpoint_state_v3_with_hash(
         steps,
         NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
         Some(influence_runtime),
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_runtime_checkpoint_state_with_hash(
     raw: &[u8],
     baseline: &DecodedScenario,
@@ -177,6 +275,7 @@ fn write_runtime_checkpoint_state_with_hash(
     steps: usize,
     schema: &'static str,
     influence_runtime: Option<InfluenceRuntimeFixture>,
+    side_dynamics: Option<SideDynamicsFixture>,
 ) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
     if state.runtime_config != RuntimeConfig::default() {
@@ -412,6 +511,14 @@ fn write_runtime_checkpoint_state_with_hash(
             .insert(
                 "influenceRuntime".to_owned(),
                 serde_json::to_value(influence_runtime)?,
+            );
+    }
+    if let Some(side_dynamics) = side_dynamics {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert(
+                "sideDynamics".to_owned(),
+                serde_json::to_value(side_dynamics)?,
             );
     }
     let bytes = serde_json::to_vec(&body)?;
@@ -1097,6 +1204,11 @@ struct RuntimeCheckpointFixture {
         deserialize_with = "deserialize_optional_influence_runtime_fixture"
     )]
     influence_runtime: Option<InfluenceRuntimeFixture>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_side_dynamics_fixture"
+    )]
+    side_dynamics: Option<SideDynamicsFixture>,
     sides: Vec<SideFixture>,
     active_sides: Vec<u16>,
     hostility_matrix: Vec<u8>,
@@ -1115,6 +1227,68 @@ struct RuntimeCheckpointFixture {
     casualties: BTreeMap<u16, f64>,
     #[serde(default)]
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SideDynamicsFixture {
+    schema: String,
+    sides: Vec<SideDynamicsSideFixture>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SideDynamicsSideFixture {
+    side_index: u16,
+    initial_personnel: f64,
+    personnel: f64,
+    momentum_history: Vec<SideDynamicsSampleFixture>,
+    war_phase: SideDynamicsWarPhaseFixture,
+    posture: SideDynamicsPostureFixture,
+    #[serde(deserialize_with = "deserialize_required_nullable_side_dynamics_posture")]
+    posture_override: Option<SideDynamicsPostureFixture>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SideDynamicsWarPhaseFixture {
+    Advancing,
+    Stalemate,
+    Retreating,
+    Collapsing,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SideDynamicsPostureFixture {
+    Offensive,
+    Balanced,
+    Defensive,
+}
+
+fn deserialize_required_nullable_side_dynamics_posture<'de, D>(
+    deserializer: D,
+) -> Result<Option<SideDynamicsPostureFixture>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<SideDynamicsPostureFixture>::deserialize(deserializer)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SideDynamicsSampleFixture {
+    frame: u64,
+    controlled: u64,
+}
+
+fn deserialize_optional_side_dynamics_fixture<'de, D>(
+    deserializer: D,
+) -> Result<Option<SideDynamicsFixture>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    SideDynamicsFixture::deserialize(deserializer).map(Some)
 }
 
 /// Native v2 continuation-only state. Browser-generated v2 checkpoints may omit
@@ -1839,6 +2013,7 @@ struct PreparedRuntime {
     live_territory_maps: Option<TerritoryMaps>,
     battlefield: Option<BattlefieldRuntimeState>,
     influence_runtime: Option<mw_core::diffusion::InfluenceRuntimeState>,
+    side_dynamics: Option<BTreeMap<usize, mw_core::SideDynamics>>,
 }
 
 /// Fully validated production handoff for native rendering and simulation.
@@ -1981,6 +2156,11 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
             decode_influence_runtime(influence_runtime, decoded.target.cell_count()?)
         })
         .transpose()?;
+    let side_dynamics = checkpoint
+        .side_dynamics
+        .as_ref()
+        .map(decode_side_dynamics)
+        .transpose()?;
 
     Ok(PreparedRuntime {
         raw_sha256,
@@ -1994,6 +2174,7 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         live_territory_maps,
         battlefield,
         influence_runtime,
+        side_dynamics,
     })
 }
 
@@ -2393,13 +2574,14 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.influence_runtime.is_some()
                 || !checkpoint.casualties_by_victim.is_empty()
                 || checkpoint.planner.is_some()
+                || checkpoint.side_dynamics.is_some()
             {
                 bail!("checkpoint-v1 cannot contain checkpoint-v2 live state");
             }
         }
         NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => {
-            if checkpoint.influence_runtime.is_some() {
-                bail!("checkpoint-v2 cannot contain checkpoint-v3 influence runtime state");
+            if checkpoint.influence_runtime.is_some() || checkpoint.side_dynamics.is_some() {
+                bail!("checkpoint-v2 cannot contain checkpoint-v3/v4 runtime state");
             }
             if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
                 || checkpoint.territory.is_none()
@@ -2418,6 +2600,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.territory.is_none()
                 || checkpoint.geography.is_none()
                 || checkpoint.influence_runtime.is_none()
+                || checkpoint.side_dynamics.is_some()
             {
                 bail!(
                     "checkpoint-v3 requires boundary midWar, immutable baseline geography, live territory, and influence runtime state"
@@ -2427,12 +2610,29 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 bail!("checkpoint-v3 strategicCycle must leave room for a later cycle");
             }
         }
+        NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+                || checkpoint.influence_runtime.is_none()
+                || checkpoint.side_dynamics.is_none()
+                || checkpoint.battlefield.is_none()
+            {
+                bail!(
+                    "checkpoint-v4 requires boundary midWar, geography, territory, battlefield, influence runtime, and side dynamics"
+                );
+            }
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v4 strategicCycle must leave room for a later cycle");
+            }
+        }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -2481,6 +2681,31 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
     if let Some(territory) = checkpoint.territory.as_ref() {
         validate_territory_markers(territory)?;
     }
+    if let Some(dynamics) = checkpoint.side_dynamics.as_ref() {
+        let territory = checkpoint
+            .territory
+            .as_ref()
+            .context("sideDynamics requires live territory")?;
+        let controlled_cell_limit =
+            territory
+                .maps
+                .land_runs
+                .iter()
+                .try_fold(0_u64, |total, (length, _)| {
+                    total
+                        .checked_add(*length)
+                        .context("territory land run lengths overflow u64")
+                })?;
+        if controlled_cell_limit == 0 {
+            bail!("sideDynamics requires a non-empty territory grid");
+        }
+        validate_side_dynamics(
+            dynamics,
+            side_count,
+            checkpoint.frame,
+            controlled_cell_limit,
+        )?;
+    }
     if let Some(planner) = checkpoint.planner.as_ref() {
         let unit_ids = checkpoint
             .units
@@ -2490,6 +2715,89 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
         validate_planner_fixture(planner, checkpoint.tick, side_count, &unit_ids)?;
     }
     Ok(())
+}
+
+fn validate_side_dynamics(
+    dynamics: &SideDynamicsFixture,
+    side_count: usize,
+    checkpoint_frame: u64,
+    controlled_cell_limit: u64,
+) -> Result<()> {
+    if dynamics.schema != NATIVE_SIDE_DYNAMICS_SCHEMA {
+        bail!("unsupported side dynamics schema {:?}", dynamics.schema);
+    }
+    if dynamics.sides.len() != side_count {
+        bail!("sideDynamics.sides must exactly cover declared sides");
+    }
+    for (expected, side) in dynamics.sides.iter().enumerate() {
+        if usize::from(side.side_index) != expected {
+            bail!("sideDynamics sides must be contiguous and ordered by sideIndex");
+        }
+        for value in [side.initial_personnel, side.personnel] {
+            if !value.is_finite() || value < 0.0 {
+                bail!("sideDynamics personnel must be finite and non-negative");
+            }
+        }
+        if side.posture_override == Some(SideDynamicsPostureFixture::Balanced) {
+            bail!("sideDynamics postureOverride must be OFFENSIVE, DEFENSIVE, or null");
+        }
+        if side.momentum_history.len() > 10 {
+            bail!("sideDynamics momentumHistory must contain at most 10 samples");
+        }
+        let mut previous = None;
+        for sample in &side.momentum_history {
+            if sample.frame > checkpoint_frame || previous.is_some_and(|frame| sample.frame < frame)
+            {
+                bail!(
+                    "sideDynamics momentumHistory frames must be nondecreasing and within checkpoint frame"
+                );
+            }
+            if sample.controlled > controlled_cell_limit {
+                bail!("sideDynamics controlled cells exceed the territory grid");
+            }
+            previous = Some(sample.frame);
+        }
+    }
+    Ok(())
+}
+
+fn decode_side_dynamics(
+    dynamics: &SideDynamicsFixture,
+) -> Result<BTreeMap<usize, mw_core::SideDynamics>> {
+    let mut result = BTreeMap::new();
+    for side in &dynamics.sides {
+        let phase = match side.war_phase {
+            SideDynamicsWarPhaseFixture::Advancing => mw_core::WarPhase::Advancing,
+            SideDynamicsWarPhaseFixture::Stalemate => mw_core::WarPhase::Stalemate,
+            SideDynamicsWarPhaseFixture::Retreating => mw_core::WarPhase::Retreating,
+            SideDynamicsWarPhaseFixture::Collapsing => mw_core::WarPhase::Collapsing,
+        };
+        let posture = match side.posture {
+            SideDynamicsPostureFixture::Offensive => mw_core::WarPosture::Offensive,
+            SideDynamicsPostureFixture::Balanced => mw_core::WarPosture::Balanced,
+            SideDynamicsPostureFixture::Defensive => mw_core::WarPosture::Defensive,
+        };
+        let mut state =
+            mw_core::SideDynamics::bootstrap(usize::from(side.side_index), side.initial_personnel);
+        state.current_personnel = side.personnel;
+        state.phase = phase;
+        state.posture = posture;
+        state.posture_override = side.posture_override.map(|posture| match posture {
+            SideDynamicsPostureFixture::Offensive => mw_core::WarPosture::Offensive,
+            SideDynamicsPostureFixture::Balanced => mw_core::WarPosture::Balanced,
+            SideDynamicsPostureFixture::Defensive => mw_core::WarPosture::Defensive,
+        });
+        for sample in &side.momentum_history {
+            state
+                .momentum_samples
+                .push_back(mw_core::dynamics::MomentumSample {
+                    frame: sample.frame,
+                    controlled: sample.controlled,
+                });
+        }
+        result.insert(usize::from(side.side_index), state);
+    }
+    Ok(result)
 }
 
 fn validate_territory_markers(territory: &TerritoryV2Fixture) -> Result<()> {
@@ -3112,6 +3420,7 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         last_front_refresh_tick,
         casualties: checkpoint.casualties.clone(),
         casualties_by_victim: checkpoint.casualties_by_victim.clone(),
+        side_dynamics: prepared.side_dynamics.clone(),
     };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
@@ -3633,6 +3942,7 @@ struct RuntimeProductionReport {
 impl PreparedRuntime {
     fn schema(&self) -> &'static str {
         match self.checkpoint.schema.as_str() {
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
             _ => NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
@@ -4512,6 +4822,7 @@ mod tests {
             territory,
             battlefield: None,
             influence_runtime: None,
+            side_dynamics: None,
             sides: vec![SideFixture {
                 side_index: 0,
                 country_ids: vec![1],
@@ -4695,6 +5006,106 @@ mod tests {
         );
         v1.influence_runtime = Some(valid_influence_runtime());
         assert!(validate_checkpoint_shape(&v1).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v4_side_dynamics_wire_is_strict() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OptionalSideDynamics {
+            #[serde(
+                default,
+                deserialize_with = "deserialize_optional_side_dynamics_fixture"
+            )]
+            side_dynamics: Option<SideDynamicsFixture>,
+        }
+
+        let absent: OptionalSideDynamics = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.side_dynamics.is_none());
+        assert!(
+            serde_json::from_value::<OptionalSideDynamics>(json!({"sideDynamics": null})).is_err()
+        );
+
+        let valid = SideDynamicsFixture {
+            schema: NATIVE_SIDE_DYNAMICS_SCHEMA.to_owned(),
+            sides: vec![SideDynamicsSideFixture {
+                side_index: 0,
+                initial_personnel: 100.0,
+                personnel: 90.0,
+                momentum_history: vec![SideDynamicsSampleFixture {
+                    frame: 1,
+                    controlled: 2,
+                }],
+                war_phase: SideDynamicsWarPhaseFixture::Advancing,
+                posture: SideDynamicsPostureFixture::Offensive,
+                posture_override: None,
+            }],
+        };
+        validate_side_dynamics(&valid, 1, 1, 4).unwrap();
+        let encoded = serde_json::to_value(&valid).unwrap();
+        assert_eq!(encoded["sides"][0]["warPhase"], "ADVANCING");
+        assert_eq!(encoded["sides"][0]["posture"], "OFFENSIVE");
+        assert!(encoded["sides"][0]["postureOverride"].is_null());
+        let mut missing_override = encoded.clone();
+        missing_override["sides"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("postureOverride");
+        assert!(serde_json::from_value::<SideDynamicsFixture>(missing_override).is_err());
+        assert!(
+            serde_json::from_value::<SideDynamicsFixture>(json!({
+                "schema": NATIVE_SIDE_DYNAMICS_SCHEMA,
+                "sides": [{
+                    "sideIndex": 0,
+                    "initialPersonnel": 100.0,
+                    "personnel": 90.0,
+                    "momentumHistory": [],
+                    "warPhase": "advancing",
+                    "posture": "OFFENSIVE",
+                    "postureOverride": null
+                }]
+            }))
+            .is_err()
+        );
+
+        let mut checkpoint = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            CheckpointBoundary::MidWar,
+            Some(valid_v2_territory()),
+        );
+        checkpoint.frame = 1;
+        checkpoint.influence_runtime = Some(valid_influence_runtime());
+        checkpoint.battlefield = Some(valid_battlefield());
+        checkpoint.side_dynamics = Some(valid.clone());
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut missing_dynamics = checkpoint.clone();
+        missing_dynamics.side_dynamics = None;
+        assert!(validate_checkpoint_shape(&missing_dynamics).is_err());
+        let mut missing_battlefield = checkpoint.clone();
+        missing_battlefield.battlefield = None;
+        assert!(validate_checkpoint_shape(&missing_battlefield).is_err());
+        let mut legacy_v3 = checkpoint.clone();
+        legacy_v3.schema = NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA.to_owned();
+        assert!(validate_checkpoint_shape(&legacy_v3).is_err());
+
+        let mut too_many = valid.clone();
+        too_many.sides[0].momentum_history = (0..11)
+            .map(|frame| SideDynamicsSampleFixture {
+                frame,
+                controlled: 1,
+            })
+            .collect();
+        assert!(validate_side_dynamics(&too_many, 1, 10, 4).is_err());
+        let mut outside_grid = valid.clone();
+        outside_grid.sides[0].momentum_history[0].controlled = 5;
+        assert!(validate_side_dynamics(&outside_grid, 1, 1, 4).is_err());
+        let mut balanced_override = valid.clone();
+        balanced_override.sides[0].posture_override = Some(SideDynamicsPostureFixture::Balanced);
+        assert!(validate_side_dynamics(&balanced_override, 1, 1, 4).is_err());
+        let mut unknown_schema = valid;
+        unknown_schema.schema = "native-side-dynamics-v0".to_owned();
+        assert!(validate_side_dynamics(&unknown_schema, 1, 1, 4).is_err());
     }
 
     #[test]

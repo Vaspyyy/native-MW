@@ -401,7 +401,7 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or v2/v3 `midWar` checkpoint in
+Run an exact browser-exported v1 `postStartWar` or v2/v3/v4 `midWar` checkpoint in
 the production viewer, or validate steps without a window:
 
 ```bash
@@ -414,8 +414,8 @@ Native-only starts use repeated `--side` selectors (ID or unique
 case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
 
 ```bash
-target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v3.json "$scenario"
-target/release/mw-native --runtime-checkpoint /tmp/mw-v3.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v3-resumed.json "$scenario"
+target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v4.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v4.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v4-resumed.json "$scenario"
 ```
 
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
@@ -437,11 +437,17 @@ V3 is requested with `window.nativeRuntimeCheckpoint({ version: 3, steps })`.
 It retains the complete v2 payload and adds the exact pending priority and
 regular influence-frontier queues plus their dense queued states. This makes
 history-dependent diffusion resumable instead of reconstructing work from map
-planes. New native saves use v3 whenever influence dynamics are enabled; legacy
-runtimes without that state continue to write v2. Checkpoint encoding/decoding
-and restore remain outside the timed benchmark region.
+planes.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2/v3
+V4 is requested with `window.nativeRuntimeCheckpoint({ version: 4, steps })`.
+It retains v3 and adds the stable-side personnel pools, bounded momentum
+history, four-state phase, three-state posture, and nullable captured browser
+desperation/reaction posture override. New native wars save v4; legacy runtimes
+write v3 when only influence dynamics are available and v2 when neither live
+state block exists. Checkpoint encoding/decoding and restore remain outside the
+timed benchmark region.
+
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2/v3/v4
 `midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
@@ -459,20 +465,24 @@ later unit visits. Native command-band changes refresh per-unit refusal,
 return-home/self-defense behavior, influence eligibility, and planning priors at
 the pay-cycle commit; those effects begin on the next native tick. Home
 fallback is deterministic first-controlled-cell selection rather than the
-browser's RNG reservoir. Task-force-aware supply-collapse reaction, naval
-exile/recovery RNG, task-force-aware repulsion suppression, and live
-war-phase/posture remain omitted. Native
-frames advance once per logical runtime step, so
+browser's RNG reservoir. V4 additionally stages momentum/phase/posture before
+planning, consumes phase and defensive posture in the same tick, and commits
+combat/attrition/desertion personnel loss transactionally. Task-force-aware
+supply-collapse reaction, naval exile/recovery RNG, task-force-aware repulsion
+suppression, and observer-scoped CONQUEST posture intel remain omitted. Native
+also holds any captured desperation/reaction override at its checkpoint value
+until those planners are ported. Native frames advance once per logical runtime step, so
 frame-window mechanics after handoff follow native cadence rather than a
 browser speed mode that batches several ticks into one RAF frame. Old saves
 without the block retain their frozen resolved inputs.
 
-Browser v2/v3 handoffs carry the exact Float32 terrain plane. Standalone stock
+Browser v2/v3/v4 handoffs carry the exact Float32 terrain plane. Standalone stock
 MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
 stress fixture and therefore do not measure the live resolver or the new
-influence scheduler; they are not a claim of complete browser-tick parity. A
-v2/v3 restore rebuilds private territory summaries; partial census work and
+influence/side-dynamics schedulers; they are not a claim of complete
+browser-tick parity. A v2/v3/v4 restore rebuilds private territory summaries;
+partial census work and
 render queues are not serialized. V3 separately preserves pending frontier
 work. Map-only viewing and the small scenario-derived `--demo-units` runtime
 remain separate modes.

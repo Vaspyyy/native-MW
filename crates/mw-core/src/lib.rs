@@ -10,6 +10,7 @@ pub mod combat;
 pub mod command;
 pub mod diffusion;
 pub mod direction;
+pub mod dynamics;
 pub mod economy;
 pub mod front;
 pub mod movement;
@@ -61,6 +62,7 @@ pub use direction::{
     DirectionField, DirectionFieldError, DirectionFieldInput, HostilityMatrix,
     build_direction_field,
 };
+pub use dynamics::{SideDynamics, WarPhase, WarPosture, bootstrap_sides};
 pub use economy::{
     CAPITAL_LOSS_INCOME_MULT, CommandBand, ECONOMY_SCHEMA_VERSION, EconomyCycleInput, EconomyError,
     EconomySeed, EconomyState, MUTINY_RECOVERY_CYCLES, OCCUPATION_COST_SHARE,

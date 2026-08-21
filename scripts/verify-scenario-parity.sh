@@ -16,6 +16,7 @@ fi
 
 node "$web_root/scripts/native-runtime-checkpoint-smoke.mjs"
 node "$web_root/scripts/native-runtime-checkpoint-v2-smoke.mjs"
+node "$native_root/scripts/js-side-dynamics-reference.mjs"
 
 cargo build --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools -p mw-native
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-core committed_state_restore
@@ -137,5 +138,17 @@ native_bin="$native_root/target/debug/mw-native"
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/part.json" "$modern_path" >/dev/null
 "$native_bin" --runtime-checkpoint "$save_tmp/part.json" --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/resumed.json" "$modern_path" >/dev/null
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 40 --tick-ms 1 --save-checkpoint "$save_tmp/full.json" "$modern_path" >/dev/null
+for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full.json"; do
+	jq -e '
+		.schema == "native-runtime-checkpoint-v4"
+		and .sideDynamics.schema == "native-side-dynamics-v1"
+		and (.sideDynamics.sides | length) == (.sides | length)
+	' "$checkpoint" >/dev/null
+done
+node "$native_root/scripts/js-browser-v4-wire.mjs" \
+	"$web_root" "$save_tmp/part.json" "$save_tmp/browser-wire.json"
+"$native_root/target/debug/mw-tools" native-runtime-fixture \
+	"$modern_path" "$save_tmp/browser-wire.json" --ticks 1 --json >/dev/null
+printf 'browser v4 wire to native loader gate ok\n'
 diff -u <(jq -S 'del(.steps)' "$save_tmp/resumed.json") <(jq -S 'del(.steps)' "$save_tmp/full.json")
 printf 'native save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'

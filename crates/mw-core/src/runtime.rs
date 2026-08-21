@@ -23,13 +23,14 @@ use crate::{
         BattlefieldTickInput, BattlefieldUnitInput, BattlefieldUnitResult, BattlefieldUnitState,
         apply_cohesion_and_repulsion, resolve_battlefield_tick, resolve_local_tactics,
     },
-    combat::{UnitKind, formation_strength, wrapped_longitude_delta},
+    combat::{UNIT_HEALTH, UnitKind, formation_strength, wrapped_longitude_delta},
     command::{
         CommandHomeTarget, CommandResolveError, CommandUnitState, CommandWorld,
         ResolvedCommandPolicy, browser_discipline, resolve_command_batch,
     },
     diffusion::DiffusionQueueResult,
     direction::HostilityMatrix,
+    dynamics::{SideDynamics, WarPhase, WarPosture},
     economy::{CommandBand, EconomyState, PAY_CYCLE_TICKS},
     front::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
@@ -46,9 +47,9 @@ use crate::{
         Simulation, SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput,
     },
     strategic::{
-        ConflictResolutionPlan, PreparedStrategicCycle, StrategicCounters, StrategicError,
-        StrategicSimulation, StrategicSnapshot, SurrenderAllocationInput, SurrenderUnitPosition,
-        plan_surrender_allocation,
+        ConflictResolutionPlan, DesertionCommand, PreparedStrategicCycle, StrategicCounters,
+        StrategicError, StrategicSimulation, StrategicSnapshot, SurrenderAllocationInput,
+        SurrenderUnitPosition, plan_surrender_allocation,
     },
     surrender::evaluate_global_conflict,
     tactical::SideKey,
@@ -506,12 +507,182 @@ fn hostile_controlled_land_by_side(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn stage_side_dynamics(
+    current: &Option<BTreeMap<usize, SideDynamics>>,
+    next_tick: u64,
+    frame: u64,
+    territory: &TerritorySnapshot,
+    country_to_side: &BTreeMap<u16, usize>,
+    active_sides: &[u16],
+    hostility: &[u8],
+    side_count: usize,
+    simulation: &Simulation,
+    policies: &BTreeMap<u64, RuntimeUnitPolicy>,
+) -> Result<Option<BTreeMap<usize, SideDynamics>>, RuntimeError> {
+    let Some(mut next) = current.clone() else {
+        return Ok(None);
+    };
+    let active = active_sides
+        .iter()
+        .copied()
+        .map(usize::from)
+        .collect::<BTreeSet<_>>();
+    let mut controlled = vec![0_u64; side_count];
+    for country in &territory.countries {
+        if let Some(&side) = country_to_side.get(&country.country_id)
+            && side < side_count
+        {
+            controlled[side] = controlled[side].saturating_add(country.controlled);
+        }
+    }
+
+    let mut strength = vec![0.0; side_count];
+    let mut deployed_units = vec![0_usize; side_count];
+    for unit in &simulation.units {
+        let side = unit.combat.side as usize;
+        if side >= side_count {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "side dynamics encountered a unit outside declared topology",
+            ));
+        }
+        let policy = policies
+            .get(&unit.combat.id)
+            .ok_or(RuntimeError::InvalidUnitPolicy(unit.combat.id))?;
+        if unit_deploying(policy, next_tick) {
+            continue;
+        }
+        deployed_units[side] += 1;
+        strength[side] += formation_strength(&unit.combat).max(0.0);
+    }
+
+    for (&side, dynamics) in &mut next {
+        if !active.contains(&side) {
+            // Browser rebuilds posture from a BALANCED array every tick and leaves zero-unit or
+            // retired sides at that default. Phase/history remain frozen for those stable sides.
+            dynamics.posture = WarPosture::Balanced;
+            continue;
+        }
+        if SideDynamics::sample_due(next_tick) {
+            dynamics.sample(frame, controlled[side]);
+        }
+        let mut hostile_strength = 0.0;
+        let mut hostile_units = 0_usize;
+        for other in 0..side_count {
+            if hostility[side * side_count + other] == 1 {
+                hostile_strength += strength[other];
+                hostile_units += deployed_units[other];
+            }
+        }
+        dynamics.refresh_posture(
+            deployed_units[side] > 0,
+            strength[side],
+            hostile_units > 0,
+            hostile_strength,
+        );
+    }
+    Ok(Some(next))
+}
+
+fn apply_runtime_casualties_to_side_dynamics(
+    dynamics: &mut Option<BTreeMap<usize, SideDynamics>>,
+    previous: &BTreeMap<u16, f64>,
+    next: &BTreeMap<u16, f64>,
+    country_to_side: &BTreeMap<u16, usize>,
+) {
+    let Some(dynamics) = dynamics else {
+        return;
+    };
+    let mut by_side = BTreeMap::<usize, f64>::new();
+    for (&country, &total) in next {
+        let before = previous.get(&country).copied().unwrap_or(0.0);
+        let delta = (total - before).max(0.0);
+        if let Some(&side) = country_to_side.get(&country) {
+            *by_side.entry(side).or_default() += delta;
+        }
+    }
+    for (side, casualties) in by_side {
+        if let Some(state) = dynamics.get_mut(&side) {
+            state.apply_casualties(casualties);
+        }
+    }
+}
+
+fn apply_personnel_loss_to_side_dynamics(
+    dynamics: &mut Option<BTreeMap<usize, SideDynamics>>,
+    losses: &BTreeMap<usize, f64>,
+) {
+    let Some(dynamics) = dynamics else {
+        return;
+    };
+    for (&side, &loss) in losses {
+        if let Some(state) = dynamics.get_mut(&side) {
+            state.apply_casualties(loss);
+        }
+    }
+}
+
+fn desertion_personnel_loss_by_side(
+    simulation: &Simulation,
+    commands: &[DesertionCommand],
+) -> BTreeMap<usize, f64> {
+    let rate_by_country = commands
+        .iter()
+        .map(|command| (command.country_id, command.rate))
+        .collect::<BTreeMap<_, _>>();
+    let crew_per_vehicle = simulation.config().combat.armor_crew_per_vehicle;
+    let mut losses = BTreeMap::<usize, f64>::new();
+    for unit in &simulation.units {
+        let Ok(country) = u16::try_from(unit.combat.sovereign) else {
+            continue;
+        };
+        let Some(&rate) = rate_by_country.get(&country) else {
+            continue;
+        };
+        if rate <= 0.0 {
+            continue;
+        }
+        let next_health = unit.combat.health - (unit.combat.health * rate).max(0.0);
+        let personnel_loss = if unit.combat.kind == UnitKind::Armor {
+            let before = unit.combat.equipment;
+            let capacity = if unit.combat.max_equipment > 0 {
+                unit.combat.max_equipment
+            } else {
+                before
+            };
+            let after = before.min(
+                ((capacity as f64) * (next_health / UNIT_HEALTH))
+                    .ceil()
+                    .max(0.0) as u64,
+            );
+            let mut loss = (before - after).saturating_mul(crew_per_vehicle) as f64;
+            if next_health <= 1.0 {
+                loss += after.saturating_mul(crew_per_vehicle) as f64;
+            }
+            loss
+        } else {
+            let before = unit.combat.personnel;
+            let proportional_loss = (before as f64 * rate).min(before as f64);
+            let after = ((before as f64 - proportional_loss).round().max(0.0)) as u64;
+            proportional_loss
+                + if next_health <= 1.0 {
+                    after as f64
+                } else {
+                    0.0
+                }
+        };
+        *losses.entry(unit.combat.side as usize).or_default() += personnel_loss;
+    }
+    losses
+}
+
 fn ai_units(
     simulation: &Simulation,
     policies: &BTreeMap<u64, RuntimeUnitPolicy>,
     prior_objective_by_unit: &BTreeMap<u64, u64>,
     tick: u64,
     battlefield: Option<&StagedBattlefieldTick>,
+    side_dynamics: Option<&BTreeMap<usize, SideDynamics>>,
 ) -> Result<Vec<AiUnitInput>, RuntimeError> {
     simulation
         .units
@@ -534,6 +705,9 @@ fn ai_units(
                 .and_then(|stage| stage.ally_weight_by_id.get(&unit.combat.id))
                 .copied()
                 .unwrap_or(unit.ally_weight);
+            let defensive_posture = side_dynamics
+                .and_then(|dynamics| dynamics.get(&usize::from(side)))
+                .is_some_and(|dynamics| dynamics.posture == WarPosture::Defensive);
             Ok(AiUnitInput {
                 id: unit.combat.id,
                 side,
@@ -554,7 +728,7 @@ fn ai_units(
                 is_reserve: policy.ai.is_reserve || policy.command.refuses_offense,
                 reinforcement_eligible: policy.ai.reinforcement_eligible,
                 encircled: policy.ai.encircled,
-                defensive_only: policy.command.refuses_offense,
+                defensive_only: policy.command.refuses_offense || defensive_posture,
             })
         })
         .collect()
@@ -947,6 +1121,7 @@ pub struct RuntimeCheckpoint {
     pub last_front_refresh_tick: Option<u64>,
     pub casualties: BTreeMap<u16, f64>,
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+    pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
 }
 
 /// Owned state captured at a committed, serialization-ready runtime boundary.
@@ -977,6 +1152,7 @@ pub struct NativeRuntimeCheckpointState {
     pub last_front_refresh_tick: Option<u64>,
     pub casualties: BTreeMap<u16, f64>,
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+    pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
 }
 
 /// Shared native simulation owner. No mutable kernel state is exposed to renderers.
@@ -1000,6 +1176,7 @@ pub struct NativeRuntime {
     prior_objective_by_unit: BTreeMap<u64, u64>,
     casualties: BTreeMap<u16, f64>,
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+    side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
     state: RuntimeState,
     latest: Arc<RuntimeSnapshot>,
     render_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
@@ -1011,6 +1188,7 @@ struct StagedStrategicEffects {
     removed_ids: Vec<u64>,
     state: RuntimeState,
     fronts_invalidated: bool,
+    desertion_personnel_loss_by_side: BTreeMap<usize, f64>,
 }
 
 struct StagedBattlefieldTick {
@@ -1137,6 +1315,14 @@ impl NativeRuntime {
         )?;
         validate_casualties(&checkpoint.casualties, &checkpoint.scenario)?;
         validate_casualties_by_victim(&checkpoint.casualties_by_victim, &checkpoint.scenario)?;
+        let controlled_cell_limit = u64::try_from(checkpoint.territory.total_cells())
+            .map_err(|_| RuntimeError::InvalidCheckpoint("territory cell count exceeds u64"))?;
+        validate_side_dynamics_state(
+            checkpoint.side_dynamics.as_ref(),
+            checkpoint.territory.max_sides(),
+            checkpoint.frame,
+            controlled_cell_limit,
+        )?;
 
         // A checkpoint may have an in-progress bounded census. Construction finishes it before
         // exposing the first cross-kernel publication.
@@ -1236,6 +1422,7 @@ impl NativeRuntime {
             prior_objective_by_unit: checkpoint.prior_objective_by_unit,
             casualties: checkpoint.casualties,
             casualties_by_victim: checkpoint.casualties_by_victim,
+            side_dynamics: checkpoint.side_dynamics,
             state: initial_state,
             latest,
             render_updates,
@@ -1323,6 +1510,7 @@ impl NativeRuntime {
             last_front_refresh_tick: self.last_front_refresh_tick,
             casualties: self.casualties.clone(),
             casualties_by_victim: self.casualties_by_victim.clone(),
+            side_dynamics: self.side_dynamics.clone(),
         })
     }
 
@@ -1332,6 +1520,7 @@ impl NativeRuntime {
         next_frame: u64,
         territory: &TerritoryControl,
         hostile_controlled_land: &[f64],
+        side_dynamics: Option<&BTreeMap<usize, SideDynamics>>,
     ) -> Result<Option<StagedBattlefieldTick>, RuntimeError> {
         let Some(state) = &self.battlefield else {
             return Ok(None);
@@ -1405,6 +1594,33 @@ impl NativeRuntime {
                         .ok_or(RuntimeError::InvalidCheckpoint(
                             "battlefield country state is missing",
                         ))?;
+                if let Some(dynamics) =
+                    side_dynamics.and_then(|dynamics| dynamics.get(&usize::from(side)))
+                {
+                    country.war_phase = match dynamics.phase {
+                        WarPhase::Advancing => crate::battlefield::BattlefieldWarPhase::Advancing,
+                        WarPhase::Collapsing => crate::battlefield::BattlefieldWarPhase::Collapsing,
+                        WarPhase::Stalemate | WarPhase::Retreating => {
+                            crate::battlefield::BattlefieldWarPhase::Stable
+                        }
+                    };
+                    if dynamics.posture == WarPosture::Defensive {
+                        let manpower_ratio = if dynamics.initial_personnel > 0.0 {
+                            (dynamics.current_personnel / dynamics.initial_personnel).max(0.0)
+                        } else {
+                            0.0
+                        };
+                        let defensive_scale = if manpower_ratio < 0.25 {
+                            0.6
+                        } else if manpower_ratio < 0.5 {
+                            0.8
+                        } else {
+                            1.0
+                        };
+                        country.ai_speed_multiplier =
+                            country.ai_speed_multiplier.min(0.96 * defensive_scale);
+                    }
+                }
                 if let Some(capital_cell) = self
                     .scenario
                     .countries
@@ -1598,6 +1814,8 @@ impl NativeRuntime {
             .iter()
             .map(|command| command.country_id)
             .collect::<Vec<_>>();
+        let desertion_personnel_loss_by_side =
+            desertion_personnel_loss_by_side(&self.simulation, &evaluated.desertions);
         let mut staged_simulation = if evaluated.desertions.is_empty() && capitulated.is_empty() {
             None
         } else {
@@ -1814,6 +2032,7 @@ impl NativeRuntime {
             removed_ids,
             state,
             fronts_invalidated: !evaluated.surrenders.is_empty(),
+            desertion_personnel_loss_by_side,
         })
     }
 
@@ -1838,6 +2057,18 @@ impl NativeRuntime {
             .frame
             .checked_add(1)
             .ok_or(RuntimeError::ClockOverflow)?;
+        let mut staged_side_dynamics = stage_side_dynamics(
+            &self.side_dynamics,
+            next_tick,
+            self.frame,
+            &self.latest.territory_snapshot,
+            self.territory.country_to_side(),
+            &self.diplomacy.active_sides,
+            &self.diplomacy.hostility,
+            self.territory.max_sides(),
+            &self.simulation,
+            &self.unit_policies,
+        )?;
         // Browser influence runs before the current tick resolves controller-dependent policy,
         // fronts, AI, movement, and combat. Build influence from the pre-tick unit/map snapshot,
         // apply it through a sparse undo transaction, then resolve the rest of the tick against
@@ -1856,6 +2087,7 @@ impl NativeRuntime {
             next_frame,
             &self.territory,
             &hostile_controlled_land,
+            staged_side_dynamics.as_ref(),
         )?;
         let mut staged_influence = None;
         // Browser influence caches contain only non-empty coalition rows. The
@@ -1920,6 +2152,7 @@ impl NativeRuntime {
                 next_frame,
                 &self.territory,
                 &hostile_controlled_land,
+                staged_side_dynamics.as_ref(),
             ) {
                 Ok(Some(stage)) => Some(stage),
                 Ok(None) => {
@@ -2065,6 +2298,7 @@ impl NativeRuntime {
             planning_prior,
             next_tick,
             staged_battlefield.as_ref(),
+            staged_side_dynamics.as_ref(),
         ));
         let mut planning = rollback_try!(resolve_ai_orders(
             self.config.ai,
@@ -2334,6 +2568,12 @@ impl NativeRuntime {
             &self.unit_sovereign_by_id,
             attrition_outcome.as_ref(),
         );
+        apply_runtime_casualties_to_side_dynamics(
+            &mut staged_side_dynamics,
+            &self.casualties,
+            &next_casualties,
+            self.territory.country_to_side(),
+        );
         let next_casualties_by_victim = next_casualties_by_victim(
             &self.casualties_by_victim,
             &self.unit_sovereign_by_id,
@@ -2439,6 +2679,10 @@ impl NativeRuntime {
                         return Err(error);
                     }
                 };
+            apply_personnel_loss_to_side_dynamics(
+                &mut staged_side_dynamics,
+                &effects.desertion_personnel_loss_by_side,
+            );
             let command_updates = match self.stage_command_policies(
                 &prepared.snapshot(),
                 effects.simulation.as_ref().unwrap_or(&self.simulation),
@@ -2542,6 +2786,7 @@ impl NativeRuntime {
         self.prior_objective_by_unit = next_prior;
         self.casualties = next_casualties;
         self.casualties_by_victim = next_casualties_by_victim;
+        self.side_dynamics = staged_side_dynamics;
         self.tick = next_tick;
         self.frame = next_frame;
         self.state = next_state;
@@ -2979,6 +3224,29 @@ fn validate_front_planner_state(
     Ok(())
 }
 
+fn validate_side_dynamics_state(
+    dynamics: Option<&BTreeMap<usize, SideDynamics>>,
+    side_count: usize,
+    checkpoint_frame: u64,
+    controlled_cell_limit: u64,
+) -> Result<(), RuntimeError> {
+    let Some(dynamics) = dynamics else {
+        return Ok(());
+    };
+    if dynamics.len() != side_count
+        || dynamics.iter().enumerate().any(|(expected, (&key, side))| {
+            key != expected
+                || side.side_index != key
+                || !side.validate(checkpoint_frame, controlled_cell_limit)
+        })
+    {
+        return Err(RuntimeError::InvalidCheckpoint(
+            "side dynamics must exactly cover the stable side topology",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_casualties(
     casualties: &BTreeMap<u16, f64>,
     scenario: &ScenarioProduction,
@@ -3093,7 +3361,7 @@ fn validate_ai_boundary(
     territory: &TerritoryControl,
     diplomacy: &RuntimeDiplomacy,
 ) -> Result<(), RuntimeError> {
-    let units = ai_units(simulation, policies, prior, tick, None)?;
+    let units = ai_units(simulation, policies, prior, tick, None, None)?;
     resolve_ai_orders(
         config,
         &units,
@@ -3296,6 +3564,35 @@ mod tests {
     }
 
     #[test]
+    fn side_personnel_tracks_desertion_but_not_capitulation_removal() {
+        let mut armor = unit(2, 1, 2, 90.0);
+        armor.combat.kind = UnitKind::Armor;
+        armor.combat.personnel = 0;
+        armor.combat.personnel_capacity = 0;
+        armor.combat.equipment = 10;
+        armor.combat.max_equipment = 10;
+        let simulation =
+            Simulation::new(SimulationConfig::default(), vec![unit(1, 0, 1, 0.0), armor]).unwrap();
+        let losses = desertion_personnel_loss_by_side(
+            &simulation,
+            &[
+                DesertionCommand {
+                    country_id: 1,
+                    rate: 0.1,
+                },
+                DesertionCommand {
+                    country_id: 2,
+                    rate: 0.1,
+                },
+            ],
+        );
+
+        assert_eq!(losses, BTreeMap::from([(0, 100.0), (1, 2.0)]));
+        // Capitulation IDs are intentionally absent from this calculation: deleting the
+        // remaining formations retires the side but does not spend its surviving manpower pool.
+    }
+
+    #[test]
     fn attrition_land_totals_use_committed_country_control_and_directed_hostility() {
         let runtime = fixture(0, false);
         let totals = hostile_controlled_land_by_side(
@@ -3439,6 +3736,7 @@ mod tests {
                 last_front_refresh_tick: None,
                 casualties: BTreeMap::new(),
                 casualties_by_victim: BTreeMap::new(),
+                side_dynamics: None,
             },
         )
         .unwrap()
@@ -3471,6 +3769,7 @@ mod tests {
             last_front_refresh_tick: state.last_front_refresh_tick,
             casualties: state.casualties,
             casualties_by_victim: state.casualties_by_victim,
+            side_dynamics: state.side_dynamics,
         }
     }
 
@@ -3509,6 +3808,151 @@ mod tests {
             units,
         });
         NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap()
+    }
+
+    fn enable_side_dynamics(runtime: &mut NativeRuntime) {
+        runtime.side_dynamics = Some(crate::dynamics::bootstrap_sides(
+            runtime.territory.max_sides(),
+            runtime.simulation.units.iter().map(|unit| {
+                (
+                    unit.combat.side as usize,
+                    if unit.combat.kind == UnitKind::Armor {
+                        unit.combat.equipment.saturating_mul(2) as f64
+                    } else {
+                        unit.combat.personnel as f64
+                    },
+                )
+            }),
+        ));
+    }
+
+    #[test]
+    fn side_dynamics_stage_feeds_same_tick_battlefield_and_ai_policy() {
+        let mut runtime = with_live_battlefield(fixture(36, false), vec![0.0; 8]);
+        enable_side_dynamics(&mut runtime);
+        let dynamics = runtime.side_dynamics.as_mut().unwrap();
+        let side_zero = dynamics.get_mut(&0).unwrap();
+        side_zero.sample(0, 4);
+        side_zero.sample(1, 4);
+        side_zero.current_personnel = side_zero.initial_personnel * 0.09;
+
+        runtime.step().unwrap();
+
+        let dynamics = runtime.side_dynamics.as_ref().unwrap();
+        let side = &dynamics[&0];
+        assert_eq!(side.momentum_samples.len(), 3);
+        assert_eq!(side.momentum_samples.back().unwrap().frame, 36);
+        assert_eq!(side.momentum_samples.back().unwrap().controlled, 4);
+        assert_eq!(side.phase, WarPhase::Collapsing);
+        assert_eq!(
+            runtime.unit_policies[&1].ai.combat.dealt_multiplier,
+            0.25 * 0.7
+        );
+
+        let mut defensive = dynamics.clone();
+        defensive.get_mut(&0).unwrap().posture = WarPosture::Defensive;
+        let inputs = ai_units(
+            &runtime.simulation,
+            &runtime.unit_policies,
+            &runtime.prior_objective_by_unit,
+            runtime.tick + 1,
+            None,
+            Some(&defensive),
+        )
+        .unwrap();
+        let side_zero = inputs
+            .iter()
+            .find(|unit| usize::from(unit.side) == 0)
+            .unwrap();
+        assert!(side_zero.defensive_only);
+        assert!(!runtime.unit_policies[&side_zero.id].command.refuses_offense);
+    }
+
+    #[test]
+    fn failed_tick_does_not_advance_side_dynamics() {
+        let mut runtime = fixture(36, false);
+        enable_side_dynamics(&mut runtime);
+        runtime
+            .side_dynamics
+            .as_mut()
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .sample(0, 4);
+        runtime
+            .side_dynamics
+            .as_mut()
+            .unwrap()
+            .get_mut(&0)
+            .unwrap()
+            .sample(1, 4);
+        let before = runtime.side_dynamics.clone();
+        runtime
+            .unit_policies
+            .get_mut(&1)
+            .unwrap()
+            .influence
+            .as_mut()
+            .unwrap()
+            .radius = f64::NAN;
+
+        assert!(runtime.step().is_err());
+        assert_eq!(runtime.side_dynamics, before);
+        assert_eq!(runtime.tick(), 36);
+        assert_eq!(runtime.frame(), 36);
+    }
+
+    #[test]
+    fn inactive_side_resets_posture_without_losing_history_or_override() {
+        let mut runtime = fixture(36, false);
+        enable_side_dynamics(&mut runtime);
+        let retired = runtime.side_dynamics.as_mut().unwrap().get_mut(&1).unwrap();
+        retired.sample(1, 2);
+        retired.posture = WarPosture::Defensive;
+        retired.posture_override = Some(WarPosture::Offensive);
+        runtime.diplomacy.active_sides = vec![0];
+
+        let staged = stage_side_dynamics(
+            &runtime.side_dynamics,
+            37,
+            runtime.frame,
+            &runtime.latest.territory_snapshot,
+            runtime.territory.country_to_side(),
+            &runtime.diplomacy.active_sides,
+            &runtime.diplomacy.hostility,
+            runtime.territory.max_sides(),
+            &runtime.simulation,
+            &runtime.unit_policies,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(staged[&1].posture, WarPosture::Balanced);
+        assert_eq!(staged[&1].momentum_samples.len(), 1);
+        assert_eq!(staged[&1].posture_override, Some(WarPosture::Offensive));
+    }
+
+    #[test]
+    fn side_dynamics_continue_exactly_across_checkpoint_split() {
+        let mut uninterrupted = with_live_battlefield(fixture(36, false), vec![0.0; 8]);
+        enable_side_dynamics(&mut uninterrupted);
+        for controlled in [4, 4] {
+            uninterrupted
+                .side_dynamics
+                .as_mut()
+                .unwrap()
+                .get_mut(&0)
+                .unwrap()
+                .sample(uninterrupted.frame, controlled);
+        }
+        uninterrupted.step().unwrap();
+        let config = uninterrupted.config;
+        let captured = uninterrupted.checkpoint_state().unwrap();
+        let mut resumed = NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap();
+
+        let expected = uninterrupted.step().unwrap();
+        let actual = resumed.step().unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(resumed.side_dynamics, uninterrupted.side_dynamics);
     }
 
     #[test]
@@ -3671,7 +4115,7 @@ mod tests {
             .encirclement_radius = 90.0;
 
         let staged = runtime
-            .stage_battlefield_tick(1, 1, &runtime.territory, &[4.0, 4.0])
+            .stage_battlefield_tick(1, 1, &runtime.territory, &[4.0, 4.0], None)
             .unwrap()
             .unwrap();
 

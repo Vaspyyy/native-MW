@@ -9,6 +9,7 @@ use crate::{
         BattlefieldUrbanCenter, BattlefieldWarPhase, CountryBattlefieldPrimitives,
     },
     combat::{CombatUnit, UnitKind},
+    dynamics::bootstrap_sides,
     economy::{
         EconomyState, PAYROLL_PER_UNIT, STARTING_RESERVE_CYCLES, TARGET_STARTING_PAYROLL_SHARE,
     },
@@ -479,6 +480,18 @@ pub fn bootstrap_native_war(
             })
             .collect(),
     };
+    let armor_crew_per_vehicle = simulation.config().combat.armor_crew_per_vehicle;
+    let side_dynamics = bootstrap_sides(
+        n,
+        simulation.units.iter().map(|unit| {
+            let personnel = if unit.combat.kind == UnitKind::Armor {
+                unit.combat.equipment.saturating_mul(armor_crew_per_vehicle) as f64
+            } else {
+                unit.combat.personnel as f64
+            };
+            (unit.combat.side as usize, personnel)
+        }),
+    );
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
         RuntimeCheckpoint {
@@ -501,6 +514,7 @@ pub fn bootstrap_native_war(
             last_front_refresh_tick: None,
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
+            side_dynamics: Some(side_dynamics),
         },
     )?)
 }
