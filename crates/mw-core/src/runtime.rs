@@ -28,6 +28,7 @@ use crate::{
         CommandHomeTarget, CommandResolveError, CommandUnitState, CommandWorld,
         ResolvedCommandPolicy, browser_discipline, resolve_command_batch,
     },
+    diffusion::DiffusionQueueResult,
     direction::HostilityMatrix,
     economy::{CommandBand, EconomyState, PAY_CYCLE_TICKS},
     front::{
@@ -228,6 +229,11 @@ pub struct RuntimeCensusCounters {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeInfluenceCounters {
     pub sources: usize,
+    pub cohort: Option<u8>,
+    pub application_budget: usize,
+    pub diffusion_budget: usize,
+    pub diffusion_processed_items: usize,
+    pub diffusion_stale_entries: usize,
     pub processed_source_cells: usize,
     pub touched_influence_cells: usize,
     pub changed_controller_cells: usize,
@@ -336,6 +342,11 @@ pub enum RuntimeError {
 fn influence_counters(sources: usize, result: &InfluenceApplyResult) -> RuntimeInfluenceCounters {
     RuntimeInfluenceCounters {
         sources,
+        cohort: None,
+        application_budget: sources,
+        diffusion_budget: 0,
+        diffusion_processed_items: 0,
+        diffusion_stale_entries: 0,
         processed_source_cells: result.processed_source_cells,
         touched_influence_cells: result.touched_influence_cells.len(),
         changed_controller_cells: result.changed_controller_cells.len(),
@@ -779,6 +790,123 @@ fn influence_sources(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InfluenceSchedule {
+    cohort: usize,
+    application_budget: usize,
+    selected_units: usize,
+}
+
+fn browser_stable_unit_cohort(seed: f64, stride: usize) -> usize {
+    debug_assert!(stride > 0);
+    // JavaScript's `>>> 0` first floors the positive product and then applies
+    // ToUint32. Keeping the modulo in f64 also matches seeds whose product is
+    // larger than Rust's integer widths.
+    let scaled = (seed.abs() * 2_147_483_647.0).floor();
+    let stable_id = if scaled.is_finite() {
+        scaled.rem_euclid(4_294_967_296.0) as u32
+    } else {
+        0
+    };
+    stable_id as usize % stride
+}
+
+fn browser_influence_budgets(nonempty_side_count: usize) -> (usize, usize) {
+    let optimization_factor = (nonempty_side_count as f64 / 2.0).max(1.0);
+    let max_applications = (300.0 / optimization_factor).floor().max(50.0) as usize;
+    let diffusion_budget = (1_600.0 / optimization_factor).floor().max(400.0) as usize;
+    (max_applications, diffusion_budget)
+}
+
+fn browser_influence_sources(
+    units: &[SimulationUnit],
+    policies: &BTreeMap<u64, RuntimeUnitPolicy>,
+    tick: u64,
+    frame: u64,
+    nonempty_side_count: usize,
+) -> Result<(Vec<InfluenceSource>, InfluenceSchedule), RuntimeError> {
+    const STRIDE: usize = 3;
+
+    let cohort = tick as usize % STRIDE;
+    let (max_applications, _) = browser_influence_budgets(nonempty_side_count);
+    let share = max_applications / STRIDE;
+    let remainder = max_applications % STRIDE;
+    let application_budget = (share + usize::from(cohort < remainder)).max(1);
+    let start = if units.is_empty() {
+        0
+    } else {
+        ((u128::from(tick) * 30) % units.len() as u128) as usize
+    };
+    let mut schedule = InfluenceSchedule {
+        cohort,
+        application_budget,
+        selected_units: 0,
+    };
+    let mut sources = Vec::with_capacity(application_budget.min(units.len()));
+
+    for offset in 0..units.len() {
+        let unit = &units[(start + offset) % units.len()];
+        let policy = policies
+            .get(&unit.combat.id)
+            .ok_or(RuntimeError::InvalidUnitPolicy(unit.combat.id))?;
+        let seed = policy
+            .influence
+            .as_ref()
+            .and_then(|influence| influence.browser_temporal_seed)
+            .ok_or(RuntimeError::InvalidCheckpoint(
+                "influence runtime requires a temporal seed for every live formation",
+            ))?;
+        if browser_stable_unit_cohort(seed, STRIDE) != cohort
+            || unit_deploying(policy, tick)
+            || frame.saturating_sub(unit.combat.last_combat_tick) <= 5
+            || unit.combat.last_combat_tick > frame
+        {
+            continue;
+        }
+        schedule.selected_units += 1;
+        if schedule.selected_units > application_budget {
+            break;
+        }
+        let influence = policy
+            .influence
+            .as_ref()
+            .expect("the temporal seed came from an influence policy");
+        let (radius, delta) = resolve_influence_timing(influence, tick);
+        let sovereign = u16::try_from(unit.combat.sovereign).map_err(|_| {
+            RuntimeError::InvalidCheckpoint("unit sovereign exceeds territory country width")
+        })?;
+        if sovereign == 0 {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "unit sovereign exceeds territory country width",
+            ));
+        }
+        let side = usize::try_from(unit.combat.side).map_err(|_| {
+            RuntimeError::InvalidCheckpoint("unit side exceeds territory side width")
+        })?;
+        sources.push(InfluenceSource {
+            id: unit.combat.id,
+            side,
+            sovereign,
+            beneficiary: influence.beneficiary.unwrap_or(sovereign),
+            lat: unit.combat.lat,
+            lng: unit.combat.lng,
+            radius,
+            // One cohort member represents three elapsed logical ticks.
+            delta: delta * STRIDE as f64,
+            concentration_bonus: influence.concentration_bonus,
+            owner_ally_country_ids: influence.owner_ally_country_ids.clone(),
+            protected_owner_ids: influence.protected_owner_ids.clone(),
+            rebel_de_jure: influence.rebel_de_jure,
+            credit_de_jure: influence.credit_de_jure,
+            credit_de_jure_by_country: influence.credit_de_jure_by_country.clone(),
+            refuses_offense: influence.refuses_offense,
+        });
+    }
+
+    schedule.selected_units = sources.len();
+    Ok((sources, schedule))
+}
+
 fn resolve_influence_timing(policy: &UnitInfluencePolicy, tick: u64) -> (f64, f64) {
     let Some(seed) = policy.browser_temporal_seed else {
         return (policy.radius, policy.delta);
@@ -835,6 +963,7 @@ pub struct NativeRuntimeCheckpointState {
     pub units: Vec<SimulationUnit>,
     pub territory_config: TerritoryConfig,
     pub territory_committed_state: TerritoryCommittedState,
+    pub influence_runtime: Option<crate::diffusion::InfluenceRuntimeState>,
     pub strategic_cycle: u64,
     pub economies: Vec<EconomyState>,
     pub occupations: Vec<OccupationState>,
@@ -897,6 +1026,9 @@ struct StagedBattlefieldTick {
 struct StagedInfluenceTick {
     transaction: InfluenceTransaction,
     source_count: usize,
+    schedule: Option<InfluenceSchedule>,
+    diffusion_budget: usize,
+    diffusion: DiffusionQueueResult,
 }
 
 struct StagedCommandPolicies {
@@ -931,6 +1063,19 @@ impl NativeRuntime {
             checkpoint.unit_policies,
             &checkpoint.territory,
         )?;
+        if checkpoint.territory.has_influence_runtime()
+            && checkpoint.simulation.units.iter().any(|unit| {
+                unit_policies
+                    .get(&unit.combat.id)
+                    .and_then(|policy| policy.influence.as_ref())
+                    .and_then(|influence| influence.browser_temporal_seed)
+                    .is_none()
+            })
+        {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "influence runtime requires a temporal seed for every live formation",
+            ));
+        }
         hydrate_missing_command_home_targets(
             &checkpoint.simulation,
             &mut unit_policies,
@@ -1164,6 +1309,7 @@ impl NativeRuntime {
             units: self.simulation.units.clone(),
             territory_config: self.territory.checkpoint_config(),
             territory_committed_state: committed,
+            influence_runtime: self.territory.influence_runtime_state(),
             strategic_cycle: self.strategic.cycle(),
             economies: self.strategic.economies().values().cloned().collect(),
             occupations: self.strategic.occupations().values().cloned().collect(),
@@ -1526,6 +1672,7 @@ impl NativeRuntime {
             })?;
 
             let mut config = self.territory.checkpoint_config();
+            let mut controller_transfer_cells = Vec::new();
             for transfer in &plan.transfers {
                 if config.maps.world_control.get(transfer.cell) != Some(&transfer.original_owner)
                     || transfer.original_owner != command.country_id
@@ -1544,8 +1691,12 @@ impl NativeRuntime {
                     influence[transfer.cell] = 0.0;
                 }
                 config.maps.side_influence[recipient_side][transfer.cell] = 1.0;
-                config.maps.dominant_side[transfer.cell] = i16::try_from(recipient_side)
+                let recipient_controller = i16::try_from(recipient_side)
                     .map_err(|_| RuntimeError::InvalidCheckpoint("side index exceeds i16"))?;
+                if config.maps.dominant_side[transfer.cell] != recipient_controller {
+                    controller_transfer_cells.push(transfer.cell);
+                }
+                config.maps.dominant_side[transfer.cell] = recipient_controller;
                 config.maps.occupation[transfer.cell] =
                     if recipient_side % 2 == 0 { 1.0 } else { -1.0 };
             }
@@ -1577,7 +1728,14 @@ impl NativeRuntime {
                     * config.height.div_ceil(config.tile_size),
                 processed_items: config.maps.land.len() + config.cities.len(),
             };
-            staged_territory = Some(TerritoryControl::restore(config, committed)?);
+            let mut restored = TerritoryControl::restore(config, committed)?;
+            if let Some(influence_runtime) = self.territory.influence_runtime_state() {
+                restored.restore_influence_runtime(influence_runtime)?;
+                for cell in controller_transfer_cells {
+                    restored.queue_influence_runtime_cell(cell, true)?;
+                }
+            }
+            staged_territory = Some(restored);
 
             let country = self
                 .scenario
@@ -1700,18 +1858,62 @@ impl NativeRuntime {
             &hostile_controlled_land,
         )?;
         let mut staged_influence = None;
+        // Browser influence caches contain only non-empty coalition rows. The
+        // territory topology deliberately retains capitulated countries for
+        // attribution, so it cannot define the live diffusion rows or budgets.
+        let influence_sides = self
+            .diplomacy
+            .active_sides
+            .iter()
+            .copied()
+            .map(usize::from)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let dynamic_influence = self.territory.has_influence_runtime();
         let staged_battlefield = if let Some(pre_stage) = pre_influence_battlefield {
-            let before = self.simulation.initial_snapshot(self.tick, self.frame);
-            let sources = influence_sources(
-                &before,
-                &pre_stage.policies,
-                next_tick,
-                Some(&pre_stage.influence_eligible),
-            )?;
-            let transaction = self.territory.apply_influence_sources_staged(&sources)?;
+            let (sources, schedule) = if dynamic_influence {
+                let (sources, schedule) = browser_influence_sources(
+                    &self.simulation.units,
+                    &pre_stage.policies,
+                    next_tick,
+                    self.frame,
+                    influence_sides.len(),
+                )?;
+                (sources, Some(schedule))
+            } else {
+                let before = self.simulation.initial_snapshot(self.tick, self.frame);
+                (
+                    influence_sources(
+                        &before,
+                        &pre_stage.policies,
+                        next_tick,
+                        Some(&pre_stage.influence_eligible),
+                    )?,
+                    None,
+                )
+            };
+            let (transaction, diffusion_budget, diffusion) = if dynamic_influence {
+                let (_, diffusion_budget) = browser_influence_budgets(influence_sides.len());
+                let (transaction, diffusion) = self.territory.apply_influence_runtime_staged(
+                    &sources,
+                    &influence_sides,
+                    diffusion_budget,
+                )?;
+                (transaction, diffusion_budget, diffusion)
+            } else {
+                (
+                    self.territory.apply_influence_sources_staged(&sources)?,
+                    0,
+                    DiffusionQueueResult::default(),
+                )
+            };
             staged_influence = Some(StagedInfluenceTick {
                 transaction,
                 source_count: sources.len(),
+                schedule,
+                diffusion_budget,
+                diffusion,
             });
             match self.stage_battlefield_tick(
                 next_tick,
@@ -1739,6 +1941,28 @@ impl NativeRuntime {
                     return Err(error);
                 }
             }
+        } else if dynamic_influence {
+            let (sources, schedule) = browser_influence_sources(
+                &self.simulation.units,
+                &self.unit_policies,
+                next_tick,
+                self.frame,
+                influence_sides.len(),
+            )?;
+            let (_, diffusion_budget) = browser_influence_budgets(influence_sides.len());
+            let (transaction, diffusion) = self.territory.apply_influence_runtime_staged(
+                &sources,
+                &influence_sides,
+                diffusion_budget,
+            )?;
+            staged_influence = Some(StagedInfluenceTick {
+                transaction,
+                source_count: sources.len(),
+                schedule: Some(schedule),
+                diffusion_budget,
+                diffusion,
+            });
+            None
         } else {
             None
         };
@@ -2115,8 +2339,20 @@ impl NativeRuntime {
             &self.unit_sovereign_by_id,
             &frame_snapshot,
         );
-        let (influence, influence_source_count) = if let Some(staged) = staged_influence.take() {
-            (staged.transaction.result().clone(), staged.source_count)
+        let (
+            influence,
+            influence_source_count,
+            influence_schedule,
+            influence_diffusion_budget,
+            influence_diffusion,
+        ) = if let Some(staged) = staged_influence.take() {
+            (
+                staged.transaction.result().clone(),
+                staged.source_count,
+                staged.schedule,
+                staged.diffusion_budget,
+                staged.diffusion,
+            )
         } else {
             let sources =
                 match influence_sources(&frame_snapshot, &self.unit_policies, next_tick, None) {
@@ -2137,7 +2373,13 @@ impl NativeRuntime {
                     return Err(RuntimeError::Territory(error));
                 }
             };
-            (influence, source_count)
+            (
+                influence,
+                source_count,
+                None,
+                0,
+                DiffusionQueueResult::default(),
+            )
         };
 
         let strategic_due = next_tick.is_multiple_of(PAY_CYCLE_TICKS);
@@ -2322,6 +2564,14 @@ impl NativeRuntime {
                 |layout| layout.counters.segments,
             )
         };
+        let mut influence_counters = influence_counters(influence_source_count, &influence);
+        if let Some(schedule) = influence_schedule {
+            influence_counters.cohort = Some(schedule.cohort as u8);
+            influence_counters.application_budget = schedule.application_budget;
+        }
+        influence_counters.diffusion_budget = influence_diffusion_budget;
+        influence_counters.diffusion_processed_items = influence_diffusion.processed_items;
+        influence_counters.diffusion_stale_entries = influence_diffusion.stale_entries;
         let counters = RuntimeStepCounters {
             front_refreshed: refresh_fronts,
             front_segments: segments,
@@ -2329,7 +2579,7 @@ impl NativeRuntime {
             ai: planning.counters,
             simulation: simulation_counters,
             attrition: attrition_counters,
-            influence: influence_counters(influence_source_count, &influence),
+            influence: influence_counters,
             census,
             strategic: strategic_counters,
             strategic_derivation: derivation_counters,
@@ -3907,6 +4157,22 @@ mod tests {
             ),
             Err(RuntimeError::InvalidUnitPolicy(1))
         ));
+    }
+
+    #[test]
+    fn browser_influence_cohorts_and_side_scaled_budgets_match_javascript() {
+        assert_eq!(browser_stable_unit_cohort(0.1, 3), 0);
+        assert_eq!(browser_stable_unit_cohort(0.2, 3), 1);
+        assert_eq!(browser_stable_unit_cohort(0.3, 3), 2);
+        assert_eq!(browser_stable_unit_cohort(0.5, 3), 0);
+        assert_eq!(browser_stable_unit_cohort(1.0, 3), 1);
+        assert_eq!(browser_stable_unit_cohort(2.000_000_001, 3), 0);
+        assert_eq!(browser_stable_unit_cohort(f64::INFINITY, 3), 0);
+
+        assert_eq!(browser_influence_budgets(0), (300, 1_600));
+        assert_eq!(browser_influence_budgets(2), (300, 1_600));
+        assert_eq!(browser_influence_budgets(8), (75, 400));
+        assert_eq!(browser_influence_budgets(24), (50, 400));
     }
 
     #[test]

@@ -9,6 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
 
+use crate::diffusion::{
+    DiffusionError, DiffusionQueueResult, FrontierCellResult, FrontierDiffusion,
+    InfluenceRuntimeState,
+};
+
 pub const TERRITORY_SCHEMA_VERSION: &str = "territory-control-v1";
 pub const DEFAULT_TERRITORY_TILE_SIZE: usize = 32;
 const CONTROL_HYSTERESIS: f64 = 0.15;
@@ -47,6 +52,8 @@ pub enum TerritoryError {
     InvalidCell(usize),
     #[error("invalid committed territory state: {0}")]
     InvalidCommittedState(&'static str),
+    #[error("influence runtime: {0}")]
+    InfluenceRuntime(#[from] DiffusionError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -252,6 +259,7 @@ pub(crate) struct InfluenceTransaction {
     census_dirty: BTreeSet<usize>,
     render_dirty: BTreeSet<usize>,
     mutation_sequence: u64,
+    influence_runtime: Option<FrontierDiffusion>,
 }
 
 impl InfluenceTransaction {
@@ -446,6 +454,7 @@ pub struct TerritoryControl {
     city_cell_mask: Vec<bool>,
     influence_cell_changes: InfluenceCellChanges,
     influence_undo_mask: Vec<bool>,
+    influence_runtime: Option<FrontierDiffusion>,
     protected_owner_ids: BTreeSet<u16>,
     census_dirty: BTreeSet<usize>,
     render_dirty: BTreeSet<usize>,
@@ -491,6 +500,7 @@ impl TerritoryControl {
             city_cell_mask,
             influence_cell_changes: InfluenceCellChanges::new(total_cells),
             influence_undo_mask: vec![false; total_cells],
+            influence_runtime: None,
             protected_owner_ids: config.protected_owner_ids,
             census_dirty: all_tiles.clone(),
             render_dirty: all_tiles,
@@ -606,6 +616,40 @@ impl TerritoryControl {
     }
     pub fn total_tiles(&self) -> usize {
         self.tiles_wide() * self.tiles_high()
+    }
+    pub fn has_influence_runtime(&self) -> bool {
+        self.influence_runtime.is_some()
+    }
+    pub fn enable_influence_runtime(&mut self) {
+        self.influence_runtime = Some(FrontierDiffusion::empty(self.total_cells()));
+    }
+    pub fn restore_influence_runtime(
+        &mut self,
+        state: InfluenceRuntimeState,
+    ) -> Result<(), TerritoryError> {
+        self.influence_runtime = Some(FrontierDiffusion::from_runtime_state(
+            self.total_cells(),
+            state,
+        )?);
+        Ok(())
+    }
+    pub fn influence_runtime_state(&self) -> Option<InfluenceRuntimeState> {
+        self.influence_runtime
+            .as_ref()
+            .map(FrontierDiffusion::runtime_state)
+    }
+    pub fn queue_influence_runtime_cell(
+        &mut self,
+        cell: usize,
+        priority: bool,
+    ) -> Result<(), TerritoryError> {
+        if cell >= self.total_cells() {
+            return Err(TerritoryError::InvalidCell(cell));
+        }
+        if let Some(runtime) = &mut self.influence_runtime {
+            runtime.enqueue_cell(cell, self.width, self.height, priority)?;
+        }
+        Ok(())
     }
     pub fn land(&self) -> &[u8] {
         &self.maps.land
@@ -980,7 +1024,7 @@ impl TerritoryControl {
         let mut changes = std::mem::take(&mut self.influence_cell_changes);
         let mut counts = InfluenceApplyCounts::default();
         for source in sources {
-            self.apply_source(source, &mut changes, &mut counts, None);
+            self.apply_source(source, &mut changes, &mut counts, None, None);
         }
         let result = changes.finish(counts);
         self.influence_cell_changes = changes;
@@ -1004,11 +1048,18 @@ impl TerritoryControl {
             census_dirty: self.census_dirty.clone(),
             render_dirty: self.render_dirty.clone(),
             mutation_sequence: self.mutation_sequence,
+            influence_runtime: self.influence_runtime.clone(),
         };
         let mut changes = std::mem::take(&mut self.influence_cell_changes);
         let mut counts = InfluenceApplyCounts::default();
         for source in sources {
-            self.apply_source(source, &mut changes, &mut counts, Some(&mut transaction));
+            self.apply_source(
+                source,
+                &mut changes,
+                &mut counts,
+                Some(&mut transaction),
+                None,
+            );
         }
         transaction.result = changes.finish(counts);
         self.influence_cell_changes = changes;
@@ -1016,6 +1067,96 @@ impl TerritoryControl {
             self.influence_undo_mask[undo.cell] = false;
         }
         Ok(transaction)
+    }
+
+    /// Apply one browser-compatible influence phase as an atomic staged mutation: pending
+    /// frontier diffusion runs first, followed by the already-selected formation sources.
+    pub fn apply_influence_runtime(
+        &mut self,
+        sources: &[InfluenceSource],
+        active_sides: &[usize],
+        diffusion_budget: usize,
+    ) -> Result<(InfluenceApplyResult, DiffusionQueueResult), TerritoryError> {
+        let (transaction, diffusion) =
+            self.apply_influence_runtime_staged(sources, active_sides, diffusion_budget)?;
+        Ok((transaction.result.clone(), diffusion))
+    }
+
+    /// Staged variant used by the runtime's wider AI/combat transaction.
+    pub(crate) fn apply_influence_runtime_staged(
+        &mut self,
+        sources: &[InfluenceSource],
+        active_sides: &[usize],
+        diffusion_budget: usize,
+    ) -> Result<(InfluenceTransaction, DiffusionQueueResult), TerritoryError> {
+        for source in sources {
+            validate_source(source, self.max_sides)?;
+        }
+        if active_sides.iter().any(|side| *side >= self.max_sides) {
+            return Err(TerritoryError::InvalidSide(
+                active_sides
+                    .iter()
+                    .copied()
+                    .find(|side| *side >= self.max_sides)
+                    .unwrap(),
+            ));
+        }
+        let mut active_sides = active_sides.to_vec();
+        active_sides.sort_unstable();
+        active_sides.dedup();
+
+        let mut frontier =
+            self.influence_runtime
+                .take()
+                .ok_or(TerritoryError::InvalidCommittedState(
+                    "influence runtime is not enabled",
+                ))?;
+        let mut transaction = InfluenceTransaction {
+            result: InfluenceApplyResult::default(),
+            cells: Vec::new(),
+            side_influence: Vec::new(),
+            census_dirty: self.census_dirty.clone(),
+            render_dirty: self.render_dirty.clone(),
+            mutation_sequence: self.mutation_sequence,
+            influence_runtime: Some(frontier.clone()),
+        };
+        let mut changes = std::mem::take(&mut self.influence_cell_changes);
+        let mut counts = InfluenceApplyCounts::default();
+        let width = self.width;
+        let height = self.height;
+        let diffusion = frontier.process(width, height, diffusion_budget, |cell| {
+            self.diffuse_influence_cell(
+                cell,
+                &active_sides,
+                &mut changes,
+                &mut counts,
+                &mut transaction,
+            )
+        });
+        let diffusion = match diffusion {
+            Ok(diffusion) => diffusion,
+            Err(error) => {
+                self.influence_runtime = transaction.influence_runtime.clone();
+                self.influence_cell_changes = changes;
+                return Err(error.into());
+            }
+        };
+        for source in sources {
+            self.apply_source(
+                source,
+                &mut changes,
+                &mut counts,
+                Some(&mut transaction),
+                Some(&mut frontier),
+            );
+        }
+        self.influence_runtime = Some(frontier);
+        transaction.result = changes.finish(counts);
+        self.influence_cell_changes = changes;
+        for undo in &transaction.cells {
+            self.influence_undo_mask[undo.cell] = false;
+        }
+        Ok((transaction, diffusion))
     }
 
     pub(crate) fn rollback_influence_transaction(&mut self, transaction: InfluenceTransaction) {
@@ -1035,6 +1176,75 @@ impl TerritoryControl {
         self.census_dirty = transaction.census_dirty;
         self.render_dirty = transaction.render_dirty;
         self.mutation_sequence = transaction.mutation_sequence;
+        self.influence_runtime = transaction.influence_runtime;
+    }
+
+    fn diffuse_influence_cell(
+        &mut self,
+        cell: usize,
+        active_sides: &[usize],
+        changes: &mut InfluenceCellChanges,
+        counts: &mut InfluenceApplyCounts,
+        transaction: &mut InfluenceTransaction,
+    ) -> FrontierCellResult {
+        if self.maps.land.get(cell) != Some(&2) {
+            return FrontierCellResult {
+                remains_frontier: false,
+                priority_neighborhood: false,
+            };
+        }
+        let x = cell % self.width;
+        let y = cell / self.width;
+        if x == 0 || x + 1 >= self.width || y == 0 || y + 1 >= self.height {
+            return FrontierCellResult {
+                remains_frontier: false,
+                priority_neighborhood: false,
+            };
+        }
+        self.capture_influence_undo(cell, transaction);
+        let old_controller = self.maps.dominant_side[cell];
+        for &side in active_sides {
+            let row = &self.maps.side_influence[side];
+            let mut sum = 0.0_f64;
+            for y in cell / self.width - 1..=cell / self.width + 1 {
+                let offset = y * self.width;
+                for x in cell % self.width - 1..=cell % self.width + 1 {
+                    sum += f64::from(row[offset + x]);
+                }
+            }
+            let old = f64::from(self.maps.side_influence[side][cell]);
+            let next = old * 0.75 + (sum / 9.0) * 0.25;
+            if write_f32(&mut self.maps.side_influence[side][cell], next) {
+                changes.record_touched(cell);
+            }
+        }
+        self.sync_occupation(cell);
+        let controller_changed = old_controller != self.maps.dominant_side[cell];
+        if controller_changed {
+            self.mark_census_region(cell, true);
+            counts.controller_change_count += 1;
+            changes.record_controller(cell);
+        }
+        FrontierCellResult {
+            remains_frontier: self.is_influence_frontier_index(cell),
+            priority_neighborhood: controller_changed,
+        }
+    }
+
+    fn is_influence_frontier_index(&self, cell: usize) -> bool {
+        if self.maps.land.get(cell) != Some(&2) {
+            return false;
+        }
+        let x = cell % self.width;
+        let y = cell / self.width;
+        if x == 0 || x + 1 >= self.width || y == 0 || y + 1 >= self.height {
+            return false;
+        }
+        let controller = self.maps.dominant_side[cell];
+        self.maps.dominant_side[cell - 1] != controller
+            || self.maps.dominant_side[cell + 1] != controller
+            || self.maps.dominant_side[cell - self.width] != controller
+            || self.maps.dominant_side[cell + self.width] != controller
     }
 
     fn apply_source(
@@ -1043,6 +1253,7 @@ impl TerritoryControl {
         changes: &mut InfluenceCellChanges,
         counts: &mut InfluenceApplyCounts,
         mut transaction: Option<&mut InfluenceTransaction>,
+        mut frontier: Option<&mut FrontierDiffusion>,
     ) {
         // Exact browser floor-and-clamp bounds and lower-edge cell coordinates.
         let sy =
@@ -1089,22 +1300,8 @@ impl TerritoryControl {
                 }
                 counts.processed_source_cells += 1;
 
-                if let Some(transaction) = transaction.as_deref_mut()
-                    && !self.influence_undo_mask[i]
-                {
-                    self.influence_undo_mask[i] = true;
-                    transaction.cells.push(InfluenceCellUndo {
-                        cell: i,
-                        primary_occupier: self.maps.primary_occupier[i],
-                        dominant_side: self.maps.dominant_side[i],
-                        occupation: self.maps.occupation[i],
-                    });
-                    transaction.side_influence.extend(
-                        self.maps
-                            .side_influence
-                            .iter()
-                            .map(|influence| influence[i]),
-                    );
+                if let Some(transaction) = transaction.as_deref_mut() {
+                    self.capture_influence_undo(i, transaction);
                 }
 
                 let mut cell_delta = source.delta;
@@ -1147,11 +1344,13 @@ impl TerritoryControl {
                 if write_f32(&mut self.maps.side_influence[source.side][i], next) {
                     changes.record_touched(i);
                 }
+                let mut hostile_touched = false;
                 for hostile in 0..self.max_sides {
                     if !self.sides_hostile(source.side, hostile) {
                         continue;
                     }
                     let old = f64::from(self.maps.side_influence[hostile][i]);
+                    hostile_touched |= old > 0.0;
                     if old > 0.0
                         && write_f32(
                             &mut self.maps.side_influence[hostile][i],
@@ -1185,8 +1384,49 @@ impl TerritoryControl {
                     counts.controller_change_count += 1;
                     changes.record_controller(i);
                 }
+                if let Some(frontier) = frontier.as_deref_mut() {
+                    // Controller synchronization notifies the frontier listener first in the
+                    // browser. Primary-credit changes then request the same priority region;
+                    // regular source work is attempted only after those upgrades.
+                    if controller_changed {
+                        frontier
+                            .enqueue_cell(i, self.width, self.height, true)
+                            .expect("source influence cell is in the validated territory grid");
+                    }
+                    if credit_changed {
+                        frontier
+                            .enqueue_cell(i, self.width, self.height, true)
+                            .expect("source influence cell is in the validated territory grid");
+                    } else if hostile_touched
+                        || old_controller != source.side as i16
+                        || self.is_influence_frontier_index(i)
+                    {
+                        frontier
+                            .enqueue_cell(i, self.width, self.height, false)
+                            .expect("source influence cell is in the validated territory grid");
+                    }
+                }
             }
         }
+    }
+
+    fn capture_influence_undo(&mut self, cell: usize, transaction: &mut InfluenceTransaction) {
+        if self.influence_undo_mask[cell] {
+            return;
+        }
+        self.influence_undo_mask[cell] = true;
+        transaction.cells.push(InfluenceCellUndo {
+            cell,
+            primary_occupier: self.maps.primary_occupier[cell],
+            dominant_side: self.maps.dominant_side[cell],
+            occupation: self.maps.occupation[cell],
+        });
+        transaction.side_influence.extend(
+            self.maps
+                .side_influence
+                .iter()
+                .map(|influence| influence[cell]),
+        );
     }
 
     fn select_neighbor_credit(&self, x: usize, y: usize, side: usize) -> u16 {

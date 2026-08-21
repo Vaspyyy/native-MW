@@ -8,6 +8,7 @@ pub mod battlefield;
 pub mod bootstrap;
 pub mod combat;
 pub mod command;
+pub mod diffusion;
 pub mod direction;
 pub mod economy;
 pub mod front;
@@ -51,6 +52,10 @@ pub use combat::{
 pub use command::{
     CommandHomeTarget, CommandResolveError, CommandUnitState, CommandWorld, ResolvedCommandPolicy,
     browser_discipline, refusal_share, resolve_command_batch, resolve_command_policy,
+};
+pub use diffusion::{
+    DiffusionError, DiffusionQueueResult, FrontierCellResult, FrontierDiffusion,
+    InfluenceRuntimeState,
 };
 pub use direction::{
     DirectionField, DirectionFieldError, DirectionFieldInput, HostilityMatrix,

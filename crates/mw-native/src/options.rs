@@ -165,7 +165,7 @@ pub fn help_text() -> &'static str {
        --runtime-checkpoint PATH  Load a strict browser postStartWar or midWar checkpoint\n\
        --side COUNTRY[,COUNTRY...]  Add a side; at least two sides start a new war\n\
        --demo-units               Run the small scenario-derived demo runtime\n\
-       --save-checkpoint PATH     Save runtime v2 on exit/S; unavailable with --demo-units\n\
+       --save-checkpoint PATH     Save resumable runtime state on exit/S; unavailable with --demo-units\n\
        --tick-ms N                Runtime tick interval in milliseconds (default 33)\n\
        --update-queue N           Bounded lossless publication queue (default 8)\n\
        --headless                 Run the checkpoint worker without a window\n\

@@ -338,6 +338,29 @@ that tail percentile. The complete tick also remains above the 16.67 ms 60 Hz
 budget. Further performance work should be chosen from a fresh profile of the
 optimized runtime; these results do not claim a new dominant hotspot.
 
+The checkpoint-v3 continuation slice was also measured from an actual
+browser-exported France-versus-Spain state: 78 live units, a 2,400 by 1,200
+target grid (2.88 million cells), and 579 pending regular frontier entries.
+Five independent release runs each used 3 warmups, 11 measured samples, and 30
+ticks per sample. Medians below are the median of the five run medians; p95 is
+the conservative maximum observed across the runs.
+
+| Live v3 30-tick sample | Median sample | Median per tick | Worst p95 sample | Worst p95 per tick |
+|---|---:|---:|---:|---:|
+| Fresh checkpoint | 95.393 ms | 3.180 ms | 111.127 ms | 3.704 ms |
+| Persistent runtime | 101.057 ms | 3.369 ms | 117.823 ms | 3.927 ms |
+
+This timing exercises three-cohort source selection, pending frontier
+diffusion, exact Float32 map updates, AI/combat orchestration, immutable
+publication, and the transactional clone of the 2.88 MB dense frontier-state
+map. All five runs retained checksum `9516cd17a8e5c4b0` and persistent final
+checksum `3a48ceb116a55ec6`.
+
+```bash
+target/release/mw-tools native-runtime-bench "$scenario" /path/to/browser-v3.json \
+  --ticks 30 --repeat 11 --warmup 3 --json
+```
+
 `mw-native` now gives `NativeRuntime` to a named dedicated simulation thread,
 so a slow tick no longer executes on the presentation thread. This isolates
 rendering from tick latency but does not improve the measured simulation rate.
@@ -378,8 +401,8 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or v2 `midWar` checkpoint in the
-production viewer, or validate steps without a window:
+Run an exact browser-exported v1 `postStartWar` or v2/v3 `midWar` checkpoint in
+the production viewer, or validate steps without a window:
 
 ```bash
 checkpoint=/path/to/native-runtime-checkpoint.json
@@ -391,8 +414,8 @@ Native-only starts use repeated `--side` selectors (ID or unique
 case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
 
 ```bash
-target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v2.json "$scenario"
-target/release/mw-native --runtime-checkpoint /tmp/mw-v2.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v2-resumed.json "$scenario"
+target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v3.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v3.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v3-resumed.json "$scenario"
 ```
 
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
@@ -408,14 +431,21 @@ Float32 bits for occupation and every side-influence plane, current control,
 primary/dominant attribution, territory revisions, the committed census,
 occupations, and nested victim-by-attacker casualties. Immutable baseline
 geography is still carried and used for production derivation before the live
-territory overlay is restored. V2 encoding/decoding and restore are outside the
-timed benchmark region, and no v2 performance number is claimed here.
+territory overlay is restored.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2
-`midWar` while rejecting `baselineReplay`. Native-written v2 saves also carry
+V3 is requested with `window.nativeRuntimeCheckpoint({ version: 3, steps })`.
+It retains the complete v2 payload and adds the exact pending priority and
+regular influence-frontier queues plus their dense queued states. This makes
+history-dependent diffusion resumable instead of reconstructing work from map
+planes. New native saves use v3 whenever influence dynamics are enabled; legacy
+runtimes without that state continue to write v2. Checkpoint encoding/decoding
+and restore remain outside the timed benchmark region.
+
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2/v3
+`midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
-comparable across a refresh boundary. Browser v2 exports omit that optional
+comparable across a refresh boundary. Browser mid-war exports omit that optional
 block and intentionally begin from a fresh deterministic front layout. The
 native runtime recomputes the browser's logical-tick influence ramp and
 deterministic radius/delta noise from the exported unit seed. A strict optional
@@ -430,24 +460,25 @@ return-home/self-defense behavior, influence eligibility, and planning priors at
 the pay-cycle commit; those effects begin on the next native tick. Home
 fallback is deterministic first-controlled-cell selection rather than the
 browser's RNG reservoir. Task-force-aware supply-collapse reaction, naval
-exile/recovery RNG, task-force-aware repulsion suppression, browser influence
-cohorts/frontier diffusion, and live war-phase/posture remain omitted. Native
+exile/recovery RNG, task-force-aware repulsion suppression, and live
+war-phase/posture remain omitted. Native
 frames advance once per logical runtime step, so
 frame-window mechanics after handoff follow native cadence rather than a
 browser speed mode that batches several ticks into one RAF frame. Old saves
 without the block retain their frozen resolved inputs.
 
-Browser v2 handoffs carry the exact Float32 terrain plane. Standalone stock
+Browser v2/v3 handoffs carry the exact Float32 terrain plane. Standalone stock
 MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
-stress fixture and therefore do not measure the live resolver or any of these
-pending paths; they are not a claim of complete browser-tick parity. A v2
-restore rebuilds private territory summaries; partial census work and render
-queues are not serialized. Map-only viewing and the small scenario-derived
-`--demo-units` runtime remain separate modes.
+stress fixture and therefore do not measure the live resolver or the new
+influence scheduler; they are not a claim of complete browser-tick parity. A
+v2/v3 restore rebuilds private territory summaries; partial census work and
+render queues are not serialized. V3 separately preserves pending frontier
+work. Map-only viewing and the small scenario-derived `--demo-units` runtime
+remain separate modes.
 
 Native save/reload equivalence assumes the canonical runtime configuration
 used by the CLI. The writer rejects custom cadence/kernel or noncanonical
 territory topology instead of silently restoring defaults. It also skips a
-requested save after clean `ConflictResolved` termination because checkpoint
-v2 represents resumable running state.
+requested save after clean `ConflictResolved` termination because mid-war
+checkpoints represent resumable running state.

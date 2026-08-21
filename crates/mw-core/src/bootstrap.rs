@@ -375,7 +375,7 @@ pub fn bootstrap_native_war(
             capital: c.capital,
         })
         .collect();
-    let territory = TerritoryControl::new(TerritoryConfig {
+    let mut territory = TerritoryControl::new(TerritoryConfig {
         width: scenario.target.width,
         height: scenario.target.height,
         grid_resolution: scenario.target.grid_res,
@@ -398,6 +398,16 @@ pub fn bootstrap_native_war(
         world_revision: 1,
         city_revision: 1,
     })?;
+    territory.enable_influence_runtime();
+    // Browser war initialization assigns active cells in row-major order.
+    // Every first controller transition queues center/orthogonal priority work,
+    // including neighboring cells outside the theater scan, until the exact
+    // bounded queue fills.
+    for cell in 0..territory.total_cells() {
+        if territory.land()[cell] == 2 {
+            territory.queue_influence_runtime_cell(cell, true)?;
+        }
+    }
     let mut economies: Vec<EconomyState> = production
         .economy_states
         .iter()
@@ -575,6 +585,16 @@ mod tests {
         assert_eq!(state.territory_config.maps.dominant_side[2], 0);
         assert_eq!(state.territory_config.maps.side_influence[0][0], 1.0);
         assert_eq!(state.territory_config.maps.side_influence[1][1], 1.0);
+        let influence_runtime = state.influence_runtime.as_ref().unwrap();
+        assert!(influence_runtime.regular_queue.is_empty());
+        assert_eq!(
+            influence_runtime.priority_queue,
+            vec![0, 1, 4, 2, 5, 3, 6, 7]
+        );
+        assert_eq!(
+            influence_runtime.queued_cells,
+            (0..8).map(|cell| (cell, 2)).collect::<Vec<_>>()
+        );
         assert_eq!(state.territory_config.cities.len(), 3);
         let battlefield = state.battlefield.as_ref().unwrap();
         assert_eq!(battlefield.terrain_intensity, vec![0.0; 8]);

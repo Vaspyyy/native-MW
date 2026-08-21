@@ -38,6 +38,11 @@ use serde_json::{Value, json};
 
 pub const NATIVE_RUNTIME_CHECKPOINT_SCHEMA: &str = "native-runtime-checkpoint-v1";
 pub const NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA: &str = "native-runtime-checkpoint-v2";
+pub const NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA: &str = "native-runtime-checkpoint-v3";
+pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
+
+const INFLUENCE_REGULAR_QUEUE_LIMIT: usize = 16_384;
+const INFLUENCE_PRIORITY_QUEUE_LIMIT: usize = 8_192;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct NativeCheckpointWriteReport {
@@ -77,12 +82,101 @@ pub fn write_runtime_checkpoint_state_v2(
     write_runtime_checkpoint_state_v2_with_hash(&raw, baseline, state, output, steps)
 }
 
+/// Serialize a quiescent runtime with its history-dependent influence scheduler state.
+pub fn write_runtime_checkpoint_v3(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    runtime: &mut NativeRuntime,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    let state = runtime
+        .checkpoint_state()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    write_runtime_checkpoint_state_v3_with_hash(&raw, baseline, &state, output, steps)
+}
+
+/// Explicitly named alias used by native frontends when selecting the v3 save contract.
+pub fn write_native_runtime_checkpoint_v3(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    runtime: &mut NativeRuntime,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    write_runtime_checkpoint_v3(scenario_path, baseline, runtime, output, steps)
+}
+
+pub fn write_runtime_checkpoint_state_v3(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    write_runtime_checkpoint_state_v3_with_hash(&raw, baseline, state, output, steps)
+}
+
 fn write_runtime_checkpoint_state_v2_with_hash(
     raw: &[u8],
     baseline: &DecodedScenario,
     state: &mw_core::NativeRuntimeCheckpointState,
     output: &Path,
     steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    write_runtime_checkpoint_state_with_hash(
+        raw,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+        None,
+    )
+}
+
+fn write_runtime_checkpoint_state_v3_with_hash(
+    raw: &[u8],
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    let influence_runtime = state
+        .influence_runtime
+        .as_ref()
+        .context("checkpoint-v3 writer requires influence runtime state")?;
+    let cell_count = state
+        .territory_config
+        .width
+        .checked_mul(state.territory_config.height)
+        .context("checkpoint-v3 territory cell count overflows")?;
+    let influence_runtime = influence_runtime_fixture(influence_runtime, cell_count)?;
+    write_runtime_checkpoint_state_with_hash(
+        raw,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+        Some(influence_runtime),
+    )
+}
+
+fn write_runtime_checkpoint_state_with_hash(
+    raw: &[u8],
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+    schema: &'static str,
+    influence_runtime: Option<InfluenceRuntimeFixture>,
 ) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
     if state.runtime_config != RuntimeConfig::default() {
@@ -284,7 +378,7 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         .collect::<Result<Vec<_>>>()?;
     let maps = &state.territory_config.maps;
     let mut body = json!({
-        "schema": NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+        "schema": schema,
         "checkpointBoundary": "midWar",
         "scenario": {"sha256": sha256_hex(raw), "name": name, "gridRes": state.territory_config.grid_resolution},
         "geography": {"landRuns": rle(&baseline.land), "worldControlRuns": rle(&baseline.world_control), "deJureRuns": rle(&baseline.de_jure)},
@@ -311,6 +405,14 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         body.as_object_mut()
             .expect("checkpoint body is an object")
             .insert("battlefield".to_owned(), serde_json::to_value(battlefield)?);
+    }
+    if let Some(influence_runtime) = influence_runtime {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert(
+                "influenceRuntime".to_owned(),
+                serde_json::to_value(influence_runtime)?,
+            );
     }
     let bytes = serde_json::to_vec(&body)?;
     let parent = checkpoint_output_parent(output);
@@ -341,7 +443,7 @@ fn write_runtime_checkpoint_state_v2_with_hash(
     Ok(NativeCheckpointWriteReport {
         path: output.display().to_string(),
         bytes: bytes.len(),
-        schema: NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+        schema,
     })
 }
 
@@ -989,6 +1091,12 @@ struct RuntimeCheckpointFixture {
     /// Optional raw battlefield inputs. Absence preserves the legacy frozen-policy mode.
     #[serde(default, deserialize_with = "deserialize_optional_battlefield_fixture")]
     battlefield: Option<BattlefieldFixture>,
+    /// History-dependent frontier diffusion work. It is mandatory for v3 and forbidden before v3.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_influence_runtime_fixture"
+    )]
+    influence_runtime: Option<InfluenceRuntimeFixture>,
     sides: Vec<SideFixture>,
     active_sides: Vec<u16>,
     hostility_matrix: Vec<u8>,
@@ -1177,6 +1285,26 @@ struct TerritoryCommittedCensusFixture {
     mutation_sequence: u64,
     processed_tiles: usize,
     processed_items: usize,
+}
+
+/// Canonical pending frontier work. Queue entries may be stale or duplicated because that is
+/// observable browser behavior; only the sparse queued-state table is canonicalized.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InfluenceRuntimeFixture {
+    schema: String,
+    regular_queue: Vec<usize>,
+    priority_queue: Vec<usize>,
+    queued_cells: Vec<(usize, u8)>,
+}
+
+fn deserialize_optional_influence_runtime_fixture<'de, D>(
+    deserializer: D,
+) -> Result<Option<InfluenceRuntimeFixture>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    InfluenceRuntimeFixture::deserialize(deserializer).map(Some)
 }
 
 /// Complete live battlefield inputs. The root field is optional for old checkpoints, but once
@@ -1710,6 +1838,7 @@ struct PreparedRuntime {
     coalition_by_side: Vec<BTreeSet<u16>>,
     live_territory_maps: Option<TerritoryMaps>,
     battlefield: Option<BattlefieldRuntimeState>,
+    influence_runtime: Option<mw_core::diffusion::InfluenceRuntimeState>,
 }
 
 /// Fully validated production handoff for native rendering and simulation.
@@ -1845,6 +1974,13 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
             )
         })
         .transpose()?;
+    let influence_runtime = checkpoint
+        .influence_runtime
+        .as_ref()
+        .map(|influence_runtime| {
+            decode_influence_runtime(influence_runtime, decoded.target.cell_count()?)
+        })
+        .transpose()?;
 
     Ok(PreparedRuntime {
         raw_sha256,
@@ -1857,6 +1993,7 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         coalition_by_side,
         live_territory_maps,
         battlefield,
+        influence_runtime,
     })
 }
 
@@ -1943,6 +2080,96 @@ fn decode_territory_v2(
         occupation,
         side_influence,
     })
+}
+
+fn decode_influence_runtime(
+    influence_runtime: &InfluenceRuntimeFixture,
+    cell_count: usize,
+) -> Result<mw_core::diffusion::InfluenceRuntimeState> {
+    if influence_runtime.schema != NATIVE_INFLUENCE_RUNTIME_SCHEMA {
+        bail!(
+            "unsupported influence runtime schema {:?}; expected {:?}",
+            influence_runtime.schema,
+            NATIVE_INFLUENCE_RUNTIME_SCHEMA
+        );
+    }
+    if influence_runtime.regular_queue.len() > INFLUENCE_REGULAR_QUEUE_LIMIT {
+        bail!(
+            "influenceRuntime.regularQueue exceeds the pending-entry limit of {INFLUENCE_REGULAR_QUEUE_LIMIT}"
+        );
+    }
+    if influence_runtime.priority_queue.len() > INFLUENCE_PRIORITY_QUEUE_LIMIT {
+        bail!(
+            "influenceRuntime.priorityQueue exceeds the pending-entry limit of {INFLUENCE_PRIORITY_QUEUE_LIMIT}"
+        );
+    }
+    for (label, queue) in [
+        (
+            "influenceRuntime.regularQueue",
+            influence_runtime.regular_queue.as_slice(),
+        ),
+        (
+            "influenceRuntime.priorityQueue",
+            influence_runtime.priority_queue.as_slice(),
+        ),
+    ] {
+        if let Some(cell) = queue.iter().copied().find(|cell| *cell >= cell_count) {
+            bail!("{label} cell {cell} is outside the territory grid");
+        }
+    }
+
+    let regular_cells = influence_runtime
+        .regular_queue
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let priority_cells = influence_runtime
+        .priority_queue
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut previous_cell = None;
+    for &(cell, state) in &influence_runtime.queued_cells {
+        if cell >= cell_count {
+            bail!("influenceRuntime.queuedCells cell {cell} is outside the territory grid");
+        }
+        if previous_cell.is_some_and(|previous| previous >= cell) {
+            bail!("influenceRuntime.queuedCells must be strictly sorted with unique cells");
+        }
+        let matching_entry = match state {
+            1 => regular_cells.contains(&cell),
+            2 => priority_cells.contains(&cell),
+            _ => bail!("influenceRuntime.queuedCells state must be 1 or 2"),
+        };
+        if !matching_entry {
+            bail!(
+                "influenceRuntime.queuedCells cell {cell} state {state} has no matching pending queue entry"
+            );
+        }
+        previous_cell = Some(cell);
+    }
+
+    Ok(mw_core::diffusion::InfluenceRuntimeState {
+        regular_queue: influence_runtime.regular_queue.clone(),
+        priority_queue: influence_runtime.priority_queue.clone(),
+        queued_cells: influence_runtime.queued_cells.clone(),
+    })
+}
+
+fn influence_runtime_fixture(
+    influence_runtime: &mw_core::diffusion::InfluenceRuntimeState,
+    cell_count: usize,
+) -> Result<InfluenceRuntimeFixture> {
+    let fixture = InfluenceRuntimeFixture {
+        schema: NATIVE_INFLUENCE_RUNTIME_SCHEMA.to_owned(),
+        regular_queue: influence_runtime.regular_queue.clone(),
+        priority_queue: influence_runtime.priority_queue.clone(),
+        queued_cells: influence_runtime.queued_cells.clone(),
+    };
+    // Core checkpoints should already be canonical. Reuse loader validation so a corrupted
+    // in-memory state cannot be published as a checkpoint which the strict loader rejects.
+    decode_influence_runtime(&fixture, cell_count)?;
+    Ok(fixture)
 }
 
 fn decode_battlefield(
@@ -2163,6 +2390,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             if checkpoint.checkpoint_boundary == CheckpointBoundary::MidWar
                 || checkpoint.territory.is_some()
                 || checkpoint.battlefield.is_some()
+                || checkpoint.influence_runtime.is_some()
                 || !checkpoint.casualties_by_victim.is_empty()
                 || checkpoint.planner.is_some()
             {
@@ -2170,6 +2398,9 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             }
         }
         NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => {
+            if checkpoint.influence_runtime.is_some() {
+                bail!("checkpoint-v2 cannot contain checkpoint-v3 influence runtime state");
+            }
             if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
                 || checkpoint.territory.is_none()
                 || checkpoint.geography.is_none()
@@ -2182,11 +2413,26 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 bail!("checkpoint-v2 strategicCycle must leave room for a later cycle");
             }
         }
+        NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+                || checkpoint.influence_runtime.is_none()
+            {
+                bail!(
+                    "checkpoint-v3 requires boundary midWar, immutable baseline geography, live territory, and influence runtime state"
+                );
+            }
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v3 strategicCycle must leave room for a later cycle");
+            }
+        }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?} or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -2967,11 +3213,15 @@ fn build_territory(prepared: &PreparedRuntime) -> Result<TerritoryControl> {
         world_revision: revisions.world_revision,
         city_revision: revisions.city_revision,
     };
-    Ok(if let Some(state) = committed {
+    let mut territory = if let Some(state) = committed {
         TerritoryControl::restore(config, state)?
     } else {
         TerritoryControl::new(config)?
-    })
+    };
+    if let Some(state) = prepared.influence_runtime.clone() {
+        territory.restore_influence_runtime(state)?;
+    }
+    Ok(territory)
 }
 
 struct FixtureExecution {
@@ -3383,6 +3633,7 @@ struct RuntimeProductionReport {
 impl PreparedRuntime {
     fn schema(&self) -> &'static str {
         match self.checkpoint.schema.as_str() {
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
             _ => NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
         }
@@ -3784,6 +4035,11 @@ fn counters_json(snapshot: &RuntimeSnapshot) -> Value {
         },
         "influence": {
             "sources": counters.influence.sources,
+            "cohort": counters.influence.cohort,
+            "applicationBudget": counters.influence.application_budget,
+            "diffusionBudget": counters.influence.diffusion_budget,
+            "diffusionProcessedItems": counters.influence.diffusion_processed_items,
+            "diffusionStaleEntries": counters.influence.diffusion_stale_entries,
             "processedSourceCells": counters.influence.processed_source_cells,
             "touchedInfluenceCells": counters.influence.touched_influence_cells,
             "changedControllerCells": counters.influence.changed_controller_cells,
@@ -4225,6 +4481,16 @@ mod tests {
         }
     }
 
+    fn valid_influence_runtime() -> InfluenceRuntimeFixture {
+        InfluenceRuntimeFixture {
+            schema: NATIVE_INFLUENCE_RUNTIME_SCHEMA.to_owned(),
+            // Repeated and stale entries are intentional and must remain accepted.
+            regular_queue: vec![0, 1, 1, 3],
+            priority_queue: vec![2, 0],
+            queued_cells: vec![(1, 1), (2, 2)],
+        }
+    }
+
     fn minimal_checkpoint(
         schema: &str,
         boundary: CheckpointBoundary,
@@ -4245,6 +4511,7 @@ mod tests {
             }),
             territory,
             battlefield: None,
+            influence_runtime: None,
             sides: vec![SideFixture {
                 side_index: 0,
                 country_ids: vec![1],
@@ -4401,6 +4668,113 @@ mod tests {
         );
         legacy_with_planner.planner = checkpoint.planner;
         assert!(validate_checkpoint_shape(&legacy_with_planner).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v3_requires_influence_runtime_and_older_schemas_reject_it() {
+        let mut checkpoint = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+            CheckpointBoundary::MidWar,
+            Some(valid_v2_territory()),
+        );
+        checkpoint.influence_runtime = Some(valid_influence_runtime());
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut missing = checkpoint.clone();
+        missing.influence_runtime = None;
+        assert!(validate_checkpoint_shape(&missing).is_err());
+
+        let mut v2 = checkpoint.clone();
+        v2.schema = NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA.to_owned();
+        assert!(validate_checkpoint_shape(&v2).is_err());
+
+        let mut v1 = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            CheckpointBoundary::PostStartWar,
+            None,
+        );
+        v1.influence_runtime = Some(valid_influence_runtime());
+        assert!(validate_checkpoint_shape(&v1).is_err());
+    }
+
+    #[test]
+    fn influence_runtime_block_is_strict_and_rejects_null() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OptionalInfluenceRuntime {
+            #[serde(
+                default,
+                deserialize_with = "deserialize_optional_influence_runtime_fixture"
+            )]
+            influence_runtime: Option<InfluenceRuntimeFixture>,
+        }
+
+        let absent: OptionalInfluenceRuntime = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.influence_runtime.is_none());
+        assert!(
+            serde_json::from_value::<OptionalInfluenceRuntime>(json!({"influenceRuntime": null}))
+                .is_err()
+        );
+
+        let encoded = serde_json::to_value(valid_influence_runtime()).unwrap();
+        let present: OptionalInfluenceRuntime =
+            serde_json::from_value(json!({"influenceRuntime": encoded.clone()})).unwrap();
+        assert!(present.influence_runtime.is_some());
+
+        let mut missing = encoded.clone();
+        missing.as_object_mut().unwrap().remove("queuedCells");
+        assert!(serde_json::from_value::<InfluenceRuntimeFixture>(missing).is_err());
+
+        let mut unknown = encoded;
+        unknown["cursor"] = json!(0);
+        assert!(serde_json::from_value::<InfluenceRuntimeFixture>(unknown).is_err());
+    }
+
+    #[test]
+    fn influence_runtime_validation_preserves_stale_and_duplicate_queue_entries() {
+        let fixture = valid_influence_runtime();
+        let decoded = decode_influence_runtime(&fixture, 4).unwrap();
+        assert_eq!(decoded.regular_queue, fixture.regular_queue);
+        assert_eq!(decoded.priority_queue, fixture.priority_queue);
+        assert_eq!(decoded.queued_cells, fixture.queued_cells);
+        assert_eq!(influence_runtime_fixture(&decoded, 4).unwrap(), fixture);
+
+        let mut invalid = fixture.clone();
+        invalid.schema = "native-influence-runtime-v0".to_owned();
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture.clone();
+        invalid.regular_queue = vec![0; INFLUENCE_REGULAR_QUEUE_LIMIT + 1];
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture.clone();
+        invalid.priority_queue = vec![0; INFLUENCE_PRIORITY_QUEUE_LIMIT + 1];
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture.clone();
+        invalid.priority_queue.push(4);
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture.clone();
+        invalid.queued_cells = vec![(2, 2), (1, 1)];
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture.clone();
+        invalid.queued_cells = vec![(1, 1), (1, 2)];
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture.clone();
+        invalid.queued_cells = vec![(1, 0)];
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture.clone();
+        invalid.queued_cells = vec![(2, 1)];
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
+
+        invalid = fixture;
+        invalid.queued_cells = vec![(1, 2)];
+        invalid.priority_queue.retain(|cell| *cell != 1);
+        assert!(decode_influence_runtime(&invalid, 4).is_err());
     }
 
     #[test]

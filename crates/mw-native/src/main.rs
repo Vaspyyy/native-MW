@@ -7,7 +7,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
-use mw_checkpoint::native_runtime::{load_runtime_checkpoint, write_runtime_checkpoint_state_v2};
+use mw_checkpoint::native_runtime::{
+    load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
+};
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
     NativeWarBootstrapConfig, ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy,
@@ -601,8 +603,12 @@ impl App {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let report =
-            write_runtime_checkpoint_state_v2(&self.scenario_path, baseline, &state, output, 1)?;
+        let writer = if state.influence_runtime.is_some() {
+            write_runtime_checkpoint_state_v3
+        } else {
+            write_runtime_checkpoint_state_v2
+        };
+        let report = writer(&self.scenario_path, baseline, &state, output, 1)?;
         log::info!(
             "saved {} bytes of {} to {} at tick {}",
             report.bytes,
