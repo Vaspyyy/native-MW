@@ -109,6 +109,8 @@ fn restored_runtime(state: NativeRuntimeCheckpointState) -> NativeRuntime {
             last_front_refresh_tick: state.last_front_refresh_tick,
             casualties: state.casualties,
             casualties_by_victim: state.casualties_by_victim,
+            gameplay_rng: state.gameplay_rng,
+            personnel_reserves: state.personnel_reserves,
             side_dynamics: state.side_dynamics,
             operations: state.operations,
             naval_planning: state.naval_planning,

@@ -40,6 +40,7 @@ use crate::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
         derive_front_layout,
     },
+    gameplay_rng::{GameplayRng, GameplayRngState},
     naval_planning::{
         NavalPlanningCounters, NavalPlanningError, NavalPlanningInput, NavalPlanningState,
         NavalRouteWorkspace, NavalTopology,
@@ -268,6 +269,8 @@ pub struct RuntimeAttritionCounters {
     pub personnel_loss: u64,
     pub equipment_loss: u64,
     pub supply_collapses: usize,
+    pub exiled_units: usize,
+    pub recovered_personnel: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -345,6 +348,9 @@ pub struct RuntimeSnapshot {
     /// Exact victim -> attacker personnel-loss attribution used by deterministic surrender
     /// allocation and persisted by mid-war checkpoints.
     pub casualties_by_victim: Arc<BTreeMap<u16, BTreeMap<u16, f64>>>,
+    pub gameplay_rng_state: GameplayRngState,
+    /// Side-level recruitable personnel returned by non-casualty formation removals.
+    pub personnel_reserves: Arc<BTreeMap<usize, f64>>,
 }
 
 #[derive(Debug, Error)]
@@ -504,8 +510,14 @@ fn add_attrition_casualties(
 fn attrition_counters(
     outcome: Option<&DamageOutcome>,
     stage: Option<&StagedBattlefieldTick>,
+    exiled_units: usize,
+    recovered_personnel: u64,
 ) -> RuntimeAttritionCounters {
-    let mut counters = RuntimeAttritionCounters::default();
+    let mut counters = RuntimeAttritionCounters {
+        exiled_units,
+        recovered_personnel,
+        ..RuntimeAttritionCounters::default()
+    };
     if let Some(outcome) = outcome {
         counters.damaged_units = outcome.results.len();
         counters.removed_units = outcome.removed_ids.len();
@@ -1466,6 +1478,8 @@ pub struct RuntimeCheckpoint {
     pub last_front_refresh_tick: Option<u64>,
     pub casualties: BTreeMap<u16, f64>,
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+    pub gameplay_rng: GameplayRngState,
+    pub personnel_reserves: BTreeMap<usize, f64>,
     pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
     /// Required by checkpoint v5; absent checkpoints retain legacy planning semantics.
     pub operations: Option<OperationalRuntimeState>,
@@ -1505,6 +1519,8 @@ pub struct NativeRuntimeCheckpointState {
     pub last_front_refresh_tick: Option<u64>,
     pub casualties: BTreeMap<u16, f64>,
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+    pub gameplay_rng: GameplayRngState,
+    pub personnel_reserves: BTreeMap<usize, f64>,
     pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
     pub operations: Option<OperationalRuntimeState>,
     pub naval_planning: Option<NavalPlanningState>,
@@ -1533,6 +1549,8 @@ pub struct NativeRuntime {
     prior_objective_by_unit: BTreeMap<u64, u64>,
     casualties: BTreeMap<u16, f64>,
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
+    gameplay_rng: GameplayRng,
+    personnel_reserves: BTreeMap<usize, f64>,
     side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
     operations: Option<OperationalRuntimeState>,
     naval_planning: Option<NavalPlanningState>,
@@ -2123,6 +2141,10 @@ impl NativeRuntime {
         )?;
         validate_casualties(&checkpoint.casualties, &checkpoint.scenario)?;
         validate_casualties_by_victim(&checkpoint.casualties_by_victim, &checkpoint.scenario)?;
+        validate_personnel_reserves(
+            &checkpoint.personnel_reserves,
+            checkpoint.territory.max_sides(),
+        )?;
         let controlled_cell_limit = u64::try_from(checkpoint.territory.total_cells())
             .map_err(|_| RuntimeError::InvalidCheckpoint("territory cell count exceeds u64"))?;
         validate_side_dynamics_state(
@@ -2373,6 +2395,8 @@ impl NativeRuntime {
             pending_render_updates: render_updates.len(),
             casualty_totals: Arc::new(checkpoint.casualties.clone()),
             casualties_by_victim: Arc::new(checkpoint.casualties_by_victim.clone()),
+            gameplay_rng_state: checkpoint.gameplay_rng,
+            personnel_reserves: Arc::new(checkpoint.personnel_reserves.clone()),
         });
 
         Ok(Self {
@@ -2395,6 +2419,8 @@ impl NativeRuntime {
             prior_objective_by_unit: checkpoint.prior_objective_by_unit,
             casualties: checkpoint.casualties,
             casualties_by_victim: checkpoint.casualties_by_victim,
+            gameplay_rng: GameplayRng::restore(checkpoint.gameplay_rng),
+            personnel_reserves: checkpoint.personnel_reserves,
             side_dynamics: checkpoint.side_dynamics,
             operations: checkpoint.operations,
             naval_planning: checkpoint.naval_planning,
@@ -2489,6 +2515,8 @@ impl NativeRuntime {
             last_front_refresh_tick: self.last_front_refresh_tick,
             casualties: self.casualties.clone(),
             casualties_by_victim: self.casualties_by_victim.clone(),
+            gameplay_rng: self.gameplay_rng.state(),
+            personnel_reserves: self.personnel_reserves.clone(),
             side_dynamics: self.side_dynamics.clone(),
             operations: self.operations.clone(),
             naval_planning: self.naval_planning.clone(),
@@ -3062,6 +3090,8 @@ impl NativeRuntime {
         let mut staged_naval_planning = self.naval_planning.clone();
         let mut staged_operational_execution = self.operational_execution.clone();
         let mut staged_air_power = self.air_power.clone();
+        let mut staged_gameplay_rng = self.gameplay_rng;
+        let mut staged_personnel_reserves = self.personnel_reserves.clone();
         let air_wing_sovereign_by_id = staged_air_power
             .as_ref()
             .map(|air_power| {
@@ -3267,6 +3297,75 @@ impl NativeRuntime {
             (Some(outcome), damage)
         } else {
             (None, None)
+        };
+
+        // Browser unit processing is reverse stable-array order. Eligible exiled naval
+        // formations consume exactly one shared gameplay draw apiece; hits recover the
+        // surviving crew/manpower and disappear before sea attrition, AI, or combat.
+        let controlled_by_country = self
+            .latest
+            .territory_snapshot
+            .countries
+            .iter()
+            .map(|country| (country.country_id, country.controlled))
+            .collect::<BTreeMap<_, _>>();
+        let exile_policies = staged_battlefield
+            .as_ref()
+            .map_or(&self.unit_policies, |stage| &stage.policies);
+        let mut exiled_ids = Vec::new();
+        let mut recovered_personnel = 0_u64;
+        for unit in self.simulation.units.iter().rev() {
+            let Ok(country) = u16::try_from(unit.combat.sovereign) else {
+                continue;
+            };
+            let Some(&controlled) = controlled_by_country.get(&country) else {
+                continue;
+            };
+            let policy = rollback_try!(
+                exile_policies
+                    .get(&unit.combat.id)
+                    .ok_or(RuntimeError::InvalidUnitPolicy(unit.combat.id))
+            );
+            if unit_deploying(policy, next_tick) {
+                continue;
+            }
+            let at_sea = staged_battlefield
+                .as_ref()
+                .and_then(|stage| stage.resolved_unit(unit.combat.id))
+                .map_or(unit.combat.at_sea, |resolved| resolved.cell.at_sea);
+            if !at_sea || controlled != 0 || staged_gameplay_rng.next_f64() >= 0.02 {
+                continue;
+            }
+            let side =
+                rollback_try!(usize::try_from(unit.combat.side).map_err(|_| {
+                    RuntimeError::InvalidCheckpoint("unit side exceeds platform")
+                }));
+            let recovered = if unit.combat.kind == UnitKind::Armor {
+                unit.combat
+                    .equipment
+                    .saturating_mul(simulation_config.combat.armor_crew_per_vehicle)
+            } else {
+                unit.combat.personnel
+            };
+            let reserve = rollback_try!(staged_personnel_reserves.get_mut(&side).ok_or(
+                RuntimeError::InvalidCheckpoint("personnel reserve is missing a unit side"),
+            ));
+            *reserve += recovered as f64;
+            if !reserve.is_finite() {
+                rollback_try!(Err::<(), RuntimeError>(RuntimeError::InvalidCheckpoint(
+                    "personnel reserve overflowed"
+                )));
+            }
+            recovered_personnel = recovered_personnel.saturating_add(recovered);
+            exiled_ids.push(unit.combat.id);
+        }
+        exiled_ids.sort_unstable();
+        let exile_outcome = if exiled_ids.is_empty() {
+            None
+        } else {
+            Some(rollback_try!(
+                self.simulation.remove_units_atomic(&exiled_ids)
+            ))
         };
 
         let attrition_commands = if let Some(stage) = &staged_battlefield {
@@ -3789,9 +3888,12 @@ impl NativeRuntime {
                 return Err(RuntimeError::Simulation(error));
             }
         };
-        if air_damage_outcome.is_some() || attrition_outcome.is_some() {
+        if air_damage_outcome.is_some() || exile_outcome.is_some() || attrition_outcome.is_some() {
             let mut removed_ids = frame_snapshot.removed_ids.to_vec();
             if let Some(outcome) = &air_damage_outcome {
+                removed_ids.extend(outcome.removed_ids.iter().copied());
+            }
+            if let Some(outcome) = &exile_outcome {
                 removed_ids.extend(outcome.removed_ids.iter().copied());
             }
             if let Some(outcome) = &attrition_outcome {
@@ -4066,8 +4168,12 @@ impl NativeRuntime {
             }
         }
 
-        let attrition_counters =
-            attrition_counters(attrition_outcome.as_ref(), staged_battlefield.as_ref());
+        let attrition_counters = attrition_counters(
+            attrition_outcome.as_ref(),
+            staged_battlefield.as_ref(),
+            exiled_ids.len(),
+            recovered_personnel,
+        );
         let final_operational_claimed = operational_claimed_unit_ids(
             staged_operations.as_ref(),
             staged_operational_execution.as_ref(),
@@ -4127,6 +4233,8 @@ impl NativeRuntime {
         self.naval_planning = staged_naval_planning;
         self.operational_execution = staged_operational_execution;
         self.air_power = staged_air_power;
+        self.gameplay_rng = staged_gameplay_rng;
+        self.personnel_reserves = staged_personnel_reserves;
         self.tick = next_tick;
         self.frame = next_frame;
         self.state = next_state;
@@ -4201,6 +4309,8 @@ impl NativeRuntime {
             pending_render_updates: self.render_updates.len(),
             casualty_totals: Arc::new(self.casualties.clone()),
             casualties_by_victim: Arc::new(self.casualties_by_victim.clone()),
+            gameplay_rng_state: self.gameplay_rng.state(),
+            personnel_reserves: Arc::new(self.personnel_reserves.clone()),
         });
         self.latest = published.clone();
         Ok(published)
@@ -4606,6 +4716,25 @@ fn validate_side_dynamics_state(
     Ok(())
 }
 
+fn validate_personnel_reserves(
+    reserves: &BTreeMap<usize, f64>,
+    side_count: usize,
+) -> Result<(), RuntimeError> {
+    if reserves.len() != side_count
+        || reserves
+            .iter()
+            .enumerate()
+            .any(|(expected, (&side, value))| {
+                side != expected || !value.is_finite() || *value < 0.0
+            })
+    {
+        return Err(RuntimeError::InvalidCheckpoint(
+            "personnel reserves must exactly cover the stable side topology",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_casualties(
     casualties: &BTreeMap<u16, f64>,
     scenario: &ScenarioProduction,
@@ -4977,6 +5106,83 @@ mod tests {
         assert_eq!(totals, vec![4.0, 0.0]);
     }
 
+    fn exile_fixture(two_armies: bool, armor: bool) -> NativeRuntime {
+        let mut source = fixture(0, false);
+        let mut state = source.checkpoint_state().unwrap();
+        state.gameplay_rng = GameplayRngState {
+            state: if two_armies { 0 } else { 0x6d2b_79f5 },
+        };
+        state.territory_config.maps.primary_occupier.fill(2);
+        state.territory_config.maps.dominant_side.fill(1);
+        state.territory_config.maps.occupation.fill(-1.0);
+        state.territory_config.maps.side_influence[0].fill(0.0);
+        state.territory_config.maps.side_influence[1].fill(1.0);
+        state.units[0].combat.at_sea = true;
+        if armor {
+            state.units[0].combat.kind = UnitKind::Armor;
+            state.units[0].combat.personnel = 0;
+            state.units[0].combat.personnel_capacity = 0;
+            state.units[0].combat.equipment = 17;
+            state.units[0].combat.max_equipment = 20;
+        }
+        if two_armies {
+            let mut second = state.units[0].clone();
+            second.combat.id = 3;
+            second.combat.lng = -90.0;
+            state.units.push(second);
+            state.unit_policies.push(RuntimeUnitPolicy::standard(3, 1));
+        }
+        let checkpoint = runtime_checkpoint(state);
+        NativeRuntime::new(RuntimeConfig::default(), checkpoint).unwrap()
+    }
+
+    #[test]
+    fn naval_exile_uses_reverse_draw_order_recovers_reserve_and_resumes_exactly() {
+        let mut uninterrupted = exile_fixture(true, false);
+        let snapshot = uninterrupted.step().unwrap();
+
+        assert_eq!(snapshot.counters.attrition.exiled_units, 1);
+        assert_eq!(snapshot.counters.attrition.recovered_personnel, 1_000);
+        assert_eq!(&*snapshot.frame_snapshot.removed_ids, &[1]);
+        assert_eq!(
+            snapshot
+                .frame_snapshot
+                .units
+                .iter()
+                .map(|unit| unit.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(snapshot.personnel_reserves.get(&0), Some(&1_000.0));
+        assert!(snapshot.casualty_totals.is_empty());
+        assert!(snapshot.casualties_by_victim.is_empty());
+
+        let split = uninterrupted.checkpoint_state().unwrap();
+        assert_eq!(split.gameplay_rng.state, 0x6d2b_79f5_u32.wrapping_mul(2));
+        let mut restored =
+            NativeRuntime::new(split.runtime_config, runtime_checkpoint(split.clone())).unwrap();
+        let expected = uninterrupted.step().unwrap();
+        let actual = restored.step().unwrap();
+        assert_eq!(actual.frame_snapshot, expected.frame_snapshot);
+        assert_eq!(actual.personnel_reserves, expected.personnel_reserves);
+        assert_eq!(
+            restored.checkpoint_state().unwrap().gameplay_rng,
+            uninterrupted.checkpoint_state().unwrap().gameplay_rng
+        );
+    }
+
+    #[test]
+    fn armor_naval_exile_returns_live_crew_without_casualties() {
+        let mut runtime = exile_fixture(false, true);
+        let snapshot = runtime.step().unwrap();
+
+        assert_eq!(snapshot.counters.attrition.exiled_units, 1);
+        assert_eq!(snapshot.counters.attrition.recovered_personnel, 34);
+        assert_eq!(snapshot.personnel_reserves.get(&0), Some(&34.0));
+        assert_eq!(&*snapshot.frame_snapshot.removed_ids, &[1]);
+        assert!(snapshot.casualty_totals.is_empty());
+    }
+
     fn fixture(tick: u64, collapsed_second_side: bool) -> NativeRuntime {
         let grid = GridSpec {
             grid_res: 90.0,
@@ -5109,6 +5315,10 @@ mod tests {
                 last_front_refresh_tick: None,
                 casualties: BTreeMap::new(),
                 casualties_by_victim: BTreeMap::new(),
+                gameplay_rng: GameplayRngState {
+                    state: crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED,
+                },
+                personnel_reserves: BTreeMap::from([(0, 0.0), (1, 0.0)]),
                 side_dynamics: None,
                 operations: None,
                 naval_planning: None,
@@ -5146,6 +5356,8 @@ mod tests {
             last_front_refresh_tick: state.last_front_refresh_tick,
             casualties: state.casualties,
             casualties_by_victim: state.casualties_by_victim,
+            gameplay_rng: state.gameplay_rng,
+            personnel_reserves: state.personnel_reserves,
             side_dynamics: state.side_dynamics,
             operations: state.operations,
             naval_planning: state.naval_planning,
@@ -6077,6 +6289,26 @@ mod tests {
         assert_eq!(runtime.tick(), 0);
         assert_eq!(runtime.frame(), 0);
         assert_eq!(runtime.pending_render_updates(), queued);
+    }
+
+    #[test]
+    fn failed_tick_rolls_back_naval_exile_rng_reserve_and_unit_removal() {
+        let mut runtime = exile_fixture(true, false);
+        let published = runtime.latest_snapshot();
+        let units = runtime.simulation.units.clone();
+        let rng = runtime.gameplay_rng.state();
+        let reserves = runtime.personnel_reserves.clone();
+        let casualties = runtime.casualties.clone();
+        runtime.config.front.max_grid_cells = 0;
+
+        assert!(matches!(runtime.step(), Err(RuntimeError::Front(_))));
+        assert_eq!(runtime.simulation.units, units);
+        assert_eq!(runtime.gameplay_rng.state(), rng);
+        assert_eq!(runtime.personnel_reserves, reserves);
+        assert_eq!(runtime.casualties, casualties);
+        assert!(Arc::ptr_eq(&runtime.latest_snapshot(), &published));
+        assert_eq!(runtime.tick(), 0);
+        assert_eq!(runtime.frame(), 0);
     }
 
     #[test]

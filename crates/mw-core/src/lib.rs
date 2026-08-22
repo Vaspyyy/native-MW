@@ -14,6 +14,7 @@ pub mod direction;
 pub mod dynamics;
 pub mod economy;
 pub mod front;
+pub mod gameplay_rng;
 pub mod movement;
 pub mod naval_planning;
 pub mod occupation;
@@ -81,6 +82,10 @@ pub use front::{
     FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit, FrontPoint,
     FrontSegment, FrontSlotAssignment, derive_front_layout,
 };
+pub use gameplay_rng::{
+    DEFAULT_GAMEPLAY_RNG_SEED, GAMEPLAY_RNG_ALGORITHM, GAMEPLAY_RNG_SCHEMA_VERSION, GameplayRng,
+    GameplayRngState,
+};
 pub use movement::{
     MOVEMENT_SCHEMA_VERSION, MovementError, MovementFactors, MovementInput, MovementOutput,
     MovementState, integrate_unit_step,
@@ -115,7 +120,8 @@ pub use scenario::{
 pub use simulation::{
     DamageCommand, DamageOutcome, DamageResult, DesertionOutcome, FrameSnapshot,
     NATIVE_TICK_SCHEMA_VERSION, ResolvedCombatOrder, ResolvedUnitOrder, Simulation,
-    SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput, UnitSnapshot,
+    SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput, UnitRemovalOutcome,
+    UnitSnapshot,
 };
 pub use strategic::{
     ConflictResolutionPlan, CountryCycleInput, CountryStrategicSnapshot, DesertionCommand,

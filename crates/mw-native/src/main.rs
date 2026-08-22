@@ -10,7 +10,7 @@ use bytemuck::{Pod, Zeroable};
 use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
-    write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v8,
+    write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
 };
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
@@ -606,7 +606,7 @@ impl App {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
         let writer = if state.naval_planning.is_some() {
-            write_runtime_checkpoint_state_v8
+            write_runtime_checkpoint_state_v9
         } else if state.operational_execution.is_some() && state.air_power.is_some() {
             write_runtime_checkpoint_state_v6
         } else if state.operations.is_some() {
@@ -1342,6 +1342,10 @@ fn create_demo_runtime(
             last_front_refresh_tick: None,
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
+            gameplay_rng: mw_core::GameplayRngState {
+                state: mw_core::DEFAULT_GAMEPLAY_RNG_SEED,
+            },
+            personnel_reserves: BTreeMap::from([(0, 0.0), (1, 0.0)]),
             side_dynamics: None,
             operations: None,
             operational_execution: None,

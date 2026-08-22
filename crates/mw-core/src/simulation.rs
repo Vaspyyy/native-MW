@@ -208,6 +208,11 @@ pub struct DamageOutcome {
     pub removed_ids: Arc<[u64]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitRemovalOutcome {
+    pub removed_ids: Arc<[u64]>,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum SimulationError {
     #[error("invalid simulation config")]
@@ -216,6 +221,10 @@ pub enum SimulationError {
     DuplicateUnit(u64),
     #[error("damage command references unknown unit id {0}")]
     UnknownDamageUnit(u64),
+    #[error("unit removal references unknown unit id {0}")]
+    UnknownRemovalUnit(u64),
+    #[error("unit removal ids must be sorted and unique")]
+    InvalidRemovalUnits,
     #[error("duplicate order for unit id {0}")]
     DuplicateOrder(u64),
     #[error("inactive unit ids must be sorted, unique, and reference live units")]
@@ -401,6 +410,51 @@ impl Simulation {
         Ok(DamageOutcome {
             results: results.into(),
             removed_ids: removed_ids.into(),
+        })
+    }
+
+    /// Atomically remove healthy formations without converting their remaining
+    /// strength into casualties. The caller owns any reserve or equipment
+    /// recovery associated with the removal reason.
+    pub fn remove_units_atomic(
+        &mut self,
+        unit_ids: &[u64],
+    ) -> Result<UnitRemovalOutcome, SimulationError> {
+        if unit_ids
+            .iter()
+            .zip(unit_ids.iter().skip(1))
+            .any(|(left, right)| left >= right)
+        {
+            return Err(SimulationError::InvalidRemovalUnits);
+        }
+        if let Some(&unknown) = unit_ids
+            .iter()
+            .find(|id| !self.units.iter().any(|unit| unit.combat.id == **id))
+        {
+            return Err(SimulationError::UnknownRemovalUnit(unknown));
+        }
+
+        let removed = unit_ids.iter().copied().collect::<BTreeSet<_>>();
+        let mut next = Vec::with_capacity(self.units.len().saturating_sub(removed.len()));
+        for unit in &self.units {
+            if !removed.contains(&unit.combat.id) {
+                next.push(unit.clone());
+            }
+        }
+        validate_unit_slice(&next, None)?;
+        self.units = next;
+        self.rebuild_unit_index()?;
+        self.tactical_units.clear();
+        self.candidates.clear();
+        self.accepted.clear();
+        self.order_by_unit.clear();
+        self.events.clear();
+        self.removed.clear();
+        self.removed.extend_from_slice(unit_ids);
+        self.abandoned.clear();
+        self.latest = None;
+        Ok(UnitRemovalOutcome {
+            removed_ids: unit_ids.into(),
         })
     }
 
@@ -1693,5 +1747,38 @@ mod tests {
             Err(SimulationError::InvalidCapitulatedCountries)
         ));
         assert_eq!(simulation.units, before);
+    }
+
+    #[test]
+    fn explicit_noncasualty_removal_is_atomic_and_preserves_storage_order() {
+        let units = vec![
+            army(3, 0, 0.0, 0.0),
+            army(1, 0, 0.0, 1.0),
+            army(2, 1, 0.0, 2.0),
+        ];
+        let mut simulation = Simulation::new(SimulationConfig::default(), units.clone()).unwrap();
+
+        let outcome = simulation.remove_units_atomic(&[1, 3]).unwrap();
+        assert_eq!(&*outcome.removed_ids, &[1, 3]);
+        assert_eq!(simulation.units, vec![units[2].clone()]);
+        assert_eq!(simulation.units[0].combat.personnel, 1_000);
+        assert!(simulation.latest_snapshot().is_none());
+    }
+
+    #[test]
+    fn invalid_noncasualty_removal_does_not_mutate() {
+        let units = vec![army(1, 0, 0.0, 0.0), army(2, 1, 0.0, 1.0)];
+        let mut simulation = Simulation::new(SimulationConfig::default(), units.clone()).unwrap();
+
+        assert_eq!(
+            simulation.remove_units_atomic(&[2, 1]),
+            Err(SimulationError::InvalidRemovalUnits)
+        );
+        assert_eq!(simulation.units, units);
+        assert_eq!(
+            simulation.remove_units_atomic(&[3]),
+            Err(SimulationError::UnknownRemovalUnit(3))
+        );
+        assert_eq!(simulation.units, units);
     }
 }

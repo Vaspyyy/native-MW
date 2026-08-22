@@ -649,6 +649,10 @@ pub fn bootstrap_native_war(
             last_front_refresh_tick: None,
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
+            gameplay_rng: crate::gameplay_rng::GameplayRngState {
+                state: crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED,
+            },
+            personnel_reserves: (0..n).map(|side| (side, 0.0)).collect(),
             side_dynamics: Some(side_dynamics),
             operations: Some(operations),
             naval_planning: Some(NavalPlanningState::bootstrap(n)?),

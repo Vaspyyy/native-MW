@@ -401,7 +401,7 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or native v2-v8 `midWar`
+Run an exact browser-exported v1 `postStartWar` or native v2-v9 `midWar`
 checkpoint in the production viewer, or validate steps without a window:
 
 ```bash
@@ -414,8 +414,8 @@ Native-only starts use repeated `--side` selectors (ID or unique
 case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
 
 ```bash
-target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v8.json "$scenario"
-target/release/mw-native --runtime-checkpoint /tmp/mw-v8.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v8-resumed.json "$scenario"
+target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v9.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v9.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v9-resumed.json "$scenario"
 ```
 
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
@@ -449,13 +449,14 @@ wings, including ordered per-country air-operations funding coverage. V7 retains
 v6 and adds the exact per-side naval reassessment
 clocks plus next native operation sequence. Coastal topology and reusable BFS
 scratch are derived from immutable land and remain outside the serialized
-contract. New native wars save v8, which adds required nullable per-unit supply
-collapse markers for exact operational-feedback continuation. Legacy runtimes
+contract. New native wars save v9. V8 adds required nullable per-unit supply
+collapse markers for exact operational-feedback continuation; v9 adds the
+Mulberry32 gameplay cursor and complete side-level recruitable reserves. Legacy runtimes
 choose the newest schema their owned continuation
 state supports. Checkpoint encoding/decoding and restore remain outside the timed
 benchmark region.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v8
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v9
 `midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
@@ -480,8 +481,9 @@ browser supply-collapse marker, applies its inclusive 15-tick and 35%
 task-force reaction window, holds regrouping forces as defense during a side
 collapse, and suppresses shared-task-force repulsion only when neither unit has
 a hostile within 0.6 degrees. Observer-scoped posture intel and live country
-desperation overrides are already staged. Naval exile/recovery RNG remains
-omitted, and native holds captured air-operations funding coverage until
+desperation overrides are already staged. V9 adds transactionally staged naval
+exile draws in reverse stable unit order, non-casualty reserve recovery, and
+exact RNG/reserve split continuation. Native holds captured air-operations funding coverage until
 aircraft-reserve production/replacement is ported.
 Native frames advance once per logical runtime step, so frame-window mechanics
 after handoff follow native cadence rather than a browser speed mode that
@@ -493,7 +495,7 @@ MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
 stress fixture and therefore do not measure the live resolver or the new
 influence/side-dynamics schedulers; they are not a claim of complete
-browser-tick parity. A v2-v8 restore rebuilds private territory summaries;
+browser-tick parity. A v2-v9 restore rebuilds private territory summaries;
 partial census work and
 render queues are not serialized. V3 separately preserves pending frontier
 work. Map-only viewing and the small scenario-derived `--demo-units` runtime
@@ -573,5 +575,29 @@ checksum `e89419fe6b87b15e`. The production parity gate also passed exact v8
 
 ```bash
 target/release/mw-tools native-runtime-bench "$scenario" /path/to/native-v8.json \
+  --ticks 30 --repeat 5 --warmup 2 --json
+```
+
+### Native checkpoint v9 replay-safe naval exile
+
+Measured on 2026-08-22 with the same United Kingdom versus Iceland setup after
+1,000 ticks. The checkpoint contained 163 live units, the exact Mulberry32
+cursor, and a two-side recruitable-reserve vector. No sovereign with a live
+at-sea formation had zero controlled land during these samples, so this is the
+steady-state eligibility-scan cost; focused tests separately force both the
+army and armor exile-hit paths and exact split continuation.
+
+| Live v9 30-tick sample | Median sample | Median per tick | p95 sample | p95 per tick |
+|---|---:|---:|---:|---:|
+| Fresh checkpoint | 145.692 ms | 4.856 ms | 145.828 ms | 4.861 ms |
+| Persistent runtime | 144.962 ms | 4.832 ms | 151.045 ms | 5.035 ms |
+
+All five persistent samples completed all 150 requested ticks with final
+checksum `957ab3e946db0f81`. The production parity gate passed exact v9 20+20
+versus 40-tick continuation and routed naval 1,000+100 versus 1,100; both
+comparisons include the serialized RNG cursor and personnel reserves.
+
+```bash
+target/release/mw-tools native-runtime-bench "$scenario" /path/to/native-v9.json \
   --ticks 30 --repeat 5 --warmup 2 --json
 ```
