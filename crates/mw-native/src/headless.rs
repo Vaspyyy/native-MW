@@ -12,6 +12,7 @@ use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
     write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
+    write_runtime_checkpoint_state_v10,
 };
 use mw_core::{
     CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
@@ -176,7 +177,9 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.naval_planning.is_some() {
+        let writer = if state.reinforcement.is_some() && state.naval_planning.is_some() {
+            write_runtime_checkpoint_state_v10
+        } else if state.naval_planning.is_some() {
             write_runtime_checkpoint_state_v9
         } else if state.operational_execution.is_some() && state.air_power.is_some() {
             write_runtime_checkpoint_state_v6
@@ -254,6 +257,14 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
                 "units": units,
                 "gameplayRngState": completion.final_snapshot.gameplay_rng_state.state,
                 "personnelReserves": completion.final_snapshot.personnel_reserves.as_ref(),
+                "reinforcement": completion.final_snapshot.reinforcement_snapshot.as_deref(),
+                "reinforcementCounters": {
+                    "recruitedUnits": completion.final_snapshot.counters.reinforcement.recruited_units,
+                    "recruitedPersonnel": completion.final_snapshot.counters.reinforcement.recruited_personnel,
+                    "aircraftPurchased": completion.final_snapshot.counters.reinforcement.aircraft_purchased,
+                    "aircraftReinforced": completion.final_snapshot.counters.reinforcement.aircraft_reinforced,
+                    "airWingsCreated": completion.final_snapshot.counters.reinforcement.air_wings_created,
+                },
                 "navalExile": {
                     "exiledUnits": completion.final_snapshot.counters.attrition.exiled_units,
                     "recoveredPersonnel": completion.final_snapshot.counters.attrition.recovered_personnel,
@@ -639,6 +650,9 @@ fn checksum_runtime_snapshot(checksum: &mut Fnv64, snapshot: &RuntimeSnapshot) -
     checksum_casualties_by_victim(checksum, snapshot.casualties_by_victim.as_ref());
     checksum.write_u64(u64::from(snapshot.gameplay_rng_state.state));
     checksum.write_bytes(&serde_json::to_vec(snapshot.personnel_reserves.as_ref())?);
+    checksum.write_bytes(&serde_json::to_vec(
+        &snapshot.reinforcement_snapshot.as_deref(),
+    )?);
     Ok(())
 }
 

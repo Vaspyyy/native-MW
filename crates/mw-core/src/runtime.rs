@@ -27,15 +27,18 @@ use crate::{
         BattlefieldTickInput, BattlefieldUnitInput, BattlefieldUnitResult, BattlefieldUnitState,
         apply_cohesion_and_repulsion, resolve_battlefield_tick, resolve_local_tactics,
     },
-    combat::{UNIT_HEALTH, UnitKind, formation_strength, wrapped_longitude_delta},
+    combat::{
+        CombatUnit, PERSONNEL_PER_FORMATION, UNIT_HEALTH, UnitKind, formation_strength,
+        wrapped_longitude_delta,
+    },
     command::{
         CommandHomeTarget, CommandResolveError, CommandUnitState, CommandWorld,
-        ResolvedCommandPolicy, browser_discipline, resolve_command_batch,
+        ResolvedCommandPolicy, browser_discipline, resolve_command_batch, resolve_command_policy,
     },
     diffusion::DiffusionQueueResult,
     direction::HostilityMatrix,
     dynamics::{MOMENTUM_SAMPLE_INTERVAL, SideDynamics, WarPhase, WarPosture},
-    economy::{CommandBand, EconomyState, PAY_CYCLE_TICKS},
+    economy::{CommandBand, EconomyState, PAY_CYCLE_TICKS, RECRUITMENT_COST},
     front::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
         derive_front_layout,
@@ -59,6 +62,9 @@ use crate::{
     production::{
         ProductionConfig, ProductionError, ScenarioProduction, StrategicDerivationCounters,
         StrategicDerivationInput, TerritoryCommitMarker, derive_strategic_cycle_input,
+    },
+    reinforcement::{
+        AirPayCycleOutcome, ReinforcementError, ReinforcementState, bootstrap_reinforcement_state,
     },
     scenario::GridSpec,
     simulation::{
@@ -86,6 +92,10 @@ pub const DEFAULT_CENSUS_BUDGET: usize = 16_384;
 pub const DEFAULT_CENSUS_FLUSH_CHUNK: usize = 65_536;
 const AIRCREW_PER_AIRCRAFT: u64 = 1;
 const AIRFIELD_CONTROLLER_PHASE: u64 = 47;
+const EARLY_RECRUIT_TICKS: u64 = 1_800;
+const EARLY_RECRUIT_MULTIPLIER: f64 = 2.3;
+const RECRUIT_DEPLOY_TICKS: u64 = 30;
+const BASE_RECRUITMENT_CHANCE: f64 = 0.012;
 /// Front-layout slots are already capacity-resolved. Preserve that handoff across the whole
 /// geographic domain instead of rebuilding a quadratic unit/objective matching problem.
 pub const DEFAULT_RUNTIME_FRONT_STICKINESS: f64 = 360.0;
@@ -288,6 +298,15 @@ pub struct RuntimeAirCounters {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeReinforcementCounters {
+    pub recruited_units: usize,
+    pub recruited_personnel: u64,
+    pub aircraft_purchased: u64,
+    pub aircraft_reinforced: u64,
+    pub air_wings_created: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeStepCounters {
     pub front_refreshed: bool,
     pub front_segments: usize,
@@ -295,6 +314,7 @@ pub struct RuntimeStepCounters {
     pub ai: AiPlanningCounters,
     pub simulation: TickCounters,
     pub air: RuntimeAirCounters,
+    pub reinforcement: RuntimeReinforcementCounters,
     pub naval_planning: NavalPlanningCounters,
     pub operational_execution: OperationalExecutionCounters,
     pub attrition: RuntimeAttritionCounters,
@@ -351,6 +371,8 @@ pub struct RuntimeSnapshot {
     pub gameplay_rng_state: GameplayRngState,
     /// Side-level recruitable personnel returned by non-casualty formation removals.
     pub personnel_reserves: Arc<BTreeMap<usize, f64>>,
+    /// Immutable aircraft reserves, funding, and monotonic formation-ID continuation.
+    pub reinforcement_snapshot: Option<Arc<ReinforcementState>>,
 }
 
 #[derive(Debug, Error)]
@@ -391,6 +413,8 @@ pub enum RuntimeError {
     Operational(#[from] OperationalError),
     #[error("air operations: {0}")]
     Air(#[from] AirError),
+    #[error("reinforcement: {0}")]
+    Reinforcement(#[from] ReinforcementError),
     #[error("operational execution: {0}")]
     OperationalExecution(#[from] OperationalExecutionError),
     #[error("naval planning: {0}")]
@@ -1489,6 +1513,8 @@ pub struct RuntimeCheckpoint {
     pub operational_execution: Option<OperationalExecutionState>,
     /// Required by checkpoint v6 and advanced atomically with operational execution.
     pub air_power: Option<AirPowerState>,
+    /// Checkpoint v10 aircraft reserves, funding, and monotonic formation allocators.
+    pub reinforcement: Option<ReinforcementState>,
 }
 
 /// Owned state captured at a committed, serialization-ready runtime boundary.
@@ -1526,6 +1552,7 @@ pub struct NativeRuntimeCheckpointState {
     pub naval_planning: Option<NavalPlanningState>,
     pub operational_execution: Option<OperationalExecutionState>,
     pub air_power: Option<AirPowerState>,
+    pub reinforcement: Option<ReinforcementState>,
 }
 
 /// Shared native simulation owner. No mutable kernel state is exposed to renderers.
@@ -1558,6 +1585,7 @@ pub struct NativeRuntime {
     naval_route_workspace: Option<NavalRouteWorkspace>,
     operational_execution: Option<OperationalExecutionState>,
     air_power: Option<AirPowerState>,
+    reinforcement: Option<ReinforcementState>,
     state: RuntimeState,
     latest: Arc<RuntimeSnapshot>,
     render_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
@@ -1596,6 +1624,15 @@ struct StagedCommandPolicies {
     changed_unit_ids: BTreeSet<u64>,
 }
 
+#[derive(Default)]
+struct StagedRecruitment {
+    units: Vec<SimulationUnit>,
+    policies: Vec<RuntimeUnitPolicy>,
+    battlefield_units: BTreeMap<u64, BattlefieldUnitState>,
+    treasury_costs: Vec<(u16, f64)>,
+    counters: RuntimeReinforcementCounters,
+}
+
 impl StagedBattlefieldTick {
     fn resolved_unit(&self, unit_id: u64) -> Option<&BattlefieldUnitResult> {
         self.resolved_by_id.get(&unit_id)
@@ -1604,6 +1641,463 @@ impl StagedBattlefieldTick {
     fn local_unit(&self, unit_id: u64) -> Option<&crate::battlefield::BattlefieldLocalUnitResult> {
         self.local_by_id.get(&unit_id)
     }
+}
+
+fn air_pay_cycle_counters(outcome: &AirPayCycleOutcome) -> RuntimeReinforcementCounters {
+    let mut counters = RuntimeReinforcementCounters::default();
+    for country in &outcome.countries {
+        counters.aircraft_purchased = counters.aircraft_purchased.saturating_add(u64::from(
+            country
+                .fighters_purchased
+                .saturating_add(country.strike_purchased),
+        ));
+        counters.aircraft_reinforced = counters.aircraft_reinforced.saturating_add(u64::from(
+            country
+                .fighters_reinforced
+                .saturating_add(country.strike_reinforced),
+        ));
+        counters.air_wings_created = counters.air_wings_created.saturating_add(
+            country
+                .wing_creation
+                .iter()
+                .filter(|creation| creation.created_wing_id.is_some())
+                .count() as u64,
+        );
+    }
+    counters
+}
+
+fn recruit_cell_center(cell: usize, grid: GridSpec) -> (f64, f64) {
+    let x = cell % grid.width;
+    let y = cell / grid.width;
+    (
+        -90.0 + (y as f64 + 0.5) * grid.grid_res,
+        -180.0 + (x as f64 + 0.5) * grid.grid_res,
+    )
+}
+
+fn recruitment_spawn_cell(
+    country_id: u16,
+    side: usize,
+    supply_failed: bool,
+    scenario: &ScenarioProduction,
+    territory: &TerritoryControl,
+    rng: &mut GameplayRng,
+) -> Option<(f64, f64, usize)> {
+    let world = WorldGridView::new(
+        territory.grid_resolution(),
+        territory.width(),
+        territory.height(),
+        territory.land(),
+    )
+    .ok()?;
+    let friendly_cities = scenario
+        .cities
+        .iter()
+        .filter(|city| {
+            city.owner_id == country_id
+                && city.cell < territory.total_cells()
+                && territory.land()[city.cell] > 0
+                && territory.dominant_side()[city.cell] == side as i16
+        })
+        .collect::<Vec<_>>();
+    if !friendly_cities.is_empty() {
+        let frontline_cities = friendly_cities
+            .iter()
+            .copied()
+            .filter(|city| {
+                let neighbors = [
+                    city.cell.saturating_add(1),
+                    city.cell.saturating_sub(1),
+                    city.cell.saturating_add(territory.width()),
+                    city.cell.saturating_sub(territory.width()),
+                ];
+                neighbors.into_iter().any(|cell| {
+                    if cell >= territory.total_cells() {
+                        return false;
+                    }
+                    let Ok(other) = usize::try_from(territory.dominant_side()[cell]) else {
+                        return false;
+                    };
+                    other < territory.max_sides()
+                        && territory.hostility_matrix()[side * territory.max_sides() + other] == 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let candidates = if !supply_failed && !frontline_cities.is_empty() {
+            &frontline_cities
+        } else {
+            &friendly_cities
+        };
+        let selected =
+            ((rng.next_f64() * candidates.len() as f64).floor() as usize).min(candidates.len() - 1);
+        let city = candidates[selected];
+        let mut lat = city.lat + (rng.next_f64() - 0.5) * scenario.grid.grid_res * 0.8;
+        let mut lng = city.lng + (rng.next_f64() - 0.5) * scenario.grid.grid_res * 0.8;
+        let valid = world.grid_index(lat, lng).is_some_and(|cell| {
+            territory.world_control()[cell] == country_id
+                && territory.dominant_side()[cell] == side as i16
+        });
+        if !valid {
+            lat = city.lat;
+            lng = city.lng;
+        }
+        return world.grid_index(lat, lng).map(|cell| (lat, lng, cell));
+    }
+
+    let sample_step = territory
+        .total_cells()
+        .checked_div(500_000)
+        .unwrap_or(0)
+        .max(1);
+    let cells = (0..territory.total_cells())
+        .step_by(sample_step)
+        .filter(|&cell| {
+            territory.land()[cell] == 2
+                && territory.world_control()[cell] == country_id
+                && territory.dominant_side()[cell] == side as i16
+        })
+        .collect::<Vec<_>>();
+    if cells.is_empty() {
+        return None;
+    }
+    let selected = ((rng.next_f64() * cells.len() as f64).floor() as usize).min(cells.len() - 1);
+    let cell = cells[selected];
+    let (lat, lng) = recruit_cell_center(cell, scenario.grid);
+    Some((lat, lng, cell))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_recruitment(
+    next_tick: u64,
+    next_frame: u64,
+    simulation: &Simulation,
+    scenario: &ScenarioProduction,
+    territory: &TerritoryControl,
+    territory_snapshot: &TerritorySnapshot,
+    strategic: &StrategicSimulation,
+    side_dynamics: Option<&BTreeMap<usize, SideDynamics>>,
+    reinforcement: &mut ReinforcementState,
+    personnel_reserves: &mut BTreeMap<usize, f64>,
+    rng: &mut GameplayRng,
+    config: ProductionConfig,
+    battlefield: Option<&BattlefieldRuntimeState>,
+) -> Result<StagedRecruitment, RuntimeError> {
+    let mut staged = StagedRecruitment::default();
+    let maximum_live_id = simulation
+        .units
+        .iter()
+        .map(|unit| unit.combat.id)
+        .max()
+        .unwrap_or(0);
+    if reinforcement.next_unit_id <= maximum_live_id {
+        return Err(RuntimeError::InvalidCheckpoint(
+            "reinforcement next unit ID does not exceed live units",
+        ));
+    }
+
+    let aggregates = territory_snapshot
+        .countries
+        .iter()
+        .map(|country| (country.country_id, country))
+        .collect::<BTreeMap<_, _>>();
+    let mut country_strength = BTreeMap::<u16, f64>::new();
+    let mut side_unit_count = BTreeMap::<usize, usize>::new();
+    for unit in &simulation.units {
+        let country_id = u16::try_from(unit.combat.sovereign)
+            .map_err(|_| RuntimeError::InvalidCheckpoint("invalid unit sovereign"))?;
+        *country_strength.entry(country_id).or_default() += formation_strength(&unit.combat);
+        *side_unit_count
+            .entry(unit.combat.side as usize)
+            .or_default() += 1;
+    }
+    let allies = territory.country_to_side().iter().fold(
+        BTreeMap::<usize, BTreeSet<u16>>::new(),
+        |mut by_side, (&country, &side)| {
+            by_side.entry(side).or_default().insert(country);
+            by_side
+        },
+    );
+    let capital_targets = scenario
+        .cities
+        .iter()
+        .filter(|city| {
+            city.capital
+                && city.owner_id > 0
+                && city.cell < territory.total_cells()
+                && territory.country_to_side().contains_key(&city.owner_id)
+        })
+        .map(|city| {
+            (
+                city.owner_id,
+                CommandHomeTarget {
+                    cell: city.cell,
+                    lat: city.lat,
+                    lng: city.lng,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let command_world = CommandWorld {
+        grid_resolution: territory.grid_resolution(),
+        width: territory.width(),
+        height: territory.height(),
+        land: territory.land(),
+        world_control: territory.world_control(),
+        dominant_side: territory.dominant_side(),
+        country_side: territory.country_to_side(),
+        capital_targets: &capital_targets,
+    };
+    let mut available_treasury = strategic
+        .economies()
+        .iter()
+        .map(|(&country, economy)| (country, economy.treasury))
+        .collect::<BTreeMap<_, _>>();
+    let mut costs = BTreeMap::<u16, f64>::new();
+    let mut countries = territory
+        .country_to_side()
+        .iter()
+        .map(|(&country, &side)| (side, country))
+        .collect::<Vec<_>>();
+    countries.sort_unstable();
+
+    for (side, country_id) in countries {
+        let Some(aggregate) = aggregates.get(&country_id) else {
+            continue;
+        };
+        let Some(country) = scenario
+            .countries
+            .iter()
+            .find(|country| country.country_id == country_id)
+        else {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "recruitment country is absent from production",
+            ));
+        };
+        let Some(economy) = strategic.economies().get(&country_id) else {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "recruitment country has no economy",
+            ));
+        };
+        if economy.capitulated {
+            continue;
+        }
+        let current_units = country_strength.get(&country_id).copied().unwrap_or(0.0);
+        let current_land = aggregate.controlled as f64;
+        let initial_land = f64::from(country.initial_core_cells.max(1));
+        let city_count = scenario
+            .cities
+            .iter()
+            .filter(|city| city.owner_id == country_id)
+            .count() as f64;
+        let size_factor = (current_land / 2_000.0).max(1.0);
+        let density_scale = 1.0 / size_factor.powf(0.35);
+        let land_city_multiplier = 1.0 + city_count * 0.12;
+        let land_cap = (current_land
+            * config.unit_density_factor
+            * 1.5
+            * density_scale
+            * land_city_multiplier)
+            .floor()
+            .max(8.0);
+        let flexible_limit = f64::from(config.max_units_per_side)
+            * (1.0 + (current_land / 4_000.0 + city_count * 0.15).min(3.0));
+        let supply_failed = !economy.capital_held;
+        let mut absolute_cap = land_cap.min(flexible_limit);
+        if supply_failed {
+            absolute_cap = (absolute_cap * 0.3).floor().max(15.0);
+        }
+        let reserve = personnel_reserves.get(&side).copied().unwrap_or(0.0);
+        let reserve_equivalents = if reserve > 0.0 {
+            (reserve / PERSONNEL_PER_FORMATION).ceil()
+        } else {
+            0.0
+        };
+        if reserve_equivalents == 0.0 {
+            absolute_cap = 0.0;
+        } else {
+            absolute_cap = absolute_cap.min(current_units + reserve_equivalents);
+        }
+        if current_units >= absolute_cap {
+            continue;
+        }
+
+        let control_ratio = current_land / initial_land;
+        let city_bonus = 0.5 + city_count * 0.5;
+        let scale_factor = (current_land / 2_000.0).powf(0.4).max(0.8);
+        let underdog = if control_ratio < 0.4 {
+            (0.4 - control_ratio) * 2.0
+        } else {
+            0.0
+        };
+        let annexation_multiplier = if control_ratio < 0.6 {
+            1.0 + (0.6 - control_ratio) * 4.0
+        } else {
+            1.0
+        };
+        let early_multiplier = if next_frame < EARLY_RECRUIT_TICKS {
+            1.0 + (EARLY_RECRUIT_MULTIPLIER - 1.0)
+                * (1.0 - next_frame as f64 / EARLY_RECRUIT_TICKS as f64)
+        } else {
+            1.0
+        };
+        let cap_fill = 1.0 + (1.0 - (current_units / absolute_cap.max(1.0)).min(1.0)) * 3.0;
+        let phase = side_dynamics
+            .and_then(|states| states.get(&side))
+            .map_or(WarPhase::Stalemate, |state| state.phase);
+        let phase_multiplier = match phase {
+            WarPhase::Collapsing => 5.0,
+            WarPhase::Retreating => 3.0,
+            WarPhase::Advancing | WarPhase::Stalemate => 1.0,
+        };
+        let manpower_multiplier = if supply_failed {
+            let ratio = side_dynamics
+                .and_then(|states| states.get(&side))
+                .filter(|state| state.initial_personnel > 0.0)
+                .map_or(1.0, |state| {
+                    (state.current_personnel / state.initial_personnel * 2.0).clamp(0.0, 1.0)
+                });
+            0.1 * ratio
+        } else {
+            1.0
+        };
+        let recruitment_chance = (BASE_RECRUITMENT_CHANCE
+            * scale_factor
+            * (control_ratio + city_bonus + underdog)
+            * annexation_multiplier
+            * early_multiplier
+            * cap_fill
+            * phase_multiplier
+            * manpower_multiplier)
+            .min(0.8);
+        let attempts = if phase == WarPhase::Collapsing && current_units < absolute_cap * 0.3 {
+            5
+        } else if phase == WarPhase::Retreating && current_units < absolute_cap * 0.5 {
+            3
+        } else {
+            1
+        };
+
+        for _ in 0..attempts {
+            if rng.next_f64() >= recruitment_chance {
+                continue;
+            }
+            let recruited_personnel = if supply_failed { 400_u64 } else { 1_000_u64 };
+            let treasury = available_treasury.entry(country_id).or_default();
+            let reserve = personnel_reserves.entry(side).or_default();
+            if economy.arrears_cycles >= 1.0
+                || *treasury < RECRUITMENT_COST
+                || *reserve < recruited_personnel as f64
+                || side_unit_count.get(&side).copied().unwrap_or(0)
+                    >= config.max_units_per_side as usize
+            {
+                continue;
+            }
+            let Some((lat, lng, cell)) =
+                recruitment_spawn_cell(country_id, side, supply_failed, scenario, territory, rng)
+            else {
+                continue;
+            };
+            let mountain = battlefield.is_some_and(|state| {
+                state.mountains_enabled
+                    && state
+                        .terrain_intensity
+                        .get(cell)
+                        .is_some_and(|intensity| *intensity > 0.35)
+            });
+            let is_alpenjager = mountain && rng.next_f64() < 0.4;
+            let browser_unit_seed = rng.next_f64();
+            let unit_id = reinforcement.next_unit_id;
+            reinforcement.next_unit_id = reinforcement
+                .next_unit_id
+                .checked_add(1)
+                .ok_or(ReinforcementError::Overflow("land unit ID"))?;
+            let health = if supply_failed {
+                UNIT_HEALTH * 0.4
+            } else {
+                UNIT_HEALTH
+            };
+            staged.units.push(SimulationUnit {
+                combat: CombatUnit {
+                    id: unit_id,
+                    side: side as u64,
+                    sovereign: u64::from(country_id),
+                    kind: UnitKind::Army,
+                    lat,
+                    lng,
+                    health,
+                    max_health: UNIT_HEALTH,
+                    personnel: recruited_personnel,
+                    personnel_capacity: 1_000,
+                    equipment: 0,
+                    max_equipment: 0,
+                    quality: 50.0,
+                    transport: false,
+                    armor_supported: false,
+                    landing_penalty_active: false,
+                    at_sea: false,
+                    last_combat_tick: 0,
+                    victory_boost_ticks: 0,
+                },
+                dir_lat: 0.0,
+                dir_lng: 0.0,
+                coast_stuck_ticks: 0,
+                armor_landing_penalty_until_tick: 0,
+                is_support: false,
+                ally_weight: 1.0,
+            });
+            let discipline = browser_discipline(browser_unit_seed, country_id);
+            let resolved = resolve_command_policy(
+                CommandUnitState {
+                    id: unit_id,
+                    sovereign_id: country_id,
+                    side,
+                    discipline,
+                },
+                economy.command_band,
+                command_world,
+            )?;
+            let mut policy = RuntimeUnitPolicy::standard(unit_id, country_id);
+            policy.ai.deploy_until_tick = next_tick
+                .checked_add(RECRUIT_DEPLOY_TICKS)
+                .ok_or(RuntimeError::ClockOverflow)?;
+            let influence = policy
+                .influence
+                .as_mut()
+                .expect("standard recruitment policy has influence");
+            influence.browser_temporal_seed = Some(browser_unit_seed);
+            influence.owner_ally_country_ids = allies.get(&side).cloned().unwrap_or_default();
+            policy.command = UnitCommandPolicy {
+                band: resolved.band,
+                discipline: resolved.discipline,
+                refuses_offense: resolved.refuses_offense,
+                return_home: resolved.return_home,
+                self_defense_only: resolved.self_defense_only,
+                home_target: resolved.home_target,
+                transition_cycle: strategic.cycle(),
+            };
+            staged.policies.push(policy);
+            staged.battlefield_units.insert(
+                unit_id,
+                BattlefieldUnitState {
+                    is_alpenjager,
+                    cohesion_seed: browser_unit_seed,
+                    ..BattlefieldUnitState::default()
+                },
+            );
+            *treasury -= RECRUITMENT_COST;
+            *reserve -= recruited_personnel as f64;
+            *costs.entry(country_id).or_default() += RECRUITMENT_COST;
+            *side_unit_count.entry(side).or_default() += 1;
+            staged.counters.recruited_units += 1;
+            staged.counters.recruited_personnel = staged
+                .counters
+                .recruited_personnel
+                .saturating_add(recruited_personnel);
+        }
+    }
+    staged.treasury_costs = costs.into_iter().collect();
+    Ok(staged)
 }
 
 fn operational_unit_inputs(
@@ -2205,6 +2699,63 @@ impl NativeRuntime {
                 ));
             }
         }
+        if checkpoint.reinforcement.is_none()
+            && let Some(air_power) = checkpoint.air_power.as_ref()
+        {
+            let next_unit_id = checkpoint
+                .simulation
+                .units
+                .iter()
+                .map(|unit| unit.combat.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(RuntimeError::InvalidCheckpoint(
+                    "unit ID allocator overflowed",
+                ))?;
+            let next_air_wing_id = air_power
+                .wings
+                .iter()
+                .map(|wing| wing.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(RuntimeError::InvalidCheckpoint(
+                    "air-wing ID allocator overflowed",
+                ))?;
+            checkpoint.reinforcement = Some(bootstrap_reinforcement_state(
+                air_power,
+                next_unit_id,
+                next_air_wing_id,
+                checkpoint.territory.country_to_side(),
+                checkpoint.territory.max_sides(),
+            )?);
+        }
+        match (&checkpoint.reinforcement, &checkpoint.air_power) {
+            (Some(reinforcement), Some(air_power)) => {
+                reinforcement.validate(
+                    air_power,
+                    checkpoint.territory.country_to_side(),
+                    checkpoint.territory.max_sides(),
+                )?;
+                if checkpoint
+                    .simulation
+                    .units
+                    .iter()
+                    .any(|unit| unit.combat.id >= reinforcement.next_unit_id)
+                {
+                    return Err(RuntimeError::InvalidCheckpoint(
+                        "next formation ID must exceed every issued live ID",
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(RuntimeError::InvalidCheckpoint(
+                    "reinforcement state requires air power",
+                ));
+            }
+            (None, _) => {}
+        }
         if let Some(operations) = &checkpoint.operations {
             let live_units = checkpoint
                 .simulation
@@ -2397,6 +2948,10 @@ impl NativeRuntime {
             casualties_by_victim: Arc::new(checkpoint.casualties_by_victim.clone()),
             gameplay_rng_state: checkpoint.gameplay_rng,
             personnel_reserves: Arc::new(checkpoint.personnel_reserves.clone()),
+            reinforcement_snapshot: checkpoint
+                .reinforcement
+                .as_ref()
+                .map(|reinforcement| Arc::new(reinforcement.clone())),
         });
 
         Ok(Self {
@@ -2428,6 +2983,7 @@ impl NativeRuntime {
             naval_route_workspace,
             operational_execution: checkpoint.operational_execution,
             air_power: checkpoint.air_power,
+            reinforcement: checkpoint.reinforcement,
             state: initial_state,
             latest,
             render_updates,
@@ -2522,6 +3078,7 @@ impl NativeRuntime {
             naval_planning: self.naval_planning.clone(),
             operational_execution: self.operational_execution.clone(),
             air_power: self.air_power.clone(),
+            reinforcement: self.reinforcement.clone(),
         })
     }
 
@@ -3090,6 +3647,8 @@ impl NativeRuntime {
         let mut staged_naval_planning = self.naval_planning.clone();
         let mut staged_operational_execution = self.operational_execution.clone();
         let mut staged_air_power = self.air_power.clone();
+        let mut staged_reinforcement = self.reinforcement.clone();
+        let mut staged_strategic = self.strategic.clone();
         let mut staged_gameplay_rng = self.gameplay_rng;
         let mut staged_personnel_reserves = self.personnel_reserves.clone();
         let air_wing_sovereign_by_id = staged_air_power
@@ -3149,7 +3708,7 @@ impl NativeRuntime {
             .into_iter()
             .collect::<Vec<_>>();
         let dynamic_influence = self.territory.has_influence_runtime();
-        let staged_battlefield = if let Some(pre_stage) = pre_influence_battlefield {
+        let mut staged_battlefield = if let Some(pre_stage) = pre_influence_battlefield {
             let (sources, schedule) = if dynamic_influence {
                 let (sources, schedule) = browser_influence_sources(
                     &self.simulation.units,
@@ -3277,7 +3836,7 @@ impl NativeRuntime {
             } else {
                 BTreeMap::new()
             };
-            let (command_bands, coverage) = air_country_policy(&self.strategic, air_power);
+            let (command_bands, coverage) = air_country_policy(&staged_strategic, air_power);
             let outcome = rollback_try!(air_power.advance(AirWorldInput {
                 tick: next_tick,
                 side_count: self.territory.max_sides(),
@@ -3993,12 +4552,13 @@ impl NativeRuntime {
             self.config.census_flush_chunk,
             strategic_due,
         );
-        let mut strategic_snapshot = self.strategic.latest_snapshot();
+        let mut strategic_snapshot = staged_strategic.latest_snapshot();
         let mut strategic_counters = None;
         let mut derivation_counters = None;
         let mut next_state = RuntimeState::Running;
         let mut strategic_fronts_invalidated = false;
         let mut staged_command_policies = None;
+        let mut reinforcement_counters = RuntimeReinforcementCounters::default();
         if strategic_due {
             let derived = match derive_production_input(
                 next_tick,
@@ -4007,7 +4567,7 @@ impl NativeRuntime {
                 &territory_snapshot,
                 &frame_snapshot,
                 &self.diplomacy,
-                &self.strategic,
+                &staged_strategic,
                 &next_casualties,
                 &self.config.production,
             ) {
@@ -4028,7 +4588,7 @@ impl NativeRuntime {
             counters.active_sides = strategic_input.active_sides.len();
             counters.hostile_pairs = strategic_input.active_hostile_pairs.len();
             derivation_counters = Some(counters);
-            let mut prepared = match self.strategic.prepare_cycle(&strategic_input) {
+            let mut prepared = match staged_strategic.prepare_cycle(&strategic_input) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     self.state = RuntimeState::Poisoned;
@@ -4057,7 +4617,7 @@ impl NativeRuntime {
                     return Err(error);
                 }
             };
-            let (published, counters) = match self.strategic.commit_cycle(prepared) {
+            let (published, counters) = match staged_strategic.commit_cycle(prepared) {
                 Ok(result) => result,
                 Err(error) => {
                     self.state = RuntimeState::Poisoned;
@@ -4099,6 +4659,36 @@ impl NativeRuntime {
             next_state = effects.state;
             strategic_snapshot = Some(published);
             strategic_counters = Some(counters);
+
+            if let (Some(reinforcement), Some(air_power)) =
+                (&mut staged_reinforcement, &mut staged_air_power)
+            {
+                let treasury_before = staged_strategic
+                    .economies()
+                    .iter()
+                    .map(|(&country, economy)| (country, economy.treasury))
+                    .collect::<BTreeMap<_, _>>();
+                let mut air_economies = staged_strategic.economies().clone();
+                let outcome = reinforcement.settle_air_pay_cycle(
+                    air_power,
+                    &mut air_economies,
+                    &mut staged_personnel_reserves,
+                    self.territory.country_to_side(),
+                    self.territory.max_sides(),
+                )?;
+                let air_costs = air_economies
+                    .iter()
+                    .filter_map(|(&country, economy)| {
+                        let spent = treasury_before[&country] - economy.treasury;
+                        (spent > 0.0).then_some((country, spent))
+                    })
+                    .collect::<Vec<_>>();
+                if !air_costs.is_empty() {
+                    staged_strategic.spend_treasury_batch(&air_costs)?;
+                }
+                reinforcement_counters = air_pay_cycle_counters(&outcome);
+                strategic_snapshot = staged_strategic.latest_snapshot();
+            }
         }
 
         if let Some(operations) = &mut staged_operations {
@@ -4168,6 +4758,47 @@ impl NativeRuntime {
             }
         }
 
+        // Browser recruitment runs after the current tactical simulation. New formations are
+        // published immediately but remain deployment-inactive and enter planning next tick.
+        let staged_recruitment = if matches!(next_state, RuntimeState::Running) {
+            if let Some(reinforcement) = &mut staged_reinforcement {
+                stage_recruitment(
+                    next_tick,
+                    next_frame,
+                    &self.simulation,
+                    &self.scenario,
+                    &self.territory,
+                    &territory_snapshot,
+                    &staged_strategic,
+                    staged_side_dynamics.as_ref(),
+                    reinforcement,
+                    &mut staged_personnel_reserves,
+                    &mut staged_gameplay_rng,
+                    self.config.production,
+                    self.battlefield.as_ref(),
+                )?
+            } else {
+                StagedRecruitment::default()
+            }
+        } else {
+            StagedRecruitment::default()
+        };
+        if !staged_recruitment.treasury_costs.is_empty() {
+            staged_strategic.spend_recruitment_batch(&staged_recruitment.treasury_costs)?;
+            strategic_snapshot = staged_strategic.latest_snapshot();
+        }
+        if !staged_recruitment.units.is_empty() {
+            self.simulation
+                .insert_units_atomic(staged_recruitment.units.clone())?;
+            frame_snapshot.units = self
+                .simulation
+                .initial_snapshot(next_tick, next_frame)
+                .units;
+        }
+        reinforcement_counters.recruited_units = staged_recruitment.counters.recruited_units;
+        reinforcement_counters.recruited_personnel =
+            staged_recruitment.counters.recruited_personnel;
+
         let attrition_counters = attrition_counters(
             attrition_outcome.as_ref(),
             staged_battlefield.as_ref(),
@@ -4179,6 +4810,28 @@ impl NativeRuntime {
             staged_operational_execution.as_ref(),
         );
         let mut next_prior = assignments_by_unit(&planning.assignments);
+        if let Some(stage) = &mut staged_battlefield {
+            for policy in &staged_recruitment.policies {
+                stage.policies.insert(policy.unit_id, policy.clone());
+            }
+            stage.next_unit_state.extend(
+                staged_recruitment
+                    .battlefield_units
+                    .iter()
+                    .map(|(&unit_id, &state)| (unit_id, state)),
+            );
+        } else {
+            for policy in &staged_recruitment.policies {
+                self.unit_policies.insert(policy.unit_id, policy.clone());
+            }
+        }
+        self.unit_sovereign_by_id.extend(
+            staged_recruitment
+                .units
+                .iter()
+                .map(|unit| (unit.combat.id, unit.combat.sovereign as u16)),
+        );
+        self.unit_sovereign_by_id.sort_unstable();
         let surviving_ids = frame_snapshot
             .units
             .iter()
@@ -4233,6 +4886,8 @@ impl NativeRuntime {
         self.naval_planning = staged_naval_planning;
         self.operational_execution = staged_operational_execution;
         self.air_power = staged_air_power;
+        self.reinforcement = staged_reinforcement;
+        self.strategic = staged_strategic;
         self.gameplay_rng = staged_gameplay_rng;
         self.personnel_reserves = staged_personnel_reserves;
         self.tick = next_tick;
@@ -4272,6 +4927,7 @@ impl NativeRuntime {
             ai: planning.counters,
             simulation: simulation_counters,
             air: air_counters(air_outcome.as_ref(), air_damage_outcome.as_ref()),
+            reinforcement: reinforcement_counters,
             naval_planning: naval_planning_counters,
             operational_execution: execution_outcome
                 .as_ref()
@@ -4311,6 +4967,10 @@ impl NativeRuntime {
             casualties_by_victim: Arc::new(self.casualties_by_victim.clone()),
             gameplay_rng_state: self.gameplay_rng.state(),
             personnel_reserves: Arc::new(self.personnel_reserves.clone()),
+            reinforcement_snapshot: self
+                .reinforcement
+                .as_ref()
+                .map(|reinforcement| Arc::new(reinforcement.clone())),
         });
         self.latest = published.clone();
         Ok(published)
@@ -5324,6 +5984,7 @@ mod tests {
                 naval_planning: None,
                 operational_execution: None,
                 air_power: None,
+                reinforcement: None,
             },
         )
         .unwrap()
@@ -5363,6 +6024,7 @@ mod tests {
             naval_planning: state.naval_planning,
             operational_execution: state.operational_execution,
             air_power: state.air_power,
+            reinforcement: state.reinforcement,
         }
     }
 
@@ -5577,6 +6239,152 @@ mod tests {
         air_power.validate().unwrap();
         captured.air_power = Some(air_power);
         NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap()
+    }
+
+    #[test]
+    fn recruitment_consumes_reserve_rng_and_treasury_in_browser_order() {
+        let runtime = fixture(0, false);
+        let mut air_power = AirPowerState::empty();
+        air_power.country_coverage = vec![
+            AirCountryCoverage {
+                country_id: 1,
+                operations_coverage: 1.0,
+            },
+            AirCountryCoverage {
+                country_id: 2,
+                operations_coverage: 1.0,
+            },
+        ];
+        let mut reinforcement =
+            ReinforcementState::bootstrap(&air_power, 3, 1, runtime.territory.country_to_side(), 2)
+                .unwrap();
+        let mut reserves = BTreeMap::from([(0, 1_000.0), (1, 0.0)]);
+        let mut rng = GameplayRng::new(7);
+
+        let staged = stage_recruitment(
+            1,
+            1,
+            &runtime.simulation,
+            &runtime.scenario,
+            &runtime.territory,
+            &runtime.latest.territory_snapshot,
+            &runtime.strategic,
+            None,
+            &mut reinforcement,
+            &mut reserves,
+            &mut rng,
+            runtime.config.production,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(staged.counters.recruited_units, 1);
+        assert_eq!(staged.counters.recruited_personnel, 1_000);
+        assert_eq!(staged.treasury_costs, vec![(1, RECRUITMENT_COST)]);
+        assert_eq!(staged.units[0].combat.id, 3);
+        assert_eq!(staged.units[0].combat.sovereign, 1);
+        assert_eq!(staged.policies[0].ai.deploy_until_tick, 31);
+        assert!(
+            staged.policies[0]
+                .influence
+                .as_ref()
+                .unwrap()
+                .browser_temporal_seed
+                .is_some()
+        );
+        assert_eq!(reinforcement.next_unit_id, 4);
+        assert_eq!(reserves[&0], 0.0);
+        // Chance, fallback-cell selection, and browser identity seed. No mountain draw exists.
+        assert_eq!(
+            rng.state().state,
+            7_u32.wrapping_add(0x6d2b_79f5_u32.wrapping_mul(3))
+        );
+    }
+
+    #[test]
+    fn pay_cycle_reinforcement_snapshot_and_next_tick_resume_exactly() {
+        let mut uninterrupted = with_air_and_execution(fixture(599, false));
+        let pay_snapshot = uninterrupted.step().unwrap();
+        let old_reinforcement = pay_snapshot.reinforcement_snapshot.clone().unwrap();
+        assert_eq!(old_reinforcement.countries[0].air_operations_due, 1.5);
+        assert!(old_reinforcement.countries[0].operations_coverage > 0.0);
+
+        let split = uninterrupted.checkpoint_state().unwrap();
+        assert_eq!(split.reinforcement.as_ref(), Some(&*old_reinforcement));
+        let mut restored =
+            NativeRuntime::new(split.runtime_config, runtime_checkpoint(split)).unwrap();
+        let expected = uninterrupted.step().unwrap();
+        let actual = restored.step().unwrap();
+
+        assert_eq!(actual.frame_snapshot, expected.frame_snapshot);
+        assert_eq!(actual.air_power_snapshot, expected.air_power_snapshot);
+        assert_eq!(
+            actual.reinforcement_snapshot,
+            expected.reinforcement_snapshot
+        );
+        assert_eq!(actual.personnel_reserves, expected.personnel_reserves);
+        assert_eq!(actual.gameplay_rng_state, expected.gameplay_rng_state);
+        let expected_state = uninterrupted.checkpoint_state().unwrap();
+        let actual_state = restored.checkpoint_state().unwrap();
+        assert_eq!(actual_state.strategic_cycle, expected_state.strategic_cycle);
+        assert_eq!(actual_state.economies, expected_state.economies);
+        assert_eq!(actual_state.occupations, expected_state.occupations);
+        assert_eq!(old_reinforcement.countries[0].air_operations_due, 1.5);
+    }
+
+    #[test]
+    fn recruited_units_publish_immutable_renderer_snapshots_and_checkpoint_cursor() {
+        let mut runtime = with_air_and_execution(fixture(0, false));
+        runtime.personnel_reserves.insert(0, 1_000.0);
+        runtime.gameplay_rng = GameplayRng::new(7);
+        let before = runtime.latest_snapshot();
+
+        let recruited = runtime.step().unwrap();
+        assert_eq!(recruited.counters.reinforcement.recruited_units, 1);
+        assert_eq!(recruited.counters.reinforcement.recruited_personnel, 1_000);
+        assert_eq!(before.frame_snapshot.units.len(), 2);
+        assert_eq!(recruited.frame_snapshot.units.len(), 3);
+        assert_eq!(recruited.frame_snapshot.units[2].id, 3);
+        assert_eq!(recruited.personnel_reserves[&0], 0.0);
+        assert_eq!(
+            recruited
+                .reinforcement_snapshot
+                .as_ref()
+                .unwrap()
+                .next_unit_id,
+            4
+        );
+
+        let checkpoint = runtime.checkpoint_state().unwrap();
+        assert_eq!(checkpoint.units.last().unwrap().combat.id, 3);
+        assert_eq!(checkpoint.reinforcement.unwrap().next_unit_id, 4);
+        assert_eq!(before.frame_snapshot.units.len(), 2);
+    }
+
+    #[test]
+    fn failed_preplanning_tick_preserves_reinforcement_transaction_and_publication() {
+        let mut runtime = with_air_and_execution(fixture(0, false));
+        runtime.personnel_reserves.insert(0, 1_000.0);
+        runtime.gameplay_rng = GameplayRng::new(7);
+        let published = runtime.latest_snapshot();
+        let strategic_cycle = runtime.strategic.cycle();
+        let economies = runtime.strategic.economies().clone();
+        let occupations = runtime.strategic.occupations().clone();
+        let air_power = runtime.air_power.clone();
+        let reinforcement = runtime.reinforcement.clone();
+        let reserves = runtime.personnel_reserves.clone();
+        let rng = runtime.gameplay_rng.state();
+        runtime.config.front.max_grid_cells = 0;
+
+        assert!(matches!(runtime.step(), Err(RuntimeError::Front(_))));
+        assert_eq!(runtime.strategic.cycle(), strategic_cycle);
+        assert_eq!(runtime.strategic.economies(), &economies);
+        assert_eq!(runtime.strategic.occupations(), &occupations);
+        assert_eq!(runtime.air_power, air_power);
+        assert_eq!(runtime.reinforcement, reinforcement);
+        assert_eq!(runtime.personnel_reserves, reserves);
+        assert_eq!(runtime.gameplay_rng.state(), rng);
+        assert!(Arc::ptr_eq(&runtime.latest_snapshot(), &published));
     }
 
     #[test]

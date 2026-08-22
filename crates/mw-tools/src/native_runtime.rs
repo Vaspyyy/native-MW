@@ -28,13 +28,13 @@ use mw_core::{
     GAMEPLAY_RNG_ALGORITHM, GAMEPLAY_RNG_SCHEMA_VERSION, GameplayRngState, GridSpec,
     NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime, NavalPlanningState, OccupationState,
     OperationalExecutionState, OperationalRuntimeState, PAYROLL_PER_UNIT, ProductionConfig,
-    ResolvedCombatModifiers, ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig,
-    RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES,
-    ScenarioProduction, Simulation, SimulationConfig, SimulationUnit, StrategicSimulation,
-    TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState, TerritoryConfig,
-    TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
-    UnitKind, WorldGridView, browser_discipline, command_refusal_share, decode_mwsc_gzip,
-    derive_scenario_production,
+    ReinforcementState, ResolvedCombatModifiers, ResolvedMovementModifiers, RuntimeCheckpoint,
+    RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy,
+    STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
+    StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState,
+    TerritoryConfig, TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitCommandPolicy,
+    UnitInfluencePolicy, UnitKind, WorldGridView, browser_discipline, command_refusal_share,
+    decode_mwsc_gzip, derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -48,6 +48,7 @@ pub const NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA: &str = "native-runtime-checkpoint
 pub const NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA: &str = "native-runtime-checkpoint-v7";
 pub const NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA: &str = "native-runtime-checkpoint-v8";
 pub const NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA: &str = "native-runtime-checkpoint-v9";
+pub const NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA: &str = "native-runtime-checkpoint-v10";
 pub const NATIVE_SIDE_DYNAMICS_SCHEMA: &str = "native-side-dynamics-v1";
 pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
 
@@ -366,7 +367,7 @@ pub fn write_runtime_checkpoint_state_v7(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_v8_or_v9(
+    write_runtime_checkpoint_state_v7_v8_v9_or_v10(
         scenario_path,
         baseline,
         state,
@@ -384,7 +385,7 @@ pub fn write_runtime_checkpoint_state_v8(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_v8_or_v9(
+    write_runtime_checkpoint_state_v7_v8_v9_or_v10(
         scenario_path,
         baseline,
         state,
@@ -402,7 +403,7 @@ pub fn write_runtime_checkpoint_state_v9(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_v8_or_v9(
+    write_runtime_checkpoint_state_v7_v8_v9_or_v10(
         scenario_path,
         baseline,
         state,
@@ -412,7 +413,25 @@ pub fn write_runtime_checkpoint_state_v9(
     )
 }
 
-fn write_runtime_checkpoint_state_v7_v8_or_v9(
+/// Serialize a v10 checkpoint with persistent reinforcement and logistics state.
+pub fn write_runtime_checkpoint_state_v10(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    write_runtime_checkpoint_state_v7_v8_v9_or_v10(
+        scenario_path,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA,
+    )
+}
+
+fn write_runtime_checkpoint_state_v7_v8_v9_or_v10(
     scenario_path: &Path,
     baseline: &DecodedScenario,
     state: &mw_core::NativeRuntimeCheckpointState,
@@ -854,7 +873,9 @@ fn write_runtime_checkpoint_state_with_hash(
         let mut battlefield = serde_json::to_value(battlefield)?;
         if !matches!(
             schema,
-            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
         ) && let Some(units) = battlefield.get_mut("units").and_then(Value::as_array_mut)
         {
             for unit in units {
@@ -912,7 +933,10 @@ fn write_runtime_checkpoint_state_with_hash(
                 serde_json::to_value(naval_planning)?,
             );
     }
-    if schema == NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA {
+    if matches!(
+        schema,
+        NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
+    ) {
         if state.personnel_reserves.len() != state.territory_config.max_sides {
             bail!("personnel reserves must exactly cover every stable side");
         }
@@ -942,6 +966,29 @@ fn write_runtime_checkpoint_state_with_hash(
         );
         object.insert("personnelReserves".to_owned(), json!(reserves));
     }
+    if schema == NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA {
+        let reinforcement = state
+            .reinforcement
+            .as_ref()
+            .context("checkpoint-v10 writer requires reinforcement state")?;
+        let air_power = state
+            .air_power
+            .as_ref()
+            .context("checkpoint-v10 writer requires air power state")?;
+        reinforcement
+            .validate(
+                air_power,
+                &state.territory_config.country_to_side,
+                state.territory_config.max_sides,
+            )
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert(
+                "reinforcement".to_owned(),
+                serde_json::to_value(reinforcement)?,
+            );
+    }
     if matches!(
         schema,
         NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
@@ -949,6 +996,7 @@ fn write_runtime_checkpoint_state_with_hash(
             | NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
     ) {
         validate_checkpoint_v5_required_nullable_fields(&body)
             .context("checkpoint writer omitted required nullable operational fields")?;
@@ -1172,7 +1220,9 @@ fn validate_checkpoint_v8_supply_collapse_fields(checkpoint: &Value) -> Result<(
         let present = object.contains_key("supplyCollapsedTick");
         if matches!(
             schema,
-            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
         ) && !present
         {
             bail!(
@@ -1181,7 +1231,9 @@ fn validate_checkpoint_v8_supply_collapse_fields(checkpoint: &Value) -> Result<(
         }
         if !matches!(
             schema,
-            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
         ) && present
         {
             bail!("{schema} cannot contain checkpoint-v8 battlefield supplyCollapse history");
@@ -1888,6 +1940,8 @@ struct RuntimeCheckpointFixture {
     gameplay_rng: Option<GameplayRngFixture>,
     #[serde(default)]
     personnel_reserves: Option<Vec<f64>>,
+    #[serde(default)]
+    reinforcement: Option<ReinforcementState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2755,11 +2809,12 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
                 | NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
         )
     ) {
         validate_checkpoint_v5_required_nullable_fields(&checkpoint_value).with_context(|| {
             format!(
-                "failed to validate required v5-v9 operational fields in {}",
+                "failed to validate required v5-v10 operational fields in {}",
                 checkpoint_path.display()
             )
         })?;
@@ -2903,6 +2958,14 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
             .context("naval planning checkpoint requires operational execution state")?;
         naval_planning
             .validate_with_execution(checkpoint.sides.len(), execution)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    if let Some(reinforcement) = checkpoint.reinforcement.as_ref() {
+        let air_power = air_power
+            .as_ref()
+            .context("reinforcement checkpoint requires air power state")?;
+        reinforcement
+            .validate(air_power, &country_to_side, checkpoint.sides.len())
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
 
@@ -3323,10 +3386,17 @@ fn validate_exact_geography_owner_ids(
 }
 
 fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()> {
-    if checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
-        && (checkpoint.gameplay_rng.is_some() || checkpoint.personnel_reserves.is_some())
+    if !matches!(
+        checkpoint.schema.as_str(),
+        NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
+    ) && (checkpoint.gameplay_rng.is_some() || checkpoint.personnel_reserves.is_some())
     {
         bail!("checkpoint-v1 through v8 cannot contain checkpoint-v9 replay state");
+    }
+    if checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
+        && checkpoint.reinforcement.is_some()
+    {
+        bail!("checkpoint-v1 through v9 cannot contain checkpoint-v10 reinforcement state");
     }
     match checkpoint.schema.as_str() {
         NATIVE_RUNTIME_CHECKPOINT_SCHEMA => {
@@ -3528,8 +3598,52 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 bail!("checkpoint-v9 strategicCycle must leave room for a later cycle");
             }
         }
+        NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+                || checkpoint.influence_runtime.is_none()
+                || checkpoint.side_dynamics.is_none()
+                || checkpoint.battlefield.is_none()
+                || checkpoint.operational_ai.is_none()
+                || checkpoint.operational_execution.is_none()
+                || checkpoint.air_power.is_none()
+                || checkpoint.naval_planning.is_none()
+            {
+                bail!("checkpoint-v10 requires all live runtime, replay, and reinforcement state");
+            }
+            let gameplay_rng = checkpoint
+                .gameplay_rng
+                .as_ref()
+                .context("checkpoint-v10 requires gameplayRng")?;
+            if gameplay_rng.schema != GAMEPLAY_RNG_SCHEMA_VERSION
+                || gameplay_rng.algorithm != GAMEPLAY_RNG_ALGORITHM
+            {
+                bail!("checkpoint-v10 gameplay RNG schema or algorithm is unsupported");
+            }
+            let reserves = checkpoint
+                .personnel_reserves
+                .as_ref()
+                .context("checkpoint-v10 requires personnelReserves")?;
+            if reserves.len() != checkpoint.sides.len()
+                || reserves
+                    .iter()
+                    .any(|value| !value.is_finite() || *value < 0.0)
+            {
+                bail!(
+                    "checkpoint-v10 personnelReserves must exactly cover sides with finite non-negative values"
+                );
+            }
+            checkpoint
+                .reinforcement
+                .as_ref()
+                .context("checkpoint-v10 requires reinforcement")?;
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v10 strategicCycle must leave room for a later cycle");
+            }
+        }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
@@ -3539,7 +3653,8 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -4346,6 +4461,7 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         operational_execution: prepared.operational_execution.clone(),
         air_power: prepared.air_power.clone(),
         naval_planning: prepared.naval_planning.clone(),
+        reinforcement: checkpoint.reinforcement.clone(),
     };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
@@ -4826,6 +4942,8 @@ struct CheckpointReport {
     gameplay_rng: Option<GameplayRngFixture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     personnel_reserves: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reinforcement: Option<ReinforcementState>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4871,6 +4989,7 @@ struct RuntimeProductionReport {
 impl PreparedRuntime {
     fn schema(&self) -> &'static str {
         match self.checkpoint.schema.as_str() {
+            NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
@@ -4964,6 +5083,7 @@ impl PreparedRuntime {
             casualties_by_victim: self.checkpoint.casualties_by_victim.clone(),
             gameplay_rng: self.checkpoint.gameplay_rng.clone(),
             personnel_reserves: self.checkpoint.personnel_reserves.clone(),
+            reinforcement: self.checkpoint.reinforcement.clone(),
         }
     }
 
@@ -5001,6 +5121,8 @@ struct RuntimeSnapshotReport {
     operational_execution: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     air_power: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reinforcement: Option<Value>,
     counters: Value,
     casualty_totals: BTreeMap<u16, f64>,
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
@@ -5257,6 +5379,11 @@ fn snapshot_report(
             .as_ref()
             .map(|air_power| serde_json::to_value(air_power.as_ref()))
             .transpose()?,
+        reinforcement: snapshot
+            .reinforcement_snapshot
+            .as_ref()
+            .map(|reinforcement| serde_json::to_value(reinforcement.as_ref()))
+            .transpose()?,
         counters: counters_json(snapshot),
         casualty_totals: snapshot.casualty_totals.as_ref().clone(),
         casualties_by_victim: snapshot.casualties_by_victim.as_ref().clone(),
@@ -5305,6 +5432,13 @@ fn counters_json(snapshot: &RuntimeSnapshot) -> Value {
             "supplyCollapses": counters.attrition.supply_collapses,
             "exiledUnits": counters.attrition.exiled_units,
             "recoveredPersonnel": counters.attrition.recovered_personnel,
+        },
+        "reinforcement": {
+            "recruitedUnits": counters.reinforcement.recruited_units,
+            "recruitedPersonnel": counters.reinforcement.recruited_personnel,
+            "aircraftPurchased": counters.reinforcement.aircraft_purchased,
+            "aircraftReinforced": counters.reinforcement.aircraft_reinforced,
+            "airWingsCreated": counters.reinforcement.air_wings_created,
         },
         "influence": {
             "sources": counters.influence.sources,
@@ -5466,6 +5600,9 @@ fn snapshot_checksum(snapshot: &RuntimeSnapshot) -> Result<String> {
     checksum.write_bytes(&serde_json::to_vec(snapshot.casualties_by_victim.as_ref())?);
     checksum.write_u64(u64::from(snapshot.gameplay_rng_state.state));
     checksum.write_bytes(&serde_json::to_vec(snapshot.personnel_reserves.as_ref())?);
+    checksum.write_bytes(&serde_json::to_vec(
+        &snapshot.reinforcement_snapshot.as_deref(),
+    )?);
     checksum.write_bytes(&serde_json::to_vec(&counters_json(snapshot))?);
     checksum.write_usize(snapshot.pending_render_updates);
     Ok(checksum.finish())
@@ -5830,6 +5967,7 @@ mod tests {
             naval_planning: None,
             gameplay_rng: None,
             personnel_reserves: None,
+            reinforcement: None,
         }
     }
 
@@ -5888,6 +6026,31 @@ mod tests {
             state: 0x4d57_5031,
         });
         checkpoint.personnel_reserves = Some(vec![125.0]);
+        checkpoint
+    }
+
+    fn valid_v10_checkpoint() -> RuntimeCheckpointFixture {
+        let mut checkpoint = valid_v9_checkpoint();
+        checkpoint.schema = NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA.to_owned();
+        checkpoint
+            .air_power
+            .as_mut()
+            .unwrap()
+            .country_coverage
+            .push(mw_core::AirCountryCoverage {
+                country_id: 1,
+                operations_coverage: 1.0,
+            });
+        checkpoint.reinforcement = Some(
+            ReinforcementState::bootstrap(
+                checkpoint.air_power.as_ref().unwrap(),
+                1,
+                1,
+                &BTreeMap::from([(1, 0)]),
+                1,
+            )
+            .unwrap(),
+        );
         checkpoint
     }
 
@@ -6480,6 +6643,41 @@ mod tests {
             "battlefield": {"units": [{"supplyCollapsedTick": null}]}
         });
         assert!(validate_checkpoint_v8_supply_collapse_fields(&v9_wire).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_v10_requires_reinforcement_and_v1_through_v9_forbid_it() {
+        let checkpoint = valid_v10_checkpoint();
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut missing_reinforcement = checkpoint.clone();
+        missing_reinforcement.reinforcement = None;
+        assert!(validate_checkpoint_shape(&missing_reinforcement).is_err());
+
+        for legacy_schema in [
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA,
+        ] {
+            let mut legacy = checkpoint.clone();
+            legacy.schema = legacy_schema.to_owned();
+            assert!(
+                validate_checkpoint_shape(&legacy).is_err(),
+                "{legacy_schema} accepted v10 reinforcement state"
+            );
+        }
+
+        let v10_wire = json!({
+            "schema": NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA,
+            "battlefield": {"units": [{"supplyCollapsedTick": null}]}
+        });
+        assert!(validate_checkpoint_v8_supply_collapse_fields(&v10_wire).is_ok());
     }
 
     #[test]

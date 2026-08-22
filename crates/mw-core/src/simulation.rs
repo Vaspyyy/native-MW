@@ -213,6 +213,11 @@ pub struct UnitRemovalOutcome {
     pub removed_ids: Arc<[u64]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitInsertionOutcome {
+    pub created_ids: Arc<[u64]>,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum SimulationError {
     #[error("invalid simulation config")]
@@ -410,6 +415,36 @@ impl Simulation {
         Ok(DamageOutcome {
             results: results.into(),
             removed_ids: removed_ids.into(),
+        })
+    }
+
+    /// Atomically append new formations in caller-provided order.
+    ///
+    /// The complete resulting unit set is validated before any simulation
+    /// state changes, so duplicate IDs, collisions with live units, and
+    /// invalid unit data cannot leak a partial insertion.
+    pub fn insert_units_atomic(
+        &mut self,
+        units: Vec<SimulationUnit>,
+    ) -> Result<UnitInsertionOutcome, SimulationError> {
+        let created_ids = units.iter().map(|unit| unit.combat.id).collect::<Vec<_>>();
+        let mut next = Vec::with_capacity(self.units.len().saturating_add(units.len()));
+        next.extend(self.units.iter().cloned());
+        next.extend(units);
+        validate_unit_slice(&next, None)?;
+
+        self.units = next;
+        self.rebuild_unit_index()?;
+        self.tactical_units.clear();
+        self.candidates.clear();
+        self.accepted.clear();
+        self.order_by_unit.clear();
+        self.events.clear();
+        self.removed.clear();
+        self.abandoned.clear();
+        self.latest = None;
+        Ok(UnitInsertionOutcome {
+            created_ids: created_ids.into(),
         })
     }
 
@@ -1780,5 +1815,59 @@ mod tests {
             Err(SimulationError::UnknownRemovalUnit(3))
         );
         assert_eq!(simulation.units, units);
+    }
+
+    #[test]
+    fn atomic_insertion_appends_in_input_order_and_reports_created_ids() {
+        let existing = vec![army(3, 0, 0.0, 0.0), army(1, 0, 0.0, 1.0)];
+        let inserted = vec![army(9, 1, 0.0, 2.0), army(4, 1, 0.0, 3.0)];
+        let mut simulation =
+            Simulation::new(SimulationConfig::default(), existing.clone()).unwrap();
+
+        let outcome = simulation.insert_units_atomic(inserted.clone()).unwrap();
+
+        assert_eq!(outcome.created_ids.as_ref(), &[9, 4]);
+        assert_eq!(
+            simulation
+                .units
+                .iter()
+                .map(|unit| unit.combat.id)
+                .collect::<Vec<_>>(),
+            [3, 1, 9, 4]
+        );
+        assert_eq!(&simulation.units[..existing.len()], existing.as_slice());
+        assert_eq!(&simulation.units[existing.len()..], inserted.as_slice());
+        assert_eq!(simulation.unit_index_by_id.get(&9), Some(&2));
+        assert_eq!(simulation.unit_index_by_id.get(&4), Some(&3));
+    }
+
+    #[test]
+    fn invalid_atomic_insertion_rolls_back_collisions_and_unit_data() {
+        let units = vec![army(1, 0, 0.0, 0.0), army(2, 1, 0.0, 1.0)];
+        let mut simulation = Simulation::new(SimulationConfig::default(), units.clone()).unwrap();
+        let before_index = simulation.unit_index_by_id.clone();
+
+        assert_eq!(
+            simulation.insert_units_atomic(vec![army(3, 0, 0.0, 2.0), army(1, 0, 0.0, 3.0),]),
+            Err(SimulationError::DuplicateUnit(1))
+        );
+        assert_eq!(simulation.units, units);
+        assert_eq!(simulation.unit_index_by_id, before_index);
+
+        assert_eq!(
+            simulation.insert_units_atomic(vec![army(3, 0, 0.0, 2.0), army(3, 1, 0.0, 3.0)]),
+            Err(SimulationError::DuplicateUnit(3))
+        );
+        assert_eq!(simulation.units, units);
+        assert_eq!(simulation.unit_index_by_id, before_index);
+
+        let mut invalid = army(4, 0, 0.0, 4.0);
+        invalid.dir_lat = f64::NAN;
+        assert_eq!(
+            simulation.insert_units_atomic(vec![army(3, 0, 0.0, 2.0), invalid]),
+            Err(SimulationError::NonFiniteInput)
+        );
+        assert_eq!(simulation.units, units);
+        assert_eq!(simulation.unit_index_by_id, before_index);
     }
 }

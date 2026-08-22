@@ -25,6 +25,7 @@ cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpo
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v7
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v8
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v9
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v10
 
 scenarios=(
 	"world-map-2022-v2.mwsc.gz"
@@ -145,7 +146,7 @@ naval_bin="$native_root/target/release/mw-native"
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 40 --tick-ms 1 --save-checkpoint "$save_tmp/full.json" "$modern_path" >/dev/null
 for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full.json"; do
 	jq -e '
-		.schema == "native-runtime-checkpoint-v9"
+		.schema == "native-runtime-checkpoint-v10"
 		and .gameplayRng.schema == "native-gameplay-rng-v1"
 		and .gameplayRng.algorithm == "mulberry32"
 		and (.gameplayRng.state | type == "number" and . >= 0 and . <= 4294967295)
@@ -156,6 +157,8 @@ for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full
 		and .operationalExecution.schema == "native-operational-execution-v1"
 		and .airPower.schema == "native-air-v2"
 		and .navalPlanning.schema == "native-naval-planning-v1"
+		and .reinforcement.schema == "native-reinforcement-v1"
+		and (.reinforcement.countries | length) == (.economies | length)
 		and (.navalPlanning.sideStates | length) == (.sides | length)
 		and ([.navalPlanning.sideStates[].side] ==
 			([.sides[].sideIndex] | sort))
@@ -169,7 +172,7 @@ for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full
 	' "$checkpoint" >/dev/null
 done
 jq '.schema = "native-runtime-checkpoint-v5"
-	| del(.operationalExecution, .airPower, .navalPlanning, .gameplayRng, .personnelReserves)
+	| del(.operationalExecution, .airPower, .navalPlanning, .gameplayRng, .personnelReserves, .reinforcement)
 	| del(.battlefield.units[].supplyCollapsedTick)' \
 	"$save_tmp/part.json" >"$save_tmp/part-v5.json"
 node "$native_root/scripts/js-browser-v5-wire.mjs" \
@@ -178,7 +181,7 @@ node "$native_root/scripts/js-browser-v5-wire.mjs" \
 	"$modern_path" "$save_tmp/browser-v5-wire.json" --ticks 1 --json >/dev/null
 printf 'browser v5 operationalAi wire to native loader gate ok\n'
 jq '.schema = "native-runtime-checkpoint-v6"
-	| del(.navalPlanning, .gameplayRng, .personnelReserves)
+	| del(.navalPlanning, .gameplayRng, .personnelReserves, .reinforcement)
 	| del(.battlefield.units[].supplyCollapsedTick)' \
 	"$save_tmp/part.json" >"$save_tmp/part-v6.json"
 "$native_bin" --runtime-checkpoint "$save_tmp/part-v6.json" --headless --ticks 1 --tick-ms 1 \
@@ -208,15 +211,16 @@ jq -e '
 	"$modern_path" "$save_tmp/browser-v6-wire.json" --ticks 1 --json >/dev/null
 printf 'browser v6 execution and air-power wire to native loader gate ok\n'
 diff -u <(jq -S 'del(.steps)' "$save_tmp/resumed.json") <(jq -S 'del(.steps)' "$save_tmp/full.json")
-printf 'native v9 save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'
+printf 'native v10 save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'
 
 "$naval_bin" --side "United Kingdom" --side Iceland --headless --ticks 1000 --tick-ms 1 \
 	--save-checkpoint "$save_tmp/naval-part.json" "$modern_path" >/dev/null
 jq -e '
-	.schema == "native-runtime-checkpoint-v9"
+	.schema == "native-runtime-checkpoint-v10"
 	and .gameplayRng.schema == "native-gameplay-rng-v1"
 	and (.personnelReserves | length) == (.sides | length)
 	and .navalPlanning.schema == "native-naval-planning-v1"
+	and .reinforcement.schema == "native-reinforcement-v1"
 	and .navalPlanning.nextOperationSequence > 1
 	and (.operationalExecution.navalOperations | length) >= 1
 	and ([.operationalExecution.navalOperations[]

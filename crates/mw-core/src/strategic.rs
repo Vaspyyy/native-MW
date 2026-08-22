@@ -323,6 +323,18 @@ pub enum StrategicError {
     DuplicateOccupation(u16),
     #[error("unknown country id {0}")]
     UnknownCountry(u16),
+    #[error("country id {0} is not active")]
+    InactiveCountry(u16),
+    #[error("recruitment cost for country id {country_id} must be positive and finite")]
+    InvalidRecruitmentCost { country_id: u16 },
+    #[error(
+        "country id {country_id} has insufficient treasury: required {required}, available {available}"
+    )]
+    InsufficientTreasury {
+        country_id: u16,
+        required: f64,
+        available: f64,
+    },
     #[error("country input contains invalid numeric data")]
     InvalidCountryInput,
     #[error("prepared strategic cycle was based on cycle {prepared}, current cycle is {current}")]
@@ -343,6 +355,7 @@ pub enum StrategicError {
     Surrender(#[from] SurrenderError),
 }
 
+#[derive(Clone)]
 pub struct StrategicSimulation {
     cycle: u64,
     economies: BTreeMap<u16, EconomyState>,
@@ -412,6 +425,61 @@ impl StrategicSimulation {
 
     pub fn latest_snapshot(&self) -> Option<Arc<StrategicSnapshot>> {
         self.latest.clone()
+    }
+
+    /// Atomically deduct an ordered batch of recruitment costs.
+    ///
+    /// Every entry is validated before any treasury is changed. A country may
+    /// occur at most once in a batch, and capitulated countries cannot recruit.
+    pub fn spend_recruitment_batch(&mut self, costs: &[(u16, f64)]) -> Result<(), StrategicError> {
+        self.spend_treasury_batch(costs)
+    }
+
+    /// Atomically deduct an ordered batch of post-settlement treasury costs.
+    ///
+    /// This is shared by recruitment and the deterministic air-logistics cycle.
+    /// Every entry is validated before any treasury is changed.
+    pub fn spend_treasury_batch(&mut self, costs: &[(u16, f64)]) -> Result<(), StrategicError> {
+        let mut seen = BTreeSet::new();
+        for &(country_id, cost) in costs {
+            if !cost.is_finite() || cost <= 0.0 {
+                return Err(StrategicError::InvalidRecruitmentCost { country_id });
+            }
+            if !seen.insert(country_id) {
+                return Err(StrategicError::DuplicateCountry(country_id));
+            }
+            let economy = self
+                .economies
+                .get(&country_id)
+                .ok_or(StrategicError::UnknownCountry(country_id))?;
+            if economy.capitulated {
+                return Err(StrategicError::InactiveCountry(country_id));
+            }
+            if economy.treasury < cost {
+                return Err(StrategicError::InsufficientTreasury {
+                    country_id,
+                    required: cost,
+                    available: economy.treasury,
+                });
+            }
+        }
+
+        for &(country_id, cost) in costs {
+            self.economies
+                .get_mut(&country_id)
+                .expect("validated recruitment country must exist")
+                .treasury -= cost;
+        }
+
+        if let Some(latest) = &mut self.latest {
+            let countries = &mut Arc::make_mut(latest).countries;
+            for country in Arc::make_mut(countries) {
+                if let Some(economy) = self.economies.get(&country.country_id) {
+                    country.economy = economy.clone();
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn run_cycle(
@@ -1190,6 +1258,62 @@ mod tests {
         assert_eq!(simulation.cycle(), 0);
         assert_eq!(simulation.economies(), &before);
         assert!(simulation.latest_snapshot().is_none());
+    }
+
+    #[test]
+    fn recruitment_spending_deducts_exact_costs_and_updates_latest_snapshot() {
+        let mut simulation = StrategicSimulation::new([economy(1), economy(2)], []).unwrap();
+        let mut cycle = input();
+        cycle.occupations.clear();
+        cycle.countries[1].controlled_cells = 100;
+        cycle.countries[1].core_controlled = 100;
+        cycle.countries[1].city_population_controlled = 100.0;
+        cycle.countries[1].capital_held = true;
+        let (published_before_spend, _) = simulation.run_cycle(&cycle).unwrap();
+        let treasury_1 = simulation.economies()[&1].treasury;
+        let treasury_2 = simulation.economies()[&2].treasury;
+
+        simulation
+            .spend_recruitment_batch(&[(1, 3.0), (2, 7.5)])
+            .unwrap();
+
+        assert_eq!(simulation.economies()[&1].treasury, treasury_1 - 3.0);
+        assert_eq!(simulation.economies()[&2].treasury, treasury_2 - 7.5);
+        let published_after_spend = simulation.latest_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(
+            &published_before_spend,
+            &published_after_spend
+        ));
+        assert_eq!(
+            published_after_spend.countries[0].economy,
+            simulation.economies()[&1]
+        );
+        assert_eq!(
+            published_after_spend.countries[1].economy,
+            simulation.economies()[&2]
+        );
+    }
+
+    #[test]
+    fn recruitment_spending_rolls_back_entire_invalid_or_insufficient_batch() {
+        let mut first = economy(1);
+        first.treasury = 10.0;
+        let mut second = economy(2);
+        second.treasury = 5.0;
+        let mut simulation = StrategicSimulation::new([first, second], []).unwrap();
+        let before = simulation.economies().clone();
+
+        assert!(matches!(
+            simulation.spend_recruitment_batch(&[(1, 4.0), (2, f64::NAN)]),
+            Err(StrategicError::InvalidRecruitmentCost { country_id: 2 })
+        ));
+        assert_eq!(simulation.economies(), &before);
+
+        assert!(matches!(
+            simulation.spend_recruitment_batch(&[(1, 4.0), (2, 6.0)]),
+            Err(StrategicError::InsufficientTreasury { country_id: 2, .. })
+        ));
+        assert_eq!(simulation.economies(), &before);
     }
 
     #[test]

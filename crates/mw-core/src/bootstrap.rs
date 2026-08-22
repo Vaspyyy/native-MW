@@ -21,6 +21,7 @@ use crate::{
     operational_execution::OperationalExecutionState,
     operations::{CountryDesperationMode, CountryDesperationState, OperationalRuntimeState},
     production::{ProductionConfig, derive_scenario_production},
+    reinforcement::{AIRCREW_PER_AIRCRAFT, ReinforcementError, ReinforcementState},
     runtime::{
         NativeRuntime, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeUnitPolicy,
     },
@@ -53,6 +54,8 @@ pub enum NativeWarBootstrapError {
     Air(#[from] AirError),
     #[error("naval planning: {0}")]
     NavalPlanning(#[from] NavalPlanningError),
+    #[error("reinforcement: {0}")]
+    Reinforcement(#[from] ReinforcementError),
     #[error("strategic: {0}")]
     Strategic(#[from] crate::strategic::StrategicError),
     #[error("runtime: {0}")]
@@ -579,7 +582,7 @@ pub fn bootstrap_native_war(
             .collect(),
     };
     let armor_crew_per_vehicle = simulation.config().combat.armor_crew_per_vehicle;
-    let side_dynamics = bootstrap_sides(
+    let mut side_dynamics = bootstrap_sides(
         n,
         simulation.units.iter().map(|unit| {
             let personnel = if unit.combat.kind == UnitKind::Armor {
@@ -627,6 +630,52 @@ pub fn bootstrap_native_war(
         })
         .collect();
     let air_power = bootstrap_air_power(&production, &country_to_side)?;
+    let next_air_wing_id = air_power
+        .wings
+        .iter()
+        .map(|wing| wing.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            NativeWarBootstrapError::Topology("air-wing ID allocator overflowed".into())
+        })?;
+    let reinforcement =
+        ReinforcementState::bootstrap(&air_power, next_id, next_air_wing_id, &country_to_side, n)?;
+
+    let mut population_pool = vec![0.0; n];
+    for country in production.countries.iter() {
+        if let Some(&side) = country_to_side.get(&country.country_id) {
+            population_pool[side] += country.population * 0.01;
+        }
+    }
+    let mut deployed_land_crews = vec![0.0; n];
+    for unit in &simulation.units {
+        let personnel = if unit.combat.kind == UnitKind::Armor {
+            unit.combat.equipment.saturating_mul(armor_crew_per_vehicle) as f64
+        } else {
+            unit.combat.personnel as f64
+        };
+        deployed_land_crews[unit.combat.side as usize] += personnel;
+    }
+    let mut deployed_air_crews = vec![0.0; n];
+    for wing in &air_power.wings {
+        deployed_air_crews[wing.side] += f64::from(wing.count) * AIRCREW_PER_AIRCRAFT;
+    }
+    let personnel_reserves = (0..n)
+        .map(|side| {
+            let reserve =
+                (population_pool[side] - deployed_land_crews[side] - deployed_air_crews[side])
+                    .max(0.0);
+            let added_personnel = reserve + deployed_air_crews[side];
+            let dynamics = side_dynamics
+                .get_mut(&side)
+                .expect("side dynamics exactly cover bootstrap topology");
+            dynamics.initial_personnel += added_personnel;
+            dynamics.current_personnel += added_personnel;
+            (side, reserve)
+        })
+        .collect();
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
         RuntimeCheckpoint {
@@ -652,12 +701,13 @@ pub fn bootstrap_native_war(
             gameplay_rng: crate::gameplay_rng::GameplayRngState {
                 state: crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED,
             },
-            personnel_reserves: (0..n).map(|side| (side, 0.0)).collect(),
+            personnel_reserves,
             side_dynamics: Some(side_dynamics),
             operations: Some(operations),
             naval_planning: Some(NavalPlanningState::bootstrap(n)?),
             operational_execution: Some(OperationalExecutionState::default()),
             air_power: Some(air_power),
+            reinforcement: Some(reinforcement),
         },
     )?)
 }
@@ -794,6 +844,54 @@ mod tests {
                 && unit.armor_support_last_tick.is_none()
                 && unit.last_ally_count == 1.0
         }));
+    }
+
+    #[test]
+    fn bootstrap_initializes_reinforcement_allocators_reserves_and_total_personnel() {
+        let mut scenario = scenario();
+        for country in scenario
+            .metadata
+            .get_mut("countries")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+        {
+            let object = country.as_object_mut().unwrap();
+            match object["id"].as_u64().unwrap() {
+                10 => object.insert("population".into(), json!(1_000_000.0)),
+                20 => object.insert("population".into(), json!(2_000_000.0)),
+                _ => None,
+            };
+        }
+
+        let mut runtime =
+            bootstrap_native_war(&scenario, &config(vec![vec![10], vec![20]])).unwrap();
+        let state = runtime.checkpoint_state().unwrap();
+        let reinforcement = state.reinforcement.as_ref().unwrap();
+
+        assert_eq!(reinforcement.next_unit_id, 7);
+        assert_eq!(reinforcement.next_air_wing_id, 5);
+        assert_eq!(
+            reinforcement
+                .countries
+                .iter()
+                .map(|country| (
+                    country.country_id,
+                    country.fighter_capacity,
+                    country.strike_capacity,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(10, 100, 100), (20, 100, 100)]
+        );
+        assert_eq!(
+            state.personnel_reserves,
+            BTreeMap::from([(0, 6_800.0), (1, 16_800.0)])
+        );
+        let dynamics = state.side_dynamics.as_ref().unwrap();
+        assert_eq!(dynamics[&0].initial_personnel, 10_000.0);
+        assert_eq!(dynamics[&0].current_personnel, 10_000.0);
+        assert_eq!(dynamics[&1].initial_personnel, 20_000.0);
+        assert_eq!(dynamics[&1].current_personnel, 20_000.0);
     }
 
     #[test]

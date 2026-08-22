@@ -116,6 +116,7 @@ fn restored_runtime(state: NativeRuntimeCheckpointState) -> NativeRuntime {
             naval_planning: state.naval_planning,
             operational_execution: state.operational_execution,
             air_power: state.air_power,
+            reinforcement: state.reinforcement,
         },
     )
     .unwrap()

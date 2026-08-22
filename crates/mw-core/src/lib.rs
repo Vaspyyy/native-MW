@@ -21,6 +21,7 @@ pub mod occupation;
 pub mod operational_execution;
 pub mod operations;
 pub mod production;
+pub mod reinforcement;
 pub mod runtime;
 pub mod scenario;
 pub mod simulation;
@@ -106,6 +107,7 @@ pub use production::{
     TerritoryCommitMarker, derive_scenario_production, derive_strategic_cycle_input,
     estimate_territory_army_units,
 };
+pub use reinforcement::*;
 pub use runtime::{
     DEFAULT_CENSUS_BUDGET, DEFAULT_CENSUS_FLUSH_CHUNK, DEFAULT_FRONT_REFRESH_TICKS,
     DEFAULT_RUNTIME_FRONT_STICKINESS, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
@@ -120,8 +122,8 @@ pub use scenario::{
 pub use simulation::{
     DamageCommand, DamageOutcome, DamageResult, DesertionOutcome, FrameSnapshot,
     NATIVE_TICK_SCHEMA_VERSION, ResolvedCombatOrder, ResolvedUnitOrder, Simulation,
-    SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput, UnitRemovalOutcome,
-    UnitSnapshot,
+    SimulationConfig, SimulationError, SimulationUnit, TickCounters, TickInput,
+    UnitInsertionOutcome, UnitRemovalOutcome, UnitSnapshot,
 };
 pub use strategic::{
     ConflictResolutionPlan, CountryCycleInput, CountryStrategicSnapshot, DesertionCommand,
