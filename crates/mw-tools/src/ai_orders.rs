@@ -614,6 +614,7 @@ impl UnitFixture {
                 .previous_assignment
                 .as_ref()
                 .map(|assignment| assignment.objective_id),
+            operationally_claimed: false,
             is_reserve: self.is_reserve,
             reinforcement_eligible: self.reinforcement_eligible,
             encircled: self.encircled,

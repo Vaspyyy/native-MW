@@ -140,16 +140,42 @@ native_bin="$native_root/target/debug/mw-native"
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 40 --tick-ms 1 --save-checkpoint "$save_tmp/full.json" "$modern_path" >/dev/null
 for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full.json"; do
 	jq -e '
-		.schema == "native-runtime-checkpoint-v5"
+		.schema == "native-runtime-checkpoint-v6"
 		and .sideDynamics.schema == "native-side-dynamics-v1"
 		and .operationalAi.schema == "native-operational-ai-v1"
+		and .operationalExecution.schema == "native-operational-execution-v1"
+		and .airPower.schema == "native-air-v2"
+		and (.airPower.countryCoverage | length) == (.economies | length)
+		and ([.airPower.countryCoverage[].countryId] ==
+			([.economies[].countryId] | sort))
+		and ([.airPower.countryCoverage[].operationsCoverage]
+			| all(type == "number" and . >= 0 and . <= 1))
 		and (.sideDynamics.sides | length) == (.sides | length)
 	' "$checkpoint" >/dev/null
 done
+jq '.schema = "native-runtime-checkpoint-v5" | del(.operationalExecution, .airPower)' \
+	"$save_tmp/part.json" >"$save_tmp/part-v5.json"
 node "$native_root/scripts/js-browser-v5-wire.mjs" \
-	"$web_root" "$save_tmp/part.json" "$save_tmp/browser-wire.json"
+	"$web_root" "$save_tmp/part-v5.json" "$save_tmp/browser-v5-wire.json"
 "$native_root/target/debug/mw-tools" native-runtime-fixture \
-	"$modern_path" "$save_tmp/browser-wire.json" --ticks 1 --json >/dev/null
+	"$modern_path" "$save_tmp/browser-v5-wire.json" --ticks 1 --json >/dev/null
 printf 'browser v5 operationalAi wire to native loader gate ok\n'
+node "$native_root/scripts/js-browser-v6-wire.mjs" \
+	"$web_root" "$save_tmp/part.json" "$save_tmp/browser-v6-wire.json"
+jq -e '
+	.schema == "native-runtime-checkpoint-v6"
+	and .operationalExecution.schema == "native-operational-execution-v1"
+	and ([.operationalExecution.navalOperations[].kind]
+		| sort == (["INVASION", "SUPPLY", "FAST_TRANSPORT"] | sort))
+	and (.operationalExecution.defenderReactions | length) == 1
+	and .airPower.schema == "native-air-v2"
+	and (.airPower.countryCoverage | length) == (.economies | length)
+	and ([.airPower.countryCoverage[].operationsCoverage] | any(. < 1))
+	and (.airPower.airfields | length) > 0
+	and (.airPower.wings | length) > 0
+' "$save_tmp/browser-v6-wire.json" >/dev/null
+"$native_root/target/debug/mw-tools" native-runtime-fixture \
+	"$modern_path" "$save_tmp/browser-v6-wire.json" --ticks 1 --json >/dev/null
+printf 'browser v6 execution and air-power wire to native loader gate ok\n'
 diff -u <(jq -S 'del(.steps)' "$save_tmp/resumed.json") <(jq -S 'del(.steps)' "$save_tmp/full.json")
 printf 'native save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'

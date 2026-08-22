@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
+    write_runtime_checkpoint_state_v6,
 };
 use mw_core::{
     CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
@@ -175,7 +176,9 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.operations.is_some() {
+        let writer = if state.operational_execution.is_some() && state.air_power.is_some() {
+            write_runtime_checkpoint_state_v6
+        } else if state.operations.is_some() {
             write_runtime_checkpoint_state_v5
         } else if state.side_dynamics.is_some() {
             write_runtime_checkpoint_state_v4
@@ -586,6 +589,24 @@ fn checksum_runtime_snapshot(checksum: &mut Fnv64, snapshot: &RuntimeSnapshot) -
         checksum.write_bytes(&serde_json::to_vec(strategic.surrenders.as_ref())?);
         checksum.write_bytes(&serde_json::to_vec(strategic.events.as_ref())?);
         checksum.write_bytes(&serde_json::to_vec(&strategic.conflict_resolution)?);
+    } else {
+        checksum.write_bool(false);
+    }
+    if let Some(operational) = &snapshot.operational_snapshot {
+        checksum.write_bool(true);
+        checksum.write_bytes(&serde_json::to_vec(operational.as_ref())?);
+    } else {
+        checksum.write_bool(false);
+    }
+    if let Some(execution) = &snapshot.operational_execution_snapshot {
+        checksum.write_bool(true);
+        checksum.write_bytes(&serde_json::to_vec(execution.as_ref())?);
+    } else {
+        checksum.write_bool(false);
+    }
+    if let Some(air_power) = &snapshot.air_power_snapshot {
+        checksum.write_bool(true);
+        checksum.write_bytes(&serde_json::to_vec(air_power.as_ref())?);
     } else {
         checksum.write_bool(false);
     }

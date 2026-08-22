@@ -133,6 +133,9 @@ pub struct AiUnitInput {
     pub movement: ResolvedMovementModifiers,
     pub combat: ResolvedCombatModifiers,
     pub prior_front_objective_id: Option<u64>,
+    /// Owned by an operational task force, naval operation, or defender reaction.
+    /// Tactical contact and retreat still apply, but generic front planning must not.
+    pub operationally_claimed: bool,
     pub is_reserve: bool,
     pub reinforcement_eligible: bool,
     pub encircled: bool,
@@ -389,7 +392,8 @@ pub fn resolve_ai_orders(
         let contact = contacts[index];
         let has_contact_direction = contact.preferred_target_id.is_some()
             && normalize(contact.preferred_delta_lat, contact.preferred_delta_lng).is_some();
-        if reinforcement[index]
+        if !unit.operationally_claimed
+            && reinforcement[index]
             && !contact.retreat
             && !has_contact_direction
             && assigned_objective[index].is_none()
@@ -759,7 +763,7 @@ fn preserve_sticky_assignments(
     let stickiness_sq = config.prior_assignment_stickiness.powi(2);
     let mut candidates = Vec::new();
     for (unit_index, unit) in units.iter().enumerate() {
-        if contacts[unit_index].retreat || reinforcement[unit_index] {
+        if unit.operationally_claimed || contacts[unit_index].retreat || reinforcement[unit_index] {
             continue;
         }
         let Some(objective_index) = unit
@@ -810,6 +814,7 @@ fn assign_main_fronts(
     let mut edges = Vec::new();
     for (unit_index, unit) in units.iter().enumerate() {
         if contacts[unit_index].retreat
+            || unit.operationally_claimed
             || reinforcement[unit_index]
             || assigned[unit_index].is_some()
         {
@@ -868,7 +873,11 @@ fn assign_reinforcements(
     counters: &mut AiPlanningCounters,
 ) -> Result<(), AiOrderError> {
     let mut unit_indices = (0..units.len())
-        .filter(|index| reinforcement[*index] && !contacts[*index].retreat)
+        .filter(|index| {
+            !units[*index].operationally_claimed
+                && reinforcement[*index]
+                && !contacts[*index].retreat
+        })
         .collect::<Vec<_>>();
     unit_indices.sort_unstable_by(|left, right| {
         units[*left]
@@ -938,6 +947,9 @@ fn choose_direction(
             (!unit.defensive_only).then_some(direction),
             AssignmentReason::Contact,
         );
+    }
+    if unit.operationally_claimed {
+        return (None, AssignmentReason::Hold);
     }
     if let Some(index) = objective_index {
         let objective = world.objectives[index];
@@ -1140,6 +1152,7 @@ mod tests {
             movement: ResolvedMovementModifiers::default(),
             combat: ResolvedCombatModifiers::default(),
             prior_front_objective_id: None,
+            operationally_claimed: false,
             is_reserve: false,
             reinforcement_eligible: false,
             encircled: false,
@@ -1381,6 +1394,52 @@ mod tests {
         assert_eq!(result.counters.sticky_assignments, 1);
         assert_eq!(result.assignments[0].objective_id, None);
         assert_eq!(result.assignments[1].objective_id, Some(10));
+    }
+
+    #[test]
+    fn operational_claims_skip_generic_fronts_but_preserve_contact_and_retreat() {
+        let land = [1; 8];
+        let dominant = [-1; 8];
+        let objectives = [objective(10, 0.0, 0.0, 1, 1)];
+        let mut claimed = unit(1, 0, 0.0, 0.1);
+        claimed.operationally_claimed = true;
+        claimed.prior_front_objective_id = Some(10);
+        let eligible = unit(2, 0, 0.0, 1.0);
+
+        let result = resolve_ai_orders(
+            AiOrderConfig::default(),
+            &[claimed, eligible],
+            standard_world(&land, &dominant, &objectives),
+        )
+        .unwrap();
+        assert_eq!(result.assignments[0].reason, AssignmentReason::Hold);
+        assert_eq!(result.assignments[0].objective_id, None);
+        assert_eq!(result.assignments[1].reason, AssignmentReason::Front);
+        assert_eq!(result.assignments[1].objective_id, Some(10));
+        assert_eq!(result.counters.sticky_assignments, 0);
+        assert_eq!(result.counters.front_assignments, 1);
+
+        let enemy = unit(3, 1, 0.0, 0.2);
+        let contact = resolve_ai_orders(
+            AiOrderConfig::default(),
+            &[claimed, eligible, enemy],
+            standard_world(&land, &dominant, &objectives),
+        )
+        .unwrap();
+        assert_eq!(contact.assignments[0].reason, AssignmentReason::Contact);
+
+        let mut overwhelming_enemy = enemy;
+        overwhelming_enemy.combat_power = 10.0;
+        let retreat = resolve_ai_orders(
+            AiOrderConfig {
+                retreat_multiple: 1.0,
+                ..AiOrderConfig::default()
+            },
+            &[claimed, eligible, overwhelming_enemy],
+            standard_world(&land, &dominant, &objectives),
+        )
+        .unwrap();
+        assert_eq!(retreat.assignments[0].reason, AssignmentReason::Retreat);
     }
 
     #[test]
