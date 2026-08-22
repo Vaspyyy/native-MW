@@ -10,6 +10,7 @@ use crate::{combat::wrapped_longitude_delta, dynamics::WarPosture};
 pub const OPERATIONAL_AI_SCHEMA_VERSION: &str = "native-operational-ai-v1";
 pub const OPERATIONAL_OVERRIDE_HISTORY_LIMIT: usize = 64;
 const SUPPLY_COLLAPSE_MEMBER_SHARE: f64 = 0.35;
+const SUPPLY_COLLAPSE_MEMORY_TICKS: u64 = 15;
 const SUPPLY_OVERRIDE_TICKS: u64 = 300;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -287,8 +288,8 @@ pub struct OperationalUnitInput {
     pub position: OperationalPoint,
     pub power: f64,
     pub readiness: f64,
-    pub supply_collapsed: bool,
-    pub encircled: bool,
+    pub supply_collapsed_tick: Option<u64>,
+    pub encircled_ticks: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -712,7 +713,12 @@ impl OperationalRuntimeState {
         })
     }
 
-    pub fn advance_task_forces(&mut self, tick: u64, units: &[OperationalUnitInput]) {
+    pub fn advance_task_forces(
+        &mut self,
+        tick: u64,
+        units: &[OperationalUnitInput],
+        collapsing_sides: &BTreeSet<usize>,
+    ) {
         let by_id = self.retain_live_unit_references(units);
         for task_force in &mut self.task_forces {
             if task_force.members.is_empty() {
@@ -742,7 +748,11 @@ impl OperationalRuntimeState {
                 .filter(|member| {
                     by_id
                         .get(&member.unit_id)
-                        .is_some_and(|unit| unit.supply_collapsed)
+                        .and_then(|unit| unit.supply_collapsed_tick)
+                        .is_some_and(|collapse_tick| {
+                            collapse_tick <= tick
+                                && tick - collapse_tick <= SUPPLY_COLLAPSE_MEMORY_TICKS
+                        })
                 })
                 .count();
             let severe_encirclement = task_force
@@ -751,11 +761,23 @@ impl OperationalRuntimeState {
                 .filter(|member| {
                     by_id
                         .get(&member.unit_id)
-                        .is_some_and(|unit| unit.encircled)
+                        .is_some_and(|unit| unit.encircled_ticks >= 60)
                 })
                 .count();
             let formation_threshold =
                 (task_force.members.len() as f64 * SUPPLY_COLLAPSE_MEMBER_SHARE).ceil() as usize;
+            if task_force.phase == TaskForcePhase::Regrouping
+                && collapsing_sides.contains(&task_force.side_index)
+            {
+                task_force.plan_type = "DEFEND".to_owned();
+                task_force.completion_reason = Some("COLLAPSING_DEFENSE".to_owned());
+                task_force.outcome = None;
+                for member in &mut task_force.members {
+                    member.route_progress =
+                        role_route_progress(task_force.phase, member.role, task_force.progress);
+                }
+                continue;
+            }
             match task_force.phase {
                 TaskForcePhase::Assembling => {
                     let launch_readiness = match task_force.posture {
@@ -772,27 +794,30 @@ impl OperationalRuntimeState {
                 TaskForcePhase::Attacking => {
                     let power_ratio =
                         task_force.current_power / task_force.launch_power.max(0.000_1);
-                    let reason = if collapsed >= formation_threshold {
-                        Some("SUPPLY_COLLAPSE")
-                    } else if severe_encirclement >= formation_threshold {
-                        Some("ENCIRCLEMENT_RISK")
-                    } else if task_force.severe_surprise {
-                        Some("SEVERE_SURPRISE")
-                    } else if power_ratio < 0.55 {
-                        Some("POWER_LOSS")
-                    } else {
-                        None
-                    };
-                    if let Some(reason) = reason {
-                        transition_task_force(task_force, TaskForcePhase::Culminated, tick);
-                        task_force.completion_reason = Some(reason.to_owned());
-                        if reason == "SUPPLY_COLLAPSE" {
-                            task_force.supply_invalidated_tick = Some(tick);
-                            task_force.intent_revision =
-                                task_force.intent_revision.saturating_add(1);
-                        }
-                    } else if task_force.progress >= 1.0 {
+                    if task_force.progress >= 1.0 {
                         transition_task_force(task_force, TaskForcePhase::Consolidating, tick);
+                        task_force.completion_reason = None;
+                    } else {
+                        let reason = if task_force.severe_surprise {
+                            Some("SEVERE_SURPRISE")
+                        } else if collapsed >= formation_threshold {
+                            Some("SUPPLY_COLLAPSE")
+                        } else if severe_encirclement >= formation_threshold {
+                            Some("ENCIRCLEMENT_RISK")
+                        } else if power_ratio < 0.55 {
+                            Some("POWER_LOSS")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
+                            transition_task_force(task_force, TaskForcePhase::Culminated, tick);
+                            task_force.completion_reason = Some(reason.to_owned());
+                            if reason == "SUPPLY_COLLAPSE" {
+                                task_force.supply_invalidated_tick = Some(tick);
+                                task_force.intent_revision =
+                                    task_force.intent_revision.saturating_add(1);
+                            }
+                        }
                     }
                 }
                 TaskForcePhase::Culminated if tick > task_force.phase_started_tick => {
@@ -1393,10 +1418,10 @@ mod tests {
             position: point(0.0, unit_id as f64),
             power: 1.0,
             readiness: 1.0,
-            supply_collapsed: false,
-            encircled: false,
+            supply_collapsed_tick: None,
+            encircled_ticks: 0,
         });
-        state.advance_task_forces(11, &surviving_units);
+        state.advance_task_forces(11, &surviving_units, &BTreeSet::new());
 
         assert!(state.sides[0].intel.contacts.is_empty());
         let live_units = BTreeMap::from([(1, 0), (2, 0), (3, 0)]);
@@ -1414,8 +1439,8 @@ mod tests {
                 position: point(0.0, 1.0),
                 power: 1.0,
                 readiness: 1.0,
-                supply_collapsed: true,
-                encircled: false,
+                supply_collapsed_tick: Some(1),
+                encircled_ticks: 0,
             },
             OperationalUnitInput {
                 unit_id: 2,
@@ -1424,8 +1449,8 @@ mod tests {
                 position: point(0.0, 2.0),
                 power: 1.0,
                 readiness: 1.0,
-                supply_collapsed: true,
-                encircled: false,
+                supply_collapsed_tick: Some(1),
+                encircled_ticks: 0,
             },
             OperationalUnitInput {
                 unit_id: 3,
@@ -1434,11 +1459,11 @@ mod tests {
                 position: point(0.0, 3.0),
                 power: 1.0,
                 readiness: 1.0,
-                supply_collapsed: false,
-                encircled: false,
+                supply_collapsed_tick: None,
+                encircled_ticks: 0,
             },
         ];
-        state.advance_task_forces(1, &inputs);
+        state.advance_task_forces(1, &inputs, &BTreeSet::new());
         let task_force = &state.task_forces[0];
         assert_eq!(task_force.phase, TaskForcePhase::Culminated);
         assert_eq!(task_force.supply_invalidated_tick, Some(1));
@@ -1453,6 +1478,59 @@ mod tests {
     }
 
     #[test]
+    fn supply_collapse_window_is_inclusive_and_expires_after_fifteen_ticks() {
+        let inputs = [1, 2, 3].map(|unit_id| OperationalUnitInput {
+            unit_id,
+            side_index: 0,
+            country_id: 10,
+            position: point(0.0, unit_id as f64),
+            power: 1.0,
+            readiness: 1.0,
+            supply_collapsed_tick: (unit_id <= 2).then_some(1),
+            encircled_ticks: 0,
+        });
+
+        let mut inclusive = state();
+        inclusive.advance_task_forces(16, &inputs, &BTreeSet::new());
+        assert_eq!(
+            inclusive.task_forces[0].completion_reason.as_deref(),
+            Some("SUPPLY_COLLAPSE")
+        );
+
+        let mut expired = state();
+        expired.advance_task_forces(17, &inputs, &BTreeSet::new());
+        assert_eq!(expired.task_forces[0].phase, TaskForcePhase::Attacking);
+        assert_eq!(expired.task_forces[0].supply_invalidated_tick, None);
+    }
+
+    #[test]
+    fn collapsing_side_holds_regrouping_force_as_defense() {
+        let mut state = state();
+        state.task_forces[0].phase = TaskForcePhase::Regrouping;
+        let inputs = [1, 2, 3].map(|unit_id| OperationalUnitInput {
+            unit_id,
+            side_index: 0,
+            country_id: 10,
+            position: point(0.0, unit_id as f64),
+            power: 1.0,
+            readiness: 1.0,
+            supply_collapsed_tick: None,
+            encircled_ticks: 0,
+        });
+
+        state.advance_task_forces(1, &inputs, &BTreeSet::from([0]));
+
+        let task_force = &state.task_forces[0];
+        assert_eq!(task_force.phase, TaskForcePhase::Regrouping);
+        assert_eq!(task_force.plan_type, "DEFEND");
+        assert_eq!(
+            task_force.completion_reason.as_deref(),
+            Some("COLLAPSING_DEFENSE")
+        );
+        assert_eq!(task_force.outcome, None);
+    }
+
+    #[test]
     fn steering_uses_role_progress_and_post_movement_advances_route() {
         let mut state = state();
         let inputs = [OperationalUnitInput {
@@ -1462,8 +1540,8 @@ mod tests {
             position: point(0.0, 1.0),
             power: 1.0,
             readiness: 1.0,
-            supply_collapsed: false,
-            encircled: false,
+            supply_collapsed_tick: None,
+            encircled_ticks: 0,
         }];
         let steering = state.steering(&inputs);
         assert_eq!(steering.len(), 1);

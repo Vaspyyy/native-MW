@@ -44,6 +44,7 @@ pub const NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA: &str = "native-runtime-checkpoint
 pub const NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA: &str = "native-runtime-checkpoint-v5";
 pub const NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA: &str = "native-runtime-checkpoint-v6";
 pub const NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA: &str = "native-runtime-checkpoint-v7";
+pub const NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA: &str = "native-runtime-checkpoint-v8";
 pub const NATIVE_SIDE_DYNAMICS_SCHEMA: &str = "native-side-dynamics-v1";
 pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
 
@@ -362,6 +363,42 @@ pub fn write_runtime_checkpoint_state_v7(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
+    write_runtime_checkpoint_state_v7_or_v8(
+        scenario_path,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+    )
+}
+
+/// Serialize a v8 checkpoint with persistent operational-feedback history.
+pub fn write_runtime_checkpoint_state_v8(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    write_runtime_checkpoint_state_v7_or_v8(
+        scenario_path,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
+    )
+}
+
+fn write_runtime_checkpoint_state_v7_or_v8(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+    schema: &'static str,
+) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
     state
         .battlefield
@@ -444,7 +481,7 @@ pub fn write_runtime_checkpoint_state_v7(
         state,
         output,
         steps,
-        NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+        schema,
         Some(influence_runtime),
         Some(side_dynamics),
         Some(operational_ai.clone()),
@@ -793,9 +830,19 @@ fn write_runtime_checkpoint_state_with_hash(
         "committedCensus": state.territory_committed_state}
     });
     if let Some(battlefield) = battlefield {
+        let mut battlefield = serde_json::to_value(battlefield)?;
+        if schema != NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
+            && let Some(units) = battlefield.get_mut("units").and_then(Value::as_array_mut)
+        {
+            for unit in units {
+                if let Some(unit) = unit.as_object_mut() {
+                    unit.remove("supplyCollapsedTick");
+                }
+            }
+        }
         body.as_object_mut()
             .expect("checkpoint body is an object")
-            .insert("battlefield".to_owned(), serde_json::to_value(battlefield)?);
+            .insert("battlefield".to_owned(), battlefield);
     }
     if let Some(influence_runtime) = influence_runtime {
         body.as_object_mut()
@@ -847,9 +894,12 @@ fn write_runtime_checkpoint_state_with_hash(
         NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
     ) {
         validate_checkpoint_v5_required_nullable_fields(&body)
             .context("checkpoint writer omitted required nullable operational fields")?;
+        validate_checkpoint_v8_supply_collapse_fields(&body)
+            .context("checkpoint writer emitted invalid supply-collapse history fields")?;
         let fixture: RuntimeCheckpointFixture = serde_json::from_value(body.clone())
             .context("checkpoint writer produced an invalid wire object")?;
         validate_checkpoint_shape(&fixture)
@@ -1049,6 +1099,35 @@ fn validate_checkpoint_v5_required_nullable_fields(checkpoint: &Value) -> Result
     Ok(())
 }
 
+fn validate_checkpoint_v8_supply_collapse_fields(checkpoint: &Value) -> Result<()> {
+    let schema = checkpoint
+        .get("schema")
+        .and_then(Value::as_str)
+        .context("checkpoint.schema must be a string")?;
+    let Some(units) = checkpoint
+        .get("battlefield")
+        .and_then(|battlefield| battlefield.get("units"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (index, unit) in units.iter().enumerate() {
+        let object = unit
+            .as_object()
+            .with_context(|| format!("checkpoint.battlefield.units[{index}] must be an object"))?;
+        let present = object.contains_key("supplyCollapsedTick");
+        if schema == NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA && !present {
+            bail!(
+                "checkpoint.battlefield.units[{index}].supplyCollapsedTick is required (use null when unset)"
+            );
+        }
+        if schema != NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA && present {
+            bail!("{schema} cannot contain checkpoint-v8 battlefield supplyCollapse history");
+        }
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_write_steps(steps: usize) -> Result<()> {
     if steps == 0 {
         bail!("checkpoint save requires at least one continuation step");
@@ -1225,6 +1304,16 @@ fn battlefield_fixture(
         bail!(
             "battlefield unit {unit_id} armor support tick {:?} is newer than checkpoint tick {checkpoint_tick}",
             state.armor_support_last_tick
+        );
+    }
+    if let Some((&unit_id, state)) = battlefield.units.iter().find(|(_, state)| {
+        state
+            .supply_collapsed_tick
+            .is_some_and(|tick| tick > checkpoint_tick)
+    }) {
+        bail!(
+            "battlefield unit {unit_id} supply collapse tick {:?} is newer than checkpoint tick {checkpoint_tick}",
+            state.supply_collapsed_tick
         );
     }
     Ok(BattlefieldFixture {
@@ -2228,6 +2317,8 @@ struct BattlefieldUnitStateFixture {
     encircled_ticks: u64,
     #[serde(deserialize_with = "deserialize_required_nullable_tick")]
     armor_support_last_tick: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_required_nullable_tick")]
+    supply_collapsed_tick: Option<u64>,
     last_ally_count: f64,
 }
 
@@ -2239,6 +2330,7 @@ impl BattlefieldUnitStateFixture {
             local_tactics_excluded: self.local_tactics_excluded,
             encircled_ticks: self.encircled_ticks,
             armor_support_last_tick: self.armor_support_last_tick,
+            supply_collapsed_tick: self.supply_collapsed_tick,
             last_ally_count: self.last_ally_count,
         }
     }
@@ -2251,6 +2343,7 @@ impl BattlefieldUnitStateFixture {
             local_tactics_excluded: value.local_tactics_excluded,
             encircled_ticks: value.encircled_ticks,
             armor_support_last_tick: value.armor_support_last_tick,
+            supply_collapsed_tick: value.supply_collapsed_tick,
             last_ally_count: value.last_ally_count,
         }
     }
@@ -2586,15 +2679,22 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
             NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
         )
     ) {
         validate_checkpoint_v5_required_nullable_fields(&checkpoint_value).with_context(|| {
             format!(
-                "failed to validate required v5/v6/v7 operational fields in {}",
+                "failed to validate required v5-v8 operational fields in {}",
                 checkpoint_path.display()
             )
         })?;
     }
+    validate_checkpoint_v8_supply_collapse_fields(&checkpoint_value).with_context(|| {
+        format!(
+            "failed to validate checkpoint supply-collapse history fields in {}",
+            checkpoint_path.display()
+        )
+    })?;
     let checkpoint: RuntimeCheckpointFixture = serde_json::from_value(checkpoint_value)
         .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
     validate_checkpoint_shape(&checkpoint)?;
@@ -2987,6 +3087,15 @@ fn decode_battlefield(
                 unit.unit_id
             );
         }
+        if unit
+            .supply_collapsed_tick
+            .is_some_and(|collapse_tick| collapse_tick > checkpoint_tick)
+        {
+            bail!(
+                "battlefield unit {} supplyCollapsedTick cannot be newer than checkpoint tick",
+                unit.unit_id
+            );
+        }
         if units.insert(unit.unit_id, unit.state()).is_some() {
             bail!(
                 "battlefield units contain duplicate unit id {}",
@@ -3277,8 +3386,28 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 bail!("checkpoint-v7 strategicCycle must leave room for a later cycle");
             }
         }
+        NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+                || checkpoint.influence_runtime.is_none()
+                || checkpoint.side_dynamics.is_none()
+                || checkpoint.battlefield.is_none()
+                || checkpoint.operational_ai.is_none()
+                || checkpoint.operational_execution.is_none()
+                || checkpoint.air_power.is_none()
+                || checkpoint.naval_planning.is_none()
+            {
+                bail!(
+                    "checkpoint-v8 requires all live runtime, execution, air power, naval planning, and operational-feedback state"
+                );
+            }
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v8 strategicCycle must leave room for a later cycle");
+            }
+        }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
@@ -3286,7 +3415,8 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -4600,6 +4730,7 @@ struct RuntimeProductionReport {
 impl PreparedRuntime {
     fn schema(&self) -> &'static str {
         match self.checkpoint.schema.as_str() {
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
@@ -5486,6 +5617,7 @@ mod tests {
                 local_tactics_excluded: false,
                 encircled_ticks: 61,
                 armor_support_last_tick: Some(9),
+                supply_collapsed_tick: Some(8),
                 last_ally_count: 4.0,
             }],
         }
@@ -5584,6 +5716,12 @@ mod tests {
             }))
             .unwrap(),
         );
+        checkpoint
+    }
+
+    fn valid_v8_checkpoint() -> RuntimeCheckpointFixture {
+        let mut checkpoint = valid_v7_checkpoint();
+        checkpoint.schema = NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA.to_owned();
         checkpoint
     }
 
@@ -6122,6 +6260,34 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_v8_requires_complete_v7_state_and_supply_history_wire() {
+        let checkpoint = valid_v8_checkpoint();
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut missing_planning = checkpoint.clone();
+        missing_planning.naval_planning = None;
+        assert!(validate_checkpoint_shape(&missing_planning).is_err());
+
+        let valid_wire = json!({
+            "schema": NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
+            "battlefield": {"units": [{"supplyCollapsedTick": null}]}
+        });
+        assert!(validate_checkpoint_v8_supply_collapse_fields(&valid_wire).is_ok());
+
+        let missing_wire = json!({
+            "schema": NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
+            "battlefield": {"units": [{}]}
+        });
+        assert!(validate_checkpoint_v8_supply_collapse_fields(&missing_wire).is_err());
+
+        let legacy_wire = json!({
+            "schema": NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+            "battlefield": {"units": [{"supplyCollapsedTick": null}]}
+        });
+        assert!(validate_checkpoint_v8_supply_collapse_fields(&legacy_wire).is_err());
+    }
+
+    #[test]
     fn checkpoint_v7_naval_planning_wire_is_strict_and_rejects_null() {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -6413,6 +6579,13 @@ mod tests {
             .remove("armorSupportLastTick");
         assert!(serde_json::from_value::<BattlefieldFixture>(missing_nullable).is_err());
 
+        let mut legacy_unit = encoded.clone();
+        legacy_unit["units"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("supplyCollapsedTick");
+        assert!(serde_json::from_value::<BattlefieldFixture>(legacy_unit).is_ok());
+
         let mut invalid_phase = encoded;
         invalid_phase["countries"][0]["warPhase"] = json!("STABLE");
         assert!(serde_json::from_value::<BattlefieldFixture>(invalid_phase).is_err());
@@ -6445,6 +6618,7 @@ mod tests {
         assert_eq!(state.countries[&1].war_phase, BattlefieldWarPhase::Stable);
         assert_eq!(state.units[&7].encircled_ticks, 61);
         assert_eq!(state.units[&7].armor_support_last_tick, Some(9));
+        assert_eq!(state.units[&7].supply_collapsed_tick, Some(8));
 
         let encoded = battlefield_fixture(&state, 10).unwrap();
         assert_eq!(encoded.schema, BATTLEFIELD_SCHEMA_VERSION);
@@ -6499,6 +6673,10 @@ mod tests {
 
         invalid = valid_battlefield();
         invalid.units[0].armor_support_last_tick = Some(11);
+        assert!(decode(&invalid).is_err());
+
+        invalid = valid_battlefield();
+        invalid.units[0].supply_collapsed_tick = Some(11);
         assert!(decode(&invalid).is_err());
 
         invalid = valid_battlefield();

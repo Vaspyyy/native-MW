@@ -1598,7 +1598,8 @@ fn operational_unit_inputs(
         .map(|unit| {
             let country_id = u16::try_from(unit.combat.sovereign)
                 .map_err(|_| RuntimeError::InvalidCheckpoint("invalid unit sovereign"))?;
-            let battlefield = battlefield.and_then(|stage| stage.resolved_unit(unit.combat.id));
+            let resolved = battlefield.and_then(|stage| stage.resolved_unit(unit.combat.id));
+            let memory = battlefield.and_then(|stage| stage.next_unit_state.get(&unit.combat.id));
             Ok(OperationalUnitInput {
                 unit_id: unit.combat.id,
                 side_index: unit.combat.side as usize,
@@ -1613,9 +1614,8 @@ fn operational_unit_inputs(
                 } else {
                     0.0
                 },
-                supply_collapsed: battlefield
-                    .is_some_and(|result| result.attrition.supply_collapsed),
-                encircled: battlefield.is_some_and(|result| result.encircled),
+                supply_collapsed_tick: memory.and_then(|state| state.supply_collapsed_tick),
+                encircled_ticks: resolved.map_or(0, |result| result.encircled_ticks),
             })
         })
         .collect()
@@ -2087,6 +2087,13 @@ impl NativeRuntime {
                 checkpoint.territory.country_to_side(),
                 &live_unit_ids,
             )?;
+            if let Some((&unit_id, _)) = battlefield.units.iter().find(|(_, state)| {
+                state
+                    .supply_collapsed_tick
+                    .is_some_and(|collapse_tick| collapse_tick > checkpoint.tick)
+            }) {
+                return Err(BattlefieldError::InvalidBattlefieldUnitState(unit_id).into());
+            }
             Some(battlefield.urban_cell_mask(world)?)
         } else {
             None
@@ -2544,7 +2551,12 @@ impl NativeRuntime {
                 })
             })
             .collect::<Result<Vec<_>, RuntimeError>>()?;
-        let local = resolve_local_tactics(next_tick, state, &local_inputs)?;
+        let local = resolve_local_tactics(
+            next_tick,
+            state,
+            &local_inputs,
+            HostilityMatrix::new(Some(&self.diplomacy.hostility), territory.max_sides()),
+        )?;
         let local_by_id = local
             .units
             .iter()
@@ -2723,6 +2735,10 @@ impl NativeRuntime {
                 )?;
                 if !unit_deploying(policy, next_tick) {
                     memory.encircled_ticks = result.encircled_ticks;
+                    if result.attrition.supply_collapse_sampled {
+                        memory.supply_collapsed_tick =
+                            result.attrition.supply_collapsed.then_some(next_tick);
+                    }
                 }
                 let local =
                     local_by_id
@@ -3366,7 +3382,18 @@ impl NativeRuntime {
         {
             let observations = tactical_contact_observations(&planning, inputs, &self.simulation);
             operations.ingest_tactical_contacts(next_tick, &observations);
-            operations.advance_task_forces(next_tick, inputs);
+            let collapsing_sides = staged_side_dynamics
+                .as_ref()
+                .map(|dynamics| {
+                    dynamics
+                        .iter()
+                        .filter_map(|(&side, dynamics)| {
+                            (dynamics.phase == WarPhase::Collapsing).then_some(side)
+                        })
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            operations.advance_task_forces(next_tick, inputs, &collapsing_sides);
             operations.evolve_overrides(next_tick, self.territory.country_to_side());
             let live_units = inputs
                 .iter()
@@ -5528,16 +5555,43 @@ mod tests {
             with_operational_state(with_live_battlefield(fixture(0, false), vec![0.0; 8]));
         let initial = uninterrupted.latest_snapshot();
         let initial_operations = initial.operational_snapshot.clone().unwrap();
+        uninterrupted.simulation.units[0].combat.lat = -89.0;
+        uninterrupted
+            .unit_policies
+            .get_mut(&1)
+            .unwrap()
+            .influence
+            .as_mut()
+            .unwrap()
+            .delta = 0.0;
+        uninterrupted
+            .battlefield
+            .as_mut()
+            .unwrap()
+            .config
+            .encirclement_radius = 90.0;
 
         uninterrupted.step().unwrap();
         let config = uninterrupted.config;
         let captured = uninterrupted.checkpoint_state().unwrap();
+        assert_eq!(
+            captured
+                .battlefield
+                .as_ref()
+                .unwrap()
+                .units
+                .get(&1)
+                .unwrap()
+                .supply_collapsed_tick,
+            Some(1)
+        );
         let mut resumed = NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap();
 
         let expected = uninterrupted.step().unwrap();
         let actual = resumed.step().unwrap();
         assert_eq!(actual, expected);
         assert_eq!(resumed.operations, uninterrupted.operations);
+        assert_eq!(resumed.battlefield, uninterrupted.battlefield);
         assert_eq!(actual.operational_snapshot, expected.operational_snapshot);
         assert!(!Arc::ptr_eq(
             actual.operational_snapshot.as_ref().unwrap(),
@@ -6562,6 +6616,59 @@ mod tests {
                 .unwrap()
                 .encircled_ticks,
             77
+        );
+    }
+
+    #[test]
+    fn supply_collapse_marker_commits_and_survives_exact_runtime_restore() {
+        let mut runtime = with_live_battlefield(fixture(0, false), vec![0.0; 8]);
+        runtime.simulation.units[0].combat.lat = -89.0;
+        runtime
+            .unit_policies
+            .get_mut(&1)
+            .unwrap()
+            .influence
+            .as_mut()
+            .unwrap()
+            .delta = 0.0;
+        runtime
+            .battlefield
+            .as_mut()
+            .unwrap()
+            .config
+            .encirclement_radius = 90.0;
+
+        runtime.step().unwrap();
+
+        assert_eq!(
+            runtime
+                .battlefield
+                .as_ref()
+                .unwrap()
+                .units
+                .get(&1)
+                .unwrap()
+                .supply_collapsed_tick,
+            Some(1)
+        );
+        let config = runtime.config;
+        let captured = runtime.checkpoint_state().unwrap();
+        let mut restored = NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap();
+        restored.simulation.units[0].combat.victory_boost_ticks = 3;
+
+        restored.step().unwrap();
+
+        assert_eq!(
+            restored
+                .battlefield
+                .as_ref()
+                .unwrap()
+                .units
+                .get(&1)
+                .unwrap()
+                .supply_collapsed_tick,
+            Some(1),
+            "ticks outside the supply scan preserve the browser marker"
         );
     }
 

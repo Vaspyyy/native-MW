@@ -23,6 +23,7 @@ cargo build --quiet --release --manifest-path "$native_root/Cargo.toml" -p mw-na
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-core committed_state_restore
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v2
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v7
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v8
 
 scenarios=(
 	"world-map-2022-v2.mwsc.gz"
@@ -143,7 +144,7 @@ naval_bin="$native_root/target/release/mw-native"
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 40 --tick-ms 1 --save-checkpoint "$save_tmp/full.json" "$modern_path" >/dev/null
 for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full.json"; do
 	jq -e '
-		.schema == "native-runtime-checkpoint-v7"
+		.schema == "native-runtime-checkpoint-v8"
 		and .sideDynamics.schema == "native-side-dynamics-v1"
 		and .operationalAi.schema == "native-operational-ai-v1"
 		and .operationalExecution.schema == "native-operational-execution-v1"
@@ -161,14 +162,18 @@ for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full
 		and (.sideDynamics.sides | length) == (.sides | length)
 	' "$checkpoint" >/dev/null
 done
-jq '.schema = "native-runtime-checkpoint-v5" | del(.operationalExecution, .airPower, .navalPlanning)' \
+jq '.schema = "native-runtime-checkpoint-v5"
+	| del(.operationalExecution, .airPower, .navalPlanning)
+	| del(.battlefield.units[].supplyCollapsedTick)' \
 	"$save_tmp/part.json" >"$save_tmp/part-v5.json"
 node "$native_root/scripts/js-browser-v5-wire.mjs" \
 	"$web_root" "$save_tmp/part-v5.json" "$save_tmp/browser-v5-wire.json"
 "$native_root/target/debug/mw-tools" native-runtime-fixture \
 	"$modern_path" "$save_tmp/browser-v5-wire.json" --ticks 1 --json >/dev/null
 printf 'browser v5 operationalAi wire to native loader gate ok\n'
-jq '.schema = "native-runtime-checkpoint-v6" | del(.navalPlanning)' \
+jq '.schema = "native-runtime-checkpoint-v6"
+	| del(.navalPlanning)
+	| del(.battlefield.units[].supplyCollapsedTick)' \
 	"$save_tmp/part.json" >"$save_tmp/part-v6.json"
 "$native_bin" --runtime-checkpoint "$save_tmp/part-v6.json" --headless --ticks 1 --tick-ms 1 \
 	--save-checkpoint "$save_tmp/resaved-v6.json" "$modern_path" >/dev/null
@@ -197,12 +202,12 @@ jq -e '
 	"$modern_path" "$save_tmp/browser-v6-wire.json" --ticks 1 --json >/dev/null
 printf 'browser v6 execution and air-power wire to native loader gate ok\n'
 diff -u <(jq -S 'del(.steps)' "$save_tmp/resumed.json") <(jq -S 'del(.steps)' "$save_tmp/full.json")
-printf 'native v7 save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'
+printf 'native v8 save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'
 
 "$naval_bin" --side "United Kingdom" --side Iceland --headless --ticks 1000 --tick-ms 1 \
 	--save-checkpoint "$save_tmp/naval-part.json" "$modern_path" >/dev/null
 jq -e '
-	.schema == "native-runtime-checkpoint-v7"
+	.schema == "native-runtime-checkpoint-v8"
 	and .navalPlanning.schema == "native-naval-planning-v1"
 	and .navalPlanning.nextOperationSequence > 1
 	and (.operationalExecution.navalOperations | length) >= 1

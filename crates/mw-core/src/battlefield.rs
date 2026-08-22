@@ -14,7 +14,10 @@ use crate::{
     ai::{ResolvedCombatModifiers, ResolvedMovementModifiers},
     combat::{UnitKind, wrapped_longitude_delta},
     direction::HostilityMatrix,
-    tactical::{PairOptions, SideKey, TacticalGrid, TacticalGridError, TacticalUnit},
+    tactical::{
+        NeighborOptions, PairOptions, SideKey, TacticalGrid, TacticalGridError, TacticalUnit,
+        tactical_cell_coords,
+    },
     world::{WorldGridError, WorldGridView},
 };
 
@@ -29,6 +32,10 @@ pub struct BattlefieldAttritionResult {
     pub encircled_ticks: u64,
     pub friendly_tiles: usize,
     pub supply_collapsed: bool,
+    /// Whether this tick evaluated and therefore replaced the browser's
+    /// `_supplyCollapsedTick` marker. Ticks outside the supply-cutoff gate
+    /// preserve the prior marker for the operational AI's 15-tick window.
+    pub supply_collapse_sampled: bool,
 }
 
 /// Browser-parity attrition arithmetic. This is intentionally pure: callers
@@ -54,6 +61,7 @@ fn calculate_attrition(
             encircled_ticks: 0,
             friendly_tiles: 0,
             supply_collapsed: false,
+            supply_collapse_sampled: false,
         };
     }
     let encircled = !at_sea
@@ -100,6 +108,7 @@ fn calculate_attrition(
             encircled_ticks,
             friendly_tiles: 0,
             supply_collapsed: false,
+            supply_collapse_sampled: false,
         };
     }
     let control = cell.map_or(0.0, |i| {
@@ -126,10 +135,12 @@ fn calculate_attrition(
     }
     let mut friendly_tiles = 0;
     let mut collapsed = false;
+    let mut supply_collapse_sampled = false;
     if enemy
         && !encircled
         && let Some(i) = cell
     {
+        supply_collapse_sampled = true;
         let radius = (0.8 / maps.world.grid_res).round() as isize;
         let row = (i / maps.world.width) as isize;
         let col = (i % maps.world.width) as isize;
@@ -167,6 +178,7 @@ fn calculate_attrition(
         encircled_ticks,
         friendly_tiles,
         supply_collapsed: collapsed,
+        supply_collapse_sampled,
     }
 }
 
@@ -285,6 +297,9 @@ pub struct BattlefieldUnitState {
     pub local_tactics_excluded: bool,
     pub encircled_ticks: u64,
     pub armor_support_last_tick: Option<u64>,
+    /// Last tick at which the browser supply-cutoff scan found no friendly
+    /// land. `None` represents JavaScript's `Number.NEGATIVE_INFINITY`.
+    pub supply_collapsed_tick: Option<u64>,
     pub last_ally_count: f64,
 }
 
@@ -296,6 +311,7 @@ impl Default for BattlefieldUnitState {
             local_tactics_excluded: false,
             encircled_ticks: 0,
             armor_support_last_tick: None,
+            supply_collapsed_tick: None,
             last_ally_count: 1.0,
         }
     }
@@ -556,6 +572,7 @@ pub struct BattlefieldLocalUnitResult {
     pub last_ally_count: f64,
     pub repulsion: Option<BattlefieldVector>,
     pub task_force_key: Option<u64>,
+    pub has_nearby_hostile: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -671,8 +688,21 @@ pub fn resolve_local_tactics(
     tick: u64,
     state: &BattlefieldRuntimeState,
     units: &[BattlefieldLocalUnitInput],
+    hostility: HostilityMatrix<'_>,
 ) -> Result<BattlefieldLocalTacticsResult, BattlefieldError> {
     validate_config(state.config)?;
+    let hostility_cells = hostility.max_sides.checked_mul(hostility.max_sides).ok_or(
+        BattlefieldError::InvalidBattlefieldState("hostility matrix dimensions overflow"),
+    )?;
+    if hostility.max_sides == 0
+        || hostility
+            .relations
+            .is_some_and(|relations| relations.len() != hostility_cells)
+    {
+        return Err(BattlefieldError::InvalidBattlefieldState(
+            "hostility matrix shape is invalid",
+        ));
+    }
     let mut input_ids = BTreeSet::new();
     let mut sides = BTreeSet::new();
     let mut tactical_units = Vec::with_capacity(units.len());
@@ -748,6 +778,7 @@ pub fn resolve_local_tactics(
             last_ally_count: strength,
             repulsion: None,
             task_force_key: unit.task_force_key,
+            has_nearby_hostile: false,
         });
         groups.entry((unit.side, group)).or_default().add(*unit);
         sides.insert(unit.side);
@@ -772,6 +803,43 @@ pub fn resolve_local_tactics(
     let mut grid = TacticalGrid::new(state.config.armor_support_radius)?;
     grid.rebuild(&tactical_units)?;
     let tactical_radius_sq = state.config.armor_support_radius.powi(2);
+    for (index, unit) in units.iter().enumerate() {
+        if unit.task_force_key.is_none() {
+            continue;
+        }
+        let Some(origin) =
+            tactical_cell_coords(unit.lat, unit.lng, state.config.armor_support_radius)?
+        else {
+            continue;
+        };
+        for &hostile_side in &sides {
+            if !side_keys_are_hostile(hostility, unit.side, hostile_side) {
+                continue;
+            }
+            grid.for_each_neighbor_cell(
+                hostile_side,
+                origin,
+                NeighborOptions { radius_cells: 1 },
+                |cell| {
+                    if results[index].has_nearby_hostile {
+                        return;
+                    }
+                    for &hostile_index in &cell.units {
+                        let hostile = units[hostile_index];
+                        let delta_lat = unit.lat - hostile.lat;
+                        let delta_lng = wrapped_longitude_delta(hostile.lng, unit.lng);
+                        if delta_lat * delta_lat + delta_lng * delta_lng <= tactical_radius_sq {
+                            results[index].has_nearby_hostile = true;
+                            break;
+                        }
+                    }
+                },
+            );
+            if results[index].has_nearby_hostile {
+                break;
+            }
+        }
+    }
     let repulsion_radius_sq = 0.45_f64.powi(2);
     for side in sides {
         grid.for_each_unordered_neighbor_pair(
@@ -814,25 +882,25 @@ pub fn resolve_local_tactics(
                 let distance = pair.distance_sq.sqrt();
                 let delta_lat = units[left].lat - units[right].lat;
                 let delta_lng = wrapped_longitude_delta(units[right].lng, units[left].lng);
-                let repulsion_scale = if units[left].task_force_key.is_some()
+                let slots_replace_repulsion = units[left].task_force_key.is_some()
                     && units[left].task_force_key == units[right].task_force_key
-                {
-                    0.35
-                } else {
-                    1.0
-                };
+                    && !results[left].has_nearby_hostile
+                    && !results[right].has_nearby_hostile;
+                if slots_replace_repulsion {
+                    return;
+                }
                 if !excluded[left] {
                     add_repulsion(
                         &mut results[left].repulsion,
-                        delta_lat / distance * repulsion_scale,
-                        delta_lng / distance * repulsion_scale,
+                        delta_lat / distance,
+                        delta_lng / distance,
                     );
                 }
                 if !excluded[right] {
                     add_repulsion(
                         &mut results[right].repulsion,
-                        -delta_lat / distance * repulsion_scale,
-                        -delta_lng / distance * repulsion_scale,
+                        -delta_lat / distance,
+                        -delta_lng / distance,
                     );
                 }
             },
@@ -1368,11 +1436,18 @@ fn unit_is_encircled(
 }
 
 fn sides_are_hostile(hostility: HostilityMatrix<'_>, left: SideKey, right: i16) -> bool {
-    if right < 0 || usize::from(left) == right as usize {
+    let Ok(right) = SideKey::try_from(right) else {
+        return false;
+    };
+    side_keys_are_hostile(hostility, left, right)
+}
+
+fn side_keys_are_hostile(hostility: HostilityMatrix<'_>, left: SideKey, right: SideKey) -> bool {
+    if left == right {
         return false;
     }
     let left = usize::from(left);
-    let right = right as usize;
+    let right = usize::from(right);
     if left >= hostility.max_sides || right >= hostility.max_sides {
         return false;
     }
@@ -1830,8 +1905,15 @@ mod tests {
         let collapsed = resolve(&maps, unit);
         assert!(!collapsed.encircled);
         assert!(collapsed.attrition.supply_collapsed);
+        assert!(collapsed.attrition.supply_collapse_sampled);
         assert_eq!(collapsed.attrition.friendly_tiles, 0);
         assert!(collapsed.attrition.damage > 2.5);
+        maps.dominant[1] = 0;
+        let resupplied = resolve(&maps, unit).attrition;
+        assert!(resupplied.supply_collapse_sampled);
+        assert!(!resupplied.supply_collapsed);
+        assert_eq!(resupplied.friendly_tiles, 1);
+        maps.dominant[1] = 1;
         maps.land[corner] = 2;
         let active_theater = resolve(&maps, unit);
         assert!(active_theater.attrition.damage > collapsed.attrition.damage);
@@ -1840,7 +1922,9 @@ mod tests {
         boosted.victory_boost_ticks = 1;
         assert!(resolve(&maps, boosted).attrition.damage > 0.0);
         boosted.victory_boost_ticks = 2;
-        assert_eq!(resolve(&maps, boosted).attrition.damage, 0.0);
+        let immune = resolve(&maps, boosted).attrition;
+        assert_eq!(immune.damage, 0.0);
+        assert!(!immune.supply_collapse_sampled);
 
         let center = 3 * WIDTH + 3;
         maps.dominant.fill(1);
@@ -1848,6 +1932,7 @@ mod tests {
         encircled.encircled_ticks = 60;
         let pressure = resolve(&maps, encircled);
         assert!(pressure.encircled);
+        assert!(!pressure.attrition.supply_collapse_sampled);
         assert_eq!(pressure.encircled_ticks, 61);
         assert!(pressure.attrition.damage > ATTRITION_DAMAGE * 5.0 * 1.5);
 
@@ -1915,23 +2000,39 @@ mod tests {
             ],
         );
 
-        let boundary = resolve_local_tactics(100, &state, &[armor, support]).unwrap();
+        let boundary = resolve_local_tactics(
+            100,
+            &state,
+            &[armor, support],
+            HostilityMatrix::new(None, 1),
+        )
+        .unwrap();
         assert!(boundary.units[0].armor_supported);
         assert_eq!(boundary.units[0].armor_support_last_tick, Some(88));
 
         state.units.get_mut(&1).unwrap().armor_support_last_tick = Some(87);
-        let expired = resolve_local_tactics(100, &state, &[armor, support]).unwrap();
+        let expired = resolve_local_tactics(
+            100,
+            &state,
+            &[armor, support],
+            HostilityMatrix::new(None, 1),
+        )
+        .unwrap();
         assert!(!expired.units[0].armor_supported);
         assert_eq!(expired.units[0].armor_support_last_tick, Some(87));
 
         let mut inside = support;
         inside.lng = 0.599;
-        let refreshed = resolve_local_tactics(100, &state, &[armor, inside]).unwrap();
+        let refreshed =
+            resolve_local_tactics(100, &state, &[armor, inside], HostilityMatrix::new(None, 1))
+                .unwrap();
         assert!(refreshed.units[0].armor_supported);
         assert_eq!(refreshed.units[0].armor_support_last_tick, Some(100));
 
         state.units.get_mut(&1).unwrap().local_tactics_excluded = true;
-        let excluded = resolve_local_tactics(101, &state, &[armor, inside]).unwrap();
+        let excluded =
+            resolve_local_tactics(101, &state, &[armor, inside], HostilityMatrix::new(None, 1))
+                .unwrap();
         assert!(!excluded.units[0].armor_supported);
         assert_eq!(excluded.units[0].armor_support_last_tick, Some(87));
     }
@@ -1952,15 +2053,20 @@ mod tests {
         );
         let first = local_unit(1, 1, UnitKind::Army, 0.0, 0.0, 2.0);
         let second = local_unit(2, 2, UnitKind::Army, 0.0, 0.5, 3.0);
-        let result = resolve_local_tactics(10, &state, &[first, second]).unwrap();
+        let result =
+            resolve_local_tactics(10, &state, &[first, second], HostilityMatrix::new(None, 1))
+                .unwrap();
         assert_close(result.units[0].last_ally_count, 2.0 + 3.0);
         assert_close(result.units[1].last_ally_count, 3.0 + 2.0 * 50.0);
     }
 
     #[test]
-    fn shared_task_force_reduces_only_its_pairwise_repulsion() {
-        let countries = BTreeMap::from([(1, CountryBattlefieldPrimitives::default())]);
-        let state = battlefield_state(
+    fn shared_task_force_suppresses_repulsion_only_outside_hostile_contact() {
+        let countries = BTreeMap::from([
+            (1, CountryBattlefieldPrimitives::default()),
+            (2, CountryBattlefieldPrimitives::default()),
+        ]);
+        let mut state = battlefield_state(
             countries,
             [
                 (1, BattlefieldUnitState::default()),
@@ -1971,12 +2077,32 @@ mod tests {
         let mut second = local_unit(2, 1, UnitKind::Army, 0.0, 0.2, 1.0);
         first.task_force_key = Some(7);
         second.task_force_key = Some(7);
-        let shared = resolve_local_tactics(10, &state, &[first, second]).unwrap();
-        assert_close(shared.units[0].repulsion.unwrap().lng.abs(), 0.35);
+        let shared =
+            resolve_local_tactics(10, &state, &[first, second], HostilityMatrix::new(None, 1))
+                .unwrap();
+        assert!(shared.units[0].repulsion.is_none());
+        assert!(!shared.units[0].has_nearby_hostile);
 
         second.task_force_key = Some(8);
-        let distinct = resolve_local_tactics(10, &state, &[first, second]).unwrap();
+        let distinct =
+            resolve_local_tactics(10, &state, &[first, second], HostilityMatrix::new(None, 1))
+                .unwrap();
         assert_close(distinct.units[0].repulsion.unwrap().lng.abs(), 1.0);
+
+        let mut hostile = local_unit(3, 2, UnitKind::Army, 0.0, 0.5, 1.0);
+        hostile.side = 1;
+        state.units.insert(3, BattlefieldUnitState::default());
+        let relations = [0, 1, 1, 0];
+        let contacted = resolve_local_tactics(
+            10,
+            &state,
+            &[first, second, hostile],
+            HostilityMatrix::new(Some(&relations), 2),
+        )
+        .unwrap();
+        assert!(contacted.units[0].has_nearby_hostile);
+        assert!(contacted.units[1].has_nearby_hostile);
+        assert_close(contacted.units[0].repulsion.unwrap().lng.abs(), 1.0);
     }
 
     #[test]
@@ -2011,7 +2137,9 @@ mod tests {
         first.previous_dir_lng = 1.0;
         let mut second = local_unit(2, 1, UnitKind::Army, 1.0, 0.0, 1.0);
         second.previous_dir_lng = 1.0;
-        let tactics = resolve_local_tactics(1, &state, &[first, second]).unwrap();
+        let tactics =
+            resolve_local_tactics(1, &state, &[first, second], HostilityMatrix::new(None, 1))
+                .unwrap();
         let group = tactics.groups.get(&(0, 0)).unwrap();
         assert_eq!(group.count, 2);
         assert_close(group.lat, 0.5);
