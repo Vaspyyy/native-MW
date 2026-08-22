@@ -12,7 +12,7 @@ use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
     write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
-    write_runtime_checkpoint_state_v10,
+    write_runtime_checkpoint_state_v10, write_runtime_checkpoint_state_v11,
 };
 use mw_core::{
     CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
@@ -177,7 +177,12 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.reinforcement.is_some() && state.naval_planning.is_some() {
+        let writer = if state.material_logistics.is_some()
+            && state.reinforcement.is_some()
+            && state.naval_planning.is_some()
+        {
+            write_runtime_checkpoint_state_v11
+        } else if state.reinforcement.is_some() && state.naval_planning.is_some() {
             write_runtime_checkpoint_state_v10
         } else if state.naval_planning.is_some() {
             write_runtime_checkpoint_state_v9

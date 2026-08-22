@@ -64,7 +64,8 @@ use crate::{
         StrategicDerivationInput, TerritoryCommitMarker, derive_strategic_cycle_input,
     },
     reinforcement::{
-        AirPayCycleOutcome, ReinforcementError, ReinforcementState, bootstrap_reinforcement_state,
+        AirPayCycleOutcome, MAX_ARMOR_CAPACITY, MaterialLogisticsState, MaterialPayCycleOutcome,
+        ReinforcementError, ReinforcementState, bootstrap_reinforcement_state,
     },
     scenario::GridSpec,
     simulation::{
@@ -304,6 +305,12 @@ pub struct RuntimeReinforcementCounters {
     pub aircraft_purchased: u64,
     pub aircraft_reinforced: u64,
     pub air_wings_created: u64,
+    pub armor_purchased: u64,
+    pub armor_reinforced: u64,
+    pub armor_formations_created: u64,
+    pub airfields_repaired: u64,
+    pub aircraft_evacuated: u64,
+    pub aircraft_lost_on_capitulation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -373,6 +380,8 @@ pub struct RuntimeSnapshot {
     pub personnel_reserves: Arc<BTreeMap<usize, f64>>,
     /// Immutable aircraft reserves, funding, and monotonic formation-ID continuation.
     pub reinforcement_snapshot: Option<Arc<ReinforcementState>>,
+    /// Immutable armor reserves, quality, and material-maintenance continuation.
+    pub material_logistics_snapshot: Option<Arc<MaterialLogisticsState>>,
 }
 
 #[derive(Debug, Error)]
@@ -1515,6 +1524,8 @@ pub struct RuntimeCheckpoint {
     pub air_power: Option<AirPowerState>,
     /// Checkpoint v10 aircraft reserves, funding, and monotonic formation allocators.
     pub reinforcement: Option<ReinforcementState>,
+    /// Checkpoint v11 armor reserves and material-maintenance state.
+    pub material_logistics: Option<MaterialLogisticsState>,
 }
 
 /// Owned state captured at a committed, serialization-ready runtime boundary.
@@ -1553,6 +1564,7 @@ pub struct NativeRuntimeCheckpointState {
     pub operational_execution: Option<OperationalExecutionState>,
     pub air_power: Option<AirPowerState>,
     pub reinforcement: Option<ReinforcementState>,
+    pub material_logistics: Option<MaterialLogisticsState>,
 }
 
 /// Shared native simulation owner. No mutable kernel state is exposed to renderers.
@@ -1586,6 +1598,7 @@ pub struct NativeRuntime {
     operational_execution: Option<OperationalExecutionState>,
     air_power: Option<AirPowerState>,
     reinforcement: Option<ReinforcementState>,
+    material_logistics: Option<MaterialLogisticsState>,
     state: RuntimeState,
     latest: Arc<RuntimeSnapshot>,
     render_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
@@ -1663,6 +1676,51 @@ fn air_pay_cycle_counters(outcome: &AirPayCycleOutcome) -> RuntimeReinforcementC
                 .filter(|creation| creation.created_wing_id.is_some())
                 .count() as u64,
         );
+    }
+    counters
+}
+
+fn material_pay_cycle_counters(outcome: &MaterialPayCycleOutcome) -> RuntimeReinforcementCounters {
+    let mut counters = RuntimeReinforcementCounters::default();
+    for country in &outcome.countries {
+        counters.aircraft_purchased = counters.aircraft_purchased.saturating_add(u64::from(
+            country
+                .air
+                .fighters_purchased
+                .saturating_add(country.air.strike_purchased),
+        ));
+        counters.aircraft_reinforced = counters.aircraft_reinforced.saturating_add(u64::from(
+            country
+                .air
+                .fighters_reinforced
+                .saturating_add(country.air.strike_reinforced),
+        ));
+        counters.air_wings_created = counters.air_wings_created.saturating_add(
+            country
+                .air
+                .wing_creation
+                .iter()
+                .filter(|creation| creation.created_wing_id.is_some())
+                .count() as u64,
+        );
+        counters.armor_purchased = counters
+            .armor_purchased
+            .saturating_add(country.armor_purchased);
+        counters.armor_reinforced = counters
+            .armor_reinforced
+            .saturating_add(country.armor_reinforced);
+        counters.armor_formations_created = counters
+            .armor_formations_created
+            .saturating_add(u64::from(country.armor_creation.created_unit_id.is_some()));
+        counters.airfields_repaired = counters
+            .airfields_repaired
+            .saturating_add(u64::from(country.airfields_repaired));
+        counters.aircraft_evacuated = counters
+            .aircraft_evacuated
+            .saturating_add(country.evacuated_aircraft);
+        counters.aircraft_lost_on_capitulation = counters
+            .aircraft_lost_on_capitulation
+            .saturating_add(country.lost_aircraft);
     }
     counters
 }
@@ -2538,6 +2596,111 @@ fn operational_country_inputs(
         .collect())
 }
 
+fn material_armor_profiles(
+    simulation: &Simulation,
+    scenario: &ScenarioProduction,
+    strategic: &StrategicSimulation,
+    country_to_side: &BTreeMap<u16, usize>,
+) -> Result<BTreeMap<u16, (u64, f64)>, RuntimeError> {
+    let mut live_capacity = BTreeMap::<u16, u64>::new();
+    let mut weighted_quality = BTreeMap::<u16, (f64, u64)>::new();
+    for unit in &simulation.units {
+        if unit.combat.kind != UnitKind::Armor {
+            continue;
+        }
+        let country_id = u16::try_from(unit.combat.sovereign)
+            .map_err(|_| RuntimeError::InvalidCheckpoint("invalid armor sovereign"))?;
+        let capacity = unit.combat.max_equipment.max(unit.combat.equipment);
+        let live = live_capacity.entry(country_id).or_default();
+        *live = live
+            .checked_add(capacity)
+            .ok_or(RuntimeError::InvalidCheckpoint("armor capacity overflowed"))?;
+        let quality = weighted_quality.entry(country_id).or_default();
+        quality.0 += unit.combat.quality * capacity as f64;
+        quality.1 = quality.1.saturating_add(capacity);
+    }
+    country_to_side
+        .keys()
+        .copied()
+        .map(|country_id| {
+            let country = scenario
+                .countries
+                .iter()
+                .find(|country| country.country_id == country_id)
+                .ok_or(RuntimeError::InvalidCheckpoint(
+                    "material country is absent from production",
+                ))?;
+            let economy =
+                strategic
+                    .economies()
+                    .get(&country_id)
+                    .ok_or(RuntimeError::InvalidCheckpoint(
+                        "material country has no economy",
+                    ))?;
+            let fallback =
+                (country.expected_army_units.max(0.0) * economy.economic_strength.max(0.0)).sqrt()
+                    * 8.0;
+            let fallback = fallback.round().clamp(0.0, MAX_ARMOR_CAPACITY as f64) as u64;
+            let capacity = fallback.max(live_capacity.get(&country_id).copied().unwrap_or(0));
+            let quality = weighted_quality
+                .get(&country_id)
+                .filter(|(_, weight)| *weight > 0)
+                .map_or(50.0, |(weighted, weight)| weighted / *weight as f64)
+                .clamp(0.0, 100.0);
+            Ok((country_id, (capacity, quality)))
+        })
+        .collect()
+}
+
+fn material_home_positions(
+    simulation: &Simulation,
+    scenario: &ScenarioProduction,
+    territory: &TerritoryControl,
+) -> BTreeMap<u16, (f64, f64)> {
+    territory
+        .country_to_side()
+        .iter()
+        .filter_map(|(&country_id, &side)| {
+            let capital = scenario.cities.iter().find(|city| {
+                city.owner_id == country_id
+                    && city.capital
+                    && city.cell < territory.total_cells()
+                    && territory.world_control()[city.cell] == country_id
+                    && territory.dominant_side()[city.cell] == side as i16
+            });
+            if let Some(capital) = capital {
+                return Some((country_id, (capital.lat, capital.lng)));
+            }
+            if let Some(unit) = simulation
+                .units
+                .iter()
+                .find(|unit| unit.combat.sovereign == u64::from(country_id) && !unit.combat.at_sea)
+            {
+                return Some((country_id, (unit.combat.lat, unit.combat.lng)));
+            }
+            territory
+                .world_control()
+                .iter()
+                .zip(territory.dominant_side())
+                .enumerate()
+                .find(|&(_, (&controller, &dominant))| {
+                    controller == country_id && dominant == side as i16
+                })
+                .map(|(cell, _)| {
+                    let x = cell % territory.width();
+                    let y = cell / territory.width();
+                    (
+                        country_id,
+                        (
+                            -90.0 + (y as f64 + 0.5) * territory.grid_resolution(),
+                            -180.0 + (x as f64 + 0.5) * territory.grid_resolution(),
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
 impl NativeRuntime {
     /// Validate the complete checkpoint, establish a coherent census, and publish tick zero (or
     /// the restored checkpoint tick) atomically from the caller's perspective.
@@ -2756,6 +2919,33 @@ impl NativeRuntime {
             }
             (None, _) => {}
         }
+        if checkpoint.material_logistics.is_none() && checkpoint.reinforcement.is_some() {
+            let profiles = material_armor_profiles(
+                &checkpoint.simulation,
+                &checkpoint.scenario,
+                &checkpoint.strategic,
+                checkpoint.territory.country_to_side(),
+            )?;
+            checkpoint.material_logistics = Some(MaterialLogisticsState::bootstrap(
+                &checkpoint.simulation.units,
+                &profiles,
+                checkpoint.territory.country_to_side(),
+                checkpoint.territory.max_sides(),
+            )?);
+        }
+        match (&checkpoint.material_logistics, &checkpoint.reinforcement) {
+            (Some(material), Some(_)) => material.validate(
+                &checkpoint.simulation.units,
+                checkpoint.territory.country_to_side(),
+                checkpoint.territory.max_sides(),
+            )?,
+            (Some(_), None) => {
+                return Err(RuntimeError::InvalidCheckpoint(
+                    "material logistics requires reinforcement state",
+                ));
+            }
+            (None, _) => {}
+        }
         if let Some(operations) = &checkpoint.operations {
             let live_units = checkpoint
                 .simulation
@@ -2952,6 +3142,10 @@ impl NativeRuntime {
                 .reinforcement
                 .as_ref()
                 .map(|reinforcement| Arc::new(reinforcement.clone())),
+            material_logistics_snapshot: checkpoint
+                .material_logistics
+                .as_ref()
+                .map(|material| Arc::new(material.clone())),
         });
 
         Ok(Self {
@@ -2984,6 +3178,7 @@ impl NativeRuntime {
             operational_execution: checkpoint.operational_execution,
             air_power: checkpoint.air_power,
             reinforcement: checkpoint.reinforcement,
+            material_logistics: checkpoint.material_logistics,
             state: initial_state,
             latest,
             render_updates,
@@ -3079,6 +3274,7 @@ impl NativeRuntime {
             operational_execution: self.operational_execution.clone(),
             air_power: self.air_power.clone(),
             reinforcement: self.reinforcement.clone(),
+            material_logistics: self.material_logistics.clone(),
         })
     }
 
@@ -3648,6 +3844,7 @@ impl NativeRuntime {
         let mut staged_operational_execution = self.operational_execution.clone();
         let mut staged_air_power = self.air_power.clone();
         let mut staged_reinforcement = self.reinforcement.clone();
+        let mut staged_material_logistics = self.material_logistics.clone();
         let mut staged_strategic = self.strategic.clone();
         let mut staged_gameplay_rng = self.gameplay_rng;
         let mut staged_personnel_reserves = self.personnel_reserves.clone();
@@ -4559,6 +4756,8 @@ impl NativeRuntime {
         let mut strategic_fronts_invalidated = false;
         let mut staged_command_policies = None;
         let mut reinforcement_counters = RuntimeReinforcementCounters::default();
+        let mut staged_material_units = None;
+        let mut material_created_ids = BTreeSet::new();
         if strategic_due {
             let derived = match derive_production_input(
                 next_tick,
@@ -4668,25 +4867,50 @@ impl NativeRuntime {
                     .iter()
                     .map(|(&country, economy)| (country, economy.treasury))
                     .collect::<BTreeMap<_, _>>();
-                let mut air_economies = staged_strategic.economies().clone();
-                let outcome = reinforcement.settle_air_pay_cycle(
-                    air_power,
-                    &mut air_economies,
-                    &mut staged_personnel_reserves,
-                    self.territory.country_to_side(),
-                    self.territory.max_sides(),
-                )?;
-                let air_costs = air_economies
+                let mut maintenance_economies = staged_strategic.economies().clone();
+                if let Some(material) = &mut staged_material_logistics {
+                    let mut logistics_units = self.simulation.units.clone();
+                    let home_positions =
+                        material_home_positions(&self.simulation, &self.scenario, &self.territory);
+                    let outcome = reinforcement.settle_material_pay_cycle(
+                        material,
+                        &mut logistics_units,
+                        air_power,
+                        &mut maintenance_economies,
+                        &mut staged_personnel_reserves,
+                        self.territory.country_to_side(),
+                        self.territory.max_sides(),
+                        &home_positions,
+                        self.config.production.max_units_per_side,
+                    )?;
+                    material_created_ids.extend(
+                        outcome
+                            .countries
+                            .iter()
+                            .filter_map(|country| country.armor_creation.created_unit_id),
+                    );
+                    reinforcement_counters = material_pay_cycle_counters(&outcome);
+                    staged_material_units = Some(logistics_units);
+                } else {
+                    let outcome = reinforcement.settle_air_pay_cycle(
+                        air_power,
+                        &mut maintenance_economies,
+                        &mut staged_personnel_reserves,
+                        self.territory.country_to_side(),
+                        self.territory.max_sides(),
+                    )?;
+                    reinforcement_counters = air_pay_cycle_counters(&outcome);
+                }
+                let maintenance_costs = maintenance_economies
                     .iter()
                     .filter_map(|(&country, economy)| {
                         let spent = treasury_before[&country] - economy.treasury;
                         (spent > 0.0).then_some((country, spent))
                     })
                     .collect::<Vec<_>>();
-                if !air_costs.is_empty() {
-                    staged_strategic.spend_treasury_batch(&air_costs)?;
+                if !maintenance_costs.is_empty() {
+                    staged_strategic.spend_treasury_batch(&maintenance_costs)?;
                 }
-                reinforcement_counters = air_pay_cycle_counters(&outcome);
                 strategic_snapshot = staged_strategic.latest_snapshot();
             }
         }
@@ -4758,14 +4982,90 @@ impl NativeRuntime {
             }
         }
 
+        let mut material_created_units = Vec::new();
+        let mut material_policies = Vec::new();
+        let mut material_battlefield_units = BTreeMap::new();
+        let mut staged_material_simulation = None;
+        if let Some(units) = staged_material_units {
+            let previous_units = self.simulation.units.clone();
+            let material_simulation = Simulation::new(simulation_config, units)?;
+            let allies = self.territory.country_to_side().iter().fold(
+                BTreeMap::<usize, BTreeSet<u16>>::new(),
+                |mut by_side, (&country, &side)| {
+                    by_side.entry(side).or_default().insert(country);
+                    by_side
+                },
+            );
+            for unit in material_simulation
+                .units
+                .iter()
+                .filter(|unit| material_created_ids.contains(&unit.combat.id))
+            {
+                let country_id = u16::try_from(unit.combat.sovereign).map_err(|_| {
+                    RuntimeError::InvalidCheckpoint("material unit sovereign exceeds u16")
+                })?;
+                let side = unit.combat.side as usize;
+                let mut policy = RuntimeUnitPolicy::standard(unit.combat.id, country_id);
+                policy.ai.deploy_until_tick = next_tick
+                    .checked_add(RECRUIT_DEPLOY_TICKS)
+                    .ok_or(RuntimeError::ClockOverflow)?;
+                let influence = policy
+                    .influence
+                    .as_mut()
+                    .expect("standard material policy has influence");
+                influence.browser_temporal_seed = Some(unit.combat.id as f64);
+                influence.owner_ally_country_ids = allies.get(&side).cloned().unwrap_or_default();
+                if let Some((source_id, source)) = previous_units
+                    .iter()
+                    .find(|source| source.combat.sovereign == unit.combat.sovereign)
+                    .and_then(|source| {
+                        self.unit_policies
+                            .get(&source.combat.id)
+                            .map(|policy| (source.combat.id, policy))
+                    })
+                {
+                    policy.command = source.command;
+                    if let Some(resolved) = staged_command_policies
+                        .as_ref()
+                        .and_then(|staged| staged.policies.get(&source_id))
+                    {
+                        policy.command = UnitCommandPolicy {
+                            band: resolved.band,
+                            discipline: resolved.discipline,
+                            refuses_offense: resolved.refuses_offense,
+                            return_home: resolved.return_home,
+                            self_defense_only: resolved.self_defense_only,
+                            home_target: resolved.home_target,
+                            transition_cycle: staged_command_policies
+                                .as_ref()
+                                .expect("resolved command came from staged command policies")
+                                .cycle,
+                        };
+                    }
+                }
+                material_battlefield_units.insert(
+                    unit.combat.id,
+                    BattlefieldUnitState {
+                        cohesion_seed: (unit.combat.id % 4) as f64 / 1_000.0,
+                        ..BattlefieldUnitState::default()
+                    },
+                );
+                material_policies.push(policy);
+                material_created_units.push(unit.clone());
+            }
+            staged_material_simulation = Some(material_simulation);
+        }
+
         // Browser recruitment runs after the current tactical simulation. New formations are
         // published immediately but remain deployment-inactive and enter planning next tick.
-        let staged_recruitment = if matches!(next_state, RuntimeState::Running) {
+        let mut staged_recruitment = if matches!(next_state, RuntimeState::Running) {
             if let Some(reinforcement) = &mut staged_reinforcement {
                 stage_recruitment(
                     next_tick,
                     next_frame,
-                    &self.simulation,
+                    staged_material_simulation
+                        .as_ref()
+                        .unwrap_or(&self.simulation),
                     &self.scenario,
                     &self.territory,
                     &territory_snapshot,
@@ -4783,9 +5083,20 @@ impl NativeRuntime {
         } else {
             StagedRecruitment::default()
         };
+        staged_recruitment.policies.extend(material_policies);
+        staged_recruitment
+            .battlefield_units
+            .extend(material_battlefield_units);
         if !staged_recruitment.treasury_costs.is_empty() {
             staged_strategic.spend_recruitment_batch(&staged_recruitment.treasury_costs)?;
             strategic_snapshot = staged_strategic.latest_snapshot();
+        }
+        if let Some(simulation) = staged_material_simulation {
+            self.simulation = simulation;
+            frame_snapshot.units = self
+                .simulation
+                .initial_snapshot(next_tick, next_frame)
+                .units;
         }
         if !staged_recruitment.units.is_empty() {
             self.simulation
@@ -4828,6 +5139,11 @@ impl NativeRuntime {
         self.unit_sovereign_by_id.extend(
             staged_recruitment
                 .units
+                .iter()
+                .map(|unit| (unit.combat.id, unit.combat.sovereign as u16)),
+        );
+        self.unit_sovereign_by_id.extend(
+            material_created_units
                 .iter()
                 .map(|unit| (unit.combat.id, unit.combat.sovereign as u16)),
         );
@@ -4887,6 +5203,7 @@ impl NativeRuntime {
         self.operational_execution = staged_operational_execution;
         self.air_power = staged_air_power;
         self.reinforcement = staged_reinforcement;
+        self.material_logistics = staged_material_logistics;
         self.strategic = staged_strategic;
         self.gameplay_rng = staged_gameplay_rng;
         self.personnel_reserves = staged_personnel_reserves;
@@ -4971,6 +5288,10 @@ impl NativeRuntime {
                 .reinforcement
                 .as_ref()
                 .map(|reinforcement| Arc::new(reinforcement.clone())),
+            material_logistics_snapshot: self
+                .material_logistics
+                .as_ref()
+                .map(|material| Arc::new(material.clone())),
         });
         self.latest = published.clone();
         Ok(published)
@@ -5985,6 +6306,7 @@ mod tests {
                 operational_execution: None,
                 air_power: None,
                 reinforcement: None,
+                material_logistics: None,
             },
         )
         .unwrap()
@@ -6025,6 +6347,7 @@ mod tests {
             operational_execution: state.operational_execution,
             air_power: state.air_power,
             reinforcement: state.reinforcement,
+            material_logistics: state.material_logistics,
         }
     }
 
@@ -6324,11 +6647,19 @@ mod tests {
         );
         assert_eq!(actual.personnel_reserves, expected.personnel_reserves);
         assert_eq!(actual.gameplay_rng_state, expected.gameplay_rng_state);
+        assert_eq!(
+            actual.material_logistics_snapshot,
+            expected.material_logistics_snapshot
+        );
         let expected_state = uninterrupted.checkpoint_state().unwrap();
         let actual_state = restored.checkpoint_state().unwrap();
         assert_eq!(actual_state.strategic_cycle, expected_state.strategic_cycle);
         assert_eq!(actual_state.economies, expected_state.economies);
         assert_eq!(actual_state.occupations, expected_state.occupations);
+        assert_eq!(
+            actual_state.material_logistics,
+            expected_state.material_logistics
+        );
         assert_eq!(old_reinforcement.countries[0].air_operations_due, 1.5);
     }
 

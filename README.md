@@ -34,12 +34,12 @@ reference while systems move into the renderer-independent `mw-core` crate.
   native `wgpu` unit overlay
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
-- versioned browser-to-native checkpoints: loadable legacy v1-v9 state plus
-  strict native v10 continuation with exact influence work, side dynamics,
+- versioned browser-to-native checkpoints: loadable legacy v1-v10 state plus
+  strict native v11 continuation with exact influence work, side dynamics,
   observer-scoped operational AI, naval planning/execution, air missions, and
   per-unit operational-feedback history, replay-safe gameplay RNG, and
-  side-level recruitable personnel and aircraft reserves with monotonic unit
-  and air-wing allocators
+  side-level recruitable personnel, aircraft and armor reserves, controlled
+  airfield repair, capitulation cleanup, and monotonic unit/air-wing allocators
 - deterministic naval invasion proposal and bounded sea-route generation plus
   invasion, supply, and fast-transport phase execution;
   full persistent defender-reaction recruitment/steering/cancellation; and
@@ -80,7 +80,7 @@ cargo run --release -p mw-tools -- native-runtime-fixture ../modern-wars/assets/
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
-`native-runtime-fixture` accepts ten versioned checkpoint
+`native-runtime-fixture` accepts eleven versioned checkpoint
 boundaries. Checkpoint v1 retains `postStartWar`, which is
 production-resumable only at tick, frame, and strategic cycle zero, and the
 synthetic non-resumable `baselineReplay` fixture/benchmark boundary.
@@ -118,6 +118,12 @@ spending, and monotonic land-unit and air-wing ID cursors. Recruitment consumes
 the side personnel reserve and treasury in browser RNG order; air operations,
 replacement purchasing, wing reinforcement, and bounded missing-wing creation
 settle after the mandatory 600-tick economy cycle.
+Checkpoint v11 retains v10 and requires strict `materialLogistics`: an immutable
+per-country material snapshot plus browser-ordered air funding, controlled-airfield
+repair, armor/fighter/strike purchases, existing armor/wing reinforcement, and
+bounded creation of one armor formation and one wing per role. Crew and treasury
+bounds are transactional. Capitulation clears reserves and resolves aircraft
+evacuation/loss; v10 remains loadable. This does not claim full UI parity.
 
 The browser exports v1 by default for compatibility. After a war has advanced,
 request the current v6 handoff explicitly from its console:
@@ -170,7 +176,7 @@ cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" "$scenari
 cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
 ```
 
-Both production paths accept exact-state v1 `postStartWar` and v2-v10 `midWar`
+Both production paths accept exact-state v1 `postStartWar` and v2-v11 `midWar`
 checkpoints. V1/v2 remain loadable under their legacy influence behavior; v3
 restores the strict `influenceRuntime` state, v4 enables live side dynamics, v5
 restores operational AI, v6 enables naval/defender/air execution, and native v7
@@ -201,7 +207,7 @@ Native-only startup accepts repeated `--side` selectors (country ID or unique
 case-insensitive name) and uses deterministic all-Army bootstrap forces. Use
 `--save-checkpoint PATH` for exact-step headless saves; windowed mode also
 supports `S` and save-on-exit when a path is configured. New native-war saves
-use v10; legacy runtimes select the newest schema supported by their owned state.
+use v11; legacy runtimes select the newest schema supported by their owned state.
 All retain frontline objectives, assignment priors, and the refresh phase; v3+
 retain frontier queues, v4+ retain momentum/phase/posture/personnel, v5 adds
 operational AI, v6 adds naval/defender/air execution, v7 adds native naval
@@ -211,14 +217,14 @@ adds live aircraft logistics plus formation allocators. Stock MWSC bootstrap
 uses the explicit flat-terrain fallback described above. This path does not yet cover every
 browser AI/combat resolver or non-land force system.
 
-Checkpoints v2-v10 are resumable-running-state formats. If a requested headless
+Checkpoints v2-v11 are resumable-running-state formats. If a requested headless
 or windowed save reaches `ConflictResolved`, the runtime finishes cleanly and
 reports that the save was skipped instead of writing a terminal file that the
 loader could not resume.
 
 ```bash
-cargo run --release -p mw-native -- --side Germany --side Czechia --headless --ticks 2 --save-checkpoint /tmp/mw-v10.json "$scenario"
-cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v10.json --headless --ticks 3 --save-checkpoint /tmp/mw-v10-resumed.json "$scenario"
+cargo run --release -p mw-native -- --side Germany --side Czechia --headless --ticks 2 --save-checkpoint /tmp/mw-v11.json "$scenario"
+cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v11.json --headless --ticks 3 --save-checkpoint /tmp/mw-v11-resumed.json "$scenario"
 ```
 
 `mw-native --demo-units`, production checkpoint viewing, native headless
@@ -314,7 +320,7 @@ map. Conflict resolution publishes a final immutable result and enters a clean
 terminal state instead of requiring an external acknowledge-and-continue
 step.
 
-This remains a bounded simulation port. Mid-war v2-v10 do not serialize a
+This remains a bounded simulation port. Mid-war v2-v11 do not serialize a
 partial census or render queues; v3+ preserve pending influence frontier work,
 and v4+ preserve side dynamics. The surrender path does not yet include
 the browser's
@@ -363,8 +369,15 @@ order; successful recruits publish immediately as immutable unit snapshots and
 remain deployment-inactive for 30 ticks. Native settlement commits after the
 current tactical step, so refreshed air funding affects the next air tick.
 
-Remaining bounded omissions include equipment-reserve evolution and the full
-gameplay UI. Native `frame` advances once per runtime
+Checkpoint v11 material logistics runs in strict order: air funding, controlled
+airfield repair, armor/fighter/strike purchases, existing armor/wing
+reinforcement, then at most one armor formation and one wing per role. Crew and
+treasury bounds, the immutable material snapshot, and capitulation reserve
+cleanup plus aircraft evacuation/loss are included. V10 remains loadable; this
+does not claim full UI parity.
+
+Remaining bounded omissions include the full gameplay UI and broader browser
+presentation parity. Native `frame` advances once per runtime
 step; a browser speed mode may execute several logical ticks in one RAF frame,
 so frame-window mechanics after handoff follow deterministic native cadence. These contracts are not a claim
 of exact full-browser tick parity.

@@ -495,6 +495,7 @@ impl AirPowerState {
                     wing.return_airfield_id = Some(replacement);
                     clear_target(&mut wing);
                     wing.state = AirWingState::Returning;
+                    wing.rearm_ticks = 0;
                 } else {
                     ground_wing(&mut wing);
                 }
@@ -1609,6 +1610,38 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, AirError::InvalidWorld("hostility relation"));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn captured_base_redirects_rearming_wing_without_stale_timer() {
+        let mut fighter = wing(1, 0, 1, 10, AirRole::Fighter, 0.0, 0.0);
+        fighter.state = AirWingState::Rearming;
+        fighter.rearm_ticks = FIGHTER_REARM_TICKS;
+        let mut state = AirPowerState::new(
+            vec![field(10, 0, 1, 0.0, 0.0), field(20, 0, 1, 0.0, 1.0)],
+            vec![fighter],
+        )
+        .unwrap();
+        let controllers = BTreeMap::from([(
+            10,
+            AirfieldController {
+                side: 1,
+                controller_country_id: 2,
+            },
+        )]);
+
+        advance(
+            &mut state,
+            AIR_TICK_INTERVAL,
+            &BTreeMap::new(),
+            &[],
+            &controllers,
+        );
+
+        assert_eq!(state.wings[0].state, AirWingState::Returning);
+        assert_eq!(state.wings[0].return_airfield_id, Some(20));
+        assert_eq!(state.wings[0].rearm_ticks, 0);
+        assert!(state.validate().is_ok());
     }
 
     #[test]

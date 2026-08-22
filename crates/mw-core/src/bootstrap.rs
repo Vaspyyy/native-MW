@@ -111,7 +111,7 @@ fn bootstrap_air_power(
             capacity: 8,
             health: 100.0,
             disabled: false,
-            capture_repair_cycles: 0,
+            capture_repair_cycles: crate::reinforcement::AIRFIELD_CAPTURE_REPAIR_CYCLES,
             capital: true,
         });
         for role in [AirRole::Fighter, AirRole::Strike] {
@@ -708,6 +708,7 @@ pub fn bootstrap_native_war(
             operational_execution: Some(OperationalExecutionState::default()),
             air_power: Some(air_power),
             reinforcement: Some(reinforcement),
+            material_logistics: None,
         },
     )?)
 }
