@@ -17,6 +17,7 @@ use crate::{
     economy::{
         EconomyState, PAYROLL_PER_UNIT, STARTING_RESERVE_CYCLES, TARGET_STARTING_PAYROLL_SHARE,
     },
+    naval_planning::{NavalPlanningError, NavalPlanningState},
     operational_execution::OperationalExecutionState,
     operations::{CountryDesperationMode, CountryDesperationState, OperationalRuntimeState},
     production::{ProductionConfig, derive_scenario_production},
@@ -50,6 +51,8 @@ pub enum NativeWarBootstrapError {
     Simulation(#[from] crate::simulation::SimulationError),
     #[error("air power: {0}")]
     Air(#[from] AirError),
+    #[error("naval planning: {0}")]
+    NavalPlanning(#[from] NavalPlanningError),
     #[error("strategic: {0}")]
     Strategic(#[from] crate::strategic::StrategicError),
     #[error("runtime: {0}")]
@@ -648,6 +651,7 @@ pub fn bootstrap_native_war(
             casualties_by_victim: BTreeMap::new(),
             side_dynamics: Some(side_dynamics),
             operations: Some(operations),
+            naval_planning: Some(NavalPlanningState::bootstrap(n)?),
             operational_execution: Some(OperationalExecutionState::default()),
             air_power: Some(air_power),
         },
@@ -727,6 +731,7 @@ mod tests {
         }
         let state = first.checkpoint_state().unwrap();
         assert_eq!(state.economies.len(), 3);
+        assert_eq!(state.naval_planning.as_ref().unwrap().side_states.len(), 2);
         assert_eq!(
             state
                 .air_power

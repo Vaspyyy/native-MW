@@ -401,8 +401,8 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or v2-v6 `midWar` checkpoint in
-the production viewer, or validate steps without a window:
+Run an exact browser-exported v1 `postStartWar` or native v2-v7 `midWar`
+checkpoint in the production viewer, or validate steps without a window:
 
 ```bash
 checkpoint=/path/to/native-runtime-checkpoint.json
@@ -414,8 +414,8 @@ Native-only starts use repeated `--side` selectors (ID or unique
 case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
 
 ```bash
-target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v6.json "$scenario"
-target/release/mw-native --runtime-checkpoint /tmp/mw-v6.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v6-resumed.json "$scenario"
+target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v7.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v7.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v7-resumed.json "$scenario"
 ```
 
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
@@ -446,11 +446,14 @@ desperation/reaction posture override. V5 adds observer-scoped operational AI,
 including contacts, task forces, routes, and desperation state. V6 adds live
 naval/transport execution, persistent defender reactions, airfields, and air
 wings, including ordered per-country air-operations funding coverage. New native
-wars save v6; legacy runtimes choose the newest schema their owned continuation
-state supports. Checkpoint encoding/decoding and restore remain outside the
-timed benchmark region.
+wars save v7. V7 retains v6 and adds the exact per-side naval reassessment
+clocks plus next native operation sequence. Coastal topology and reusable BFS
+scratch are derived from immutable land and remain outside the serialized
+contract. Legacy runtimes choose the newest schema their owned continuation
+state supports. Checkpoint encoding/decoding and restore remain outside the timed
+benchmark region.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v6
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v7
 `midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
@@ -472,21 +475,21 @@ browser's RNG reservoir. V4 additionally stages momentum/phase/posture before
 planning, consumes phase and defensive posture in the same tick, and commits
 combat/attrition/desertion personnel loss transactionally. Task-force-aware
 supply-collapse reaction, naval exile/recovery RNG, task-force-aware repulsion
-suppression, observer-scoped CONQUEST posture intel, and native naval-plan
-proposal/sea-path generation remain omitted. Native also holds captured
-country-desperation posture overrides at their checkpoint values until that
-planner is ported, and it holds captured air-operations funding coverage until
-aircraft-reserve production/replacement is ported. Native frames advance once per logical runtime step, so
-frame-window mechanics after handoff follow native cadence rather than a
-browser speed mode that batches several ticks into one RAF frame. Old saves
-without the block retain their frozen resolved inputs.
+suppression, and observer-scoped CONQUEST posture intel remain omitted. Native
+also holds captured country-desperation posture overrides at their checkpoint
+values until that planner is ported, and it holds captured air-operations
+funding coverage until aircraft-reserve production/replacement is ported.
+Native frames advance once per logical runtime step, so frame-window mechanics
+after handoff follow native cadence rather than a browser speed mode that
+batches several ticks into one RAF frame. Old saves without the block retain
+their frozen resolved inputs.
 
 Browser v2-v6 handoffs carry the exact Float32 terrain plane. Standalone stock
 MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
 stress fixture and therefore do not measure the live resolver or the new
 influence/side-dynamics schedulers; they are not a claim of complete
-browser-tick parity. A v2-v6 restore rebuilds private territory summaries;
+browser-tick parity. A v2-v7 restore rebuilds private territory summaries;
 partial census work and
 render queues are not serialized. V3 separately preserves pending frontier
 work. Map-only viewing and the small scenario-derived `--demo-units` runtime
@@ -518,5 +521,31 @@ checksum `a95d7861cf76c239`. The cross-language release gate also matched a
 
 ```bash
 target/release/mw-tools native-runtime-bench "$scenario" /path/to/native-v6.json \
+  --ticks 30 --repeat 5 --warmup 2 --json
+```
+
+### Native checkpoint v7 naval origination
+
+Measured on 2026-08-22 on the same host and Rust toolchain. A native-only United
+Kingdom versus Iceland war reached tick 1,000 with 163 live units, two
+independently originated invasions, 28 persisted sea waypoints per invasion,
+and two active defender reactions. Both invasions were in `TRANSIT`. The
+planner had consumed operation sequences 1 through 3 and persisted the next
+sequence as 4.
+
+| Live v7 30-tick sample | Median sample | Median per tick | p95 sample | p95 per tick |
+|---|---:|---:|---:|---:|
+| Fresh checkpoint | 149.023 ms | 4.967 ms | 161.903 ms | 5.397 ms |
+| Persistent runtime | 149.923 ms | 4.997 ms | 153.490 ms | 5.116 ms |
+
+All five persistent samples completed all 150 requested ticks with final
+checksum `e89419fe6b87b15e`. The production release gate also compares a
+checkpointed 1,000+100-tick run with an uninterrupted 1,100-tick run byte for
+byte after removing the nonsemantic `steps` request field. On the same run,
+end-to-end release wall time including decode, bootstrap, simulation, and save
+encoding was 4.596 seconds for 1,000 ticks and 5.025 seconds for 1,100 ticks.
+
+```bash
+target/release/mw-tools native-runtime-bench "$scenario" /path/to/native-v7.json \
   --ticks 30 --repeat 5 --warmup 2 --json
 ```

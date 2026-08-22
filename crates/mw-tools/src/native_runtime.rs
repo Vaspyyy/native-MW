@@ -25,14 +25,14 @@ use mw_core::{
     BattlefieldWarPhase, CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand,
     CommandHomeTarget, ConflictResolutionPlan, CountryBattlefieldPrimitives, DecodedScenario,
     EconomyState, FrontLayoutPrior, FrontObjective, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION,
-    NativeRuntime, OccupationState, OperationalExecutionState, OperationalRuntimeState,
-    PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers, ResolvedMovementModifiers,
-    RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState,
-    RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation, SimulationConfig,
-    SimulationUnit, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE, TerritoryCity,
-    TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps, UnitAiPolicy,
-    UnitCommandPolicy, UnitInfluencePolicy, UnitKind, WorldGridView, browser_discipline,
-    command_refusal_share, decode_mwsc_gzip, derive_scenario_production,
+    NativeRuntime, NavalPlanningState, OccupationState, OperationalExecutionState,
+    OperationalRuntimeState, PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers,
+    ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot,
+    RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation,
+    SimulationConfig, SimulationUnit, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE,
+    TerritoryCity, TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps,
+    UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy, UnitKind, WorldGridView,
+    browser_discipline, command_refusal_share, decode_mwsc_gzip, derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -43,6 +43,7 @@ pub const NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA: &str = "native-runtime-checkpoint
 pub const NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA: &str = "native-runtime-checkpoint-v4";
 pub const NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA: &str = "native-runtime-checkpoint-v5";
 pub const NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA: &str = "native-runtime-checkpoint-v6";
+pub const NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA: &str = "native-runtime-checkpoint-v7";
 pub const NATIVE_SIDE_DYNAMICS_SCHEMA: &str = "native-side-dynamics-v1";
 pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
 
@@ -177,6 +178,7 @@ pub fn write_runtime_checkpoint_state_v4(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -253,6 +255,7 @@ pub fn write_runtime_checkpoint_state_v5(
         Some(influence_runtime),
         Some(side_dynamics),
         Some(operational_ai.clone()),
+        None,
         None,
         None,
     )
@@ -347,6 +350,107 @@ pub fn write_runtime_checkpoint_state_v6(
         Some(operational_ai.clone()),
         Some(operational_execution.clone()),
         Some(air_power.clone()),
+        None,
+    )
+}
+
+/// Serialize a v7 checkpoint with the complete naval-planning continuation state.
+pub fn write_runtime_checkpoint_state_v7(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    state
+        .battlefield
+        .as_ref()
+        .context("checkpoint-v7 writer requires live battlefield state")?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    let influence_runtime = state
+        .influence_runtime
+        .as_ref()
+        .context("checkpoint-v7 writer requires influence runtime state")?;
+    let cell_count = state
+        .territory_config
+        .width
+        .checked_mul(state.territory_config.height)
+        .context("checkpoint-v7 territory cell count overflows")?;
+    let influence_runtime = influence_runtime_fixture(influence_runtime, cell_count)?;
+    let dynamics = state
+        .side_dynamics
+        .as_ref()
+        .context("checkpoint-v7 writer requires side dynamics state")?;
+    let side_dynamics = side_dynamics_fixture(dynamics)?;
+    validate_side_dynamics(
+        &side_dynamics,
+        state.territory_config.max_sides,
+        state.frame,
+        u64::try_from(cell_count).context("checkpoint-v7 territory cell count exceeds u64")?,
+    )?;
+    let operational_ai = state
+        .operations
+        .as_ref()
+        .context("checkpoint-v7 writer requires operational AI state")?;
+    let live_units = state
+        .units
+        .iter()
+        .map(|unit| {
+            usize::try_from(unit.combat.side)
+                .context("unit side exceeds the checkpoint platform")
+                .map(|side| (unit.combat.id, side))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let countries = state
+        .scenario
+        .countries
+        .iter()
+        .map(|country| country.country_id)
+        .collect::<BTreeSet<_>>();
+    validate_operational_ai(
+        operational_ai,
+        state.territory_config.max_sides,
+        &live_units,
+        &countries,
+        state.tick,
+        &state.diplomacy.hostility,
+    )?;
+    let operational_execution = state
+        .operational_execution
+        .as_ref()
+        .context("checkpoint-v7 writer requires operational execution state")?;
+    operational_execution
+        .validate_shape(state.tick, state.territory_config.max_sides)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let air_power = state
+        .air_power
+        .as_ref()
+        .context("checkpoint-v7 writer requires air power state")?;
+    air_power
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let naval_planning = state
+        .naval_planning
+        .as_ref()
+        .context("checkpoint-v7 writer requires naval planning state")?;
+    naval_planning
+        .validate_with_execution(state.territory_config.max_sides, operational_execution)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    write_runtime_checkpoint_state_with_hash(
+        &raw,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+        Some(influence_runtime),
+        Some(side_dynamics),
+        Some(operational_ai.clone()),
+        Some(operational_execution.clone()),
+        Some(air_power.clone()),
+        Some(naval_planning.clone()),
     )
 }
 
@@ -413,6 +517,7 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -445,6 +550,7 @@ fn write_runtime_checkpoint_state_v3_with_hash(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -461,6 +567,7 @@ fn write_runtime_checkpoint_state_with_hash(
     operational_ai: Option<OperationalRuntimeState>,
     operational_execution: Option<OperationalExecutionState>,
     air_power: Option<AirPowerState>,
+    naval_planning: Option<NavalPlanningState>,
 ) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
     if state.runtime_config != RuntimeConfig::default() {
@@ -727,9 +834,19 @@ fn write_runtime_checkpoint_state_with_hash(
             .expect("checkpoint body is an object")
             .insert("airPower".to_owned(), serde_json::to_value(air_power)?);
     }
+    if let Some(naval_planning) = naval_planning {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert(
+                "navalPlanning".to_owned(),
+                serde_json::to_value(naval_planning)?,
+            );
+    }
     if matches!(
         schema,
-        NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
+        NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
     ) {
         validate_checkpoint_v5_required_nullable_fields(&body)
             .context("checkpoint writer omitted required nullable operational fields")?;
@@ -811,6 +928,21 @@ where
     if value.is_none() {
         return Err(serde::de::Error::custom(
             "airPower must be an object, not null",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_naval_planning<'de, D>(
+    deserializer: D,
+) -> Result<Option<NavalPlanningState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<NavalPlanningState>::deserialize(deserializer)?;
+    if value.is_none() {
+        return Err(serde::de::Error::custom(
+            "navalPlanning must be an object, not null",
         ));
     }
     Ok(value)
@@ -1599,6 +1731,8 @@ struct RuntimeCheckpointFixture {
     operational_execution: Option<OperationalExecutionState>,
     #[serde(default, deserialize_with = "deserialize_optional_air_power")]
     air_power: Option<AirPowerState>,
+    #[serde(default, deserialize_with = "deserialize_optional_naval_planning")]
+    naval_planning: Option<NavalPlanningState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2389,6 +2523,7 @@ struct PreparedRuntime {
     operational_ai: Option<OperationalRuntimeState>,
     operational_execution: Option<OperationalExecutionState>,
     air_power: Option<AirPowerState>,
+    naval_planning: Option<NavalPlanningState>,
 }
 
 /// Fully validated production handoff for native rendering and simulation.
@@ -2447,11 +2582,15 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
     if matches!(
         checkpoint_value.get("schema").and_then(Value::as_str),
-        Some(NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA)
+        Some(
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
+        )
     ) {
         validate_checkpoint_v5_required_nullable_fields(&checkpoint_value).with_context(|| {
             format!(
-                "failed to validate required v5/v6 operational fields in {}",
+                "failed to validate required v5/v6/v7 operational fields in {}",
                 checkpoint_path.display()
             )
         })?;
@@ -2582,6 +2721,15 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
+    let naval_planning = checkpoint.naval_planning.clone();
+    if let Some(naval_planning) = naval_planning.as_ref() {
+        let execution = operational_execution
+            .as_ref()
+            .context("naval planning checkpoint requires operational execution state")?;
+        naval_planning
+            .validate_with_execution(checkpoint.sides.len(), execution)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
 
     Ok(PreparedRuntime {
         raw_sha256,
@@ -2599,6 +2747,7 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         operational_ai,
         operational_execution,
         air_power,
+        naval_planning,
     })
 }
 
@@ -3002,6 +3151,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.operational_ai.is_some()
                 || checkpoint.operational_execution.is_some()
                 || checkpoint.air_power.is_some()
+                || checkpoint.naval_planning.is_some()
             {
                 bail!("checkpoint-v1 cannot contain checkpoint-v2 live state");
             }
@@ -3012,8 +3162,9 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.operational_ai.is_some()
                 || checkpoint.operational_execution.is_some()
                 || checkpoint.air_power.is_some()
+                || checkpoint.naval_planning.is_some()
             {
-                bail!("checkpoint-v2 cannot contain checkpoint-v3/v4/v5/v6 runtime state");
+                bail!("checkpoint-v2 cannot contain checkpoint-v3/v4/v5/v6/v7 runtime state");
             }
             if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
                 || checkpoint.territory.is_none()
@@ -3036,6 +3187,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.operational_ai.is_some()
                 || checkpoint.operational_execution.is_some()
                 || checkpoint.air_power.is_some()
+                || checkpoint.naval_planning.is_some()
             {
                 bail!(
                     "checkpoint-v3 requires boundary midWar, immutable baseline geography, live territory, and influence runtime state"
@@ -3055,9 +3207,10 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.operational_ai.is_some()
                 || checkpoint.operational_execution.is_some()
                 || checkpoint.air_power.is_some()
+                || checkpoint.naval_planning.is_some()
             {
                 bail!(
-                    "checkpoint-v4 requires its complete live state and forbids v5/v6 operational state"
+                    "checkpoint-v4 requires its complete live state and forbids v5/v6/v7 operational state"
                 );
             }
             if checkpoint.strategic_cycle == u64::MAX {
@@ -3074,9 +3227,10 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.operational_ai.is_none()
                 || checkpoint.operational_execution.is_some()
                 || checkpoint.air_power.is_some()
+                || checkpoint.naval_planning.is_some()
             {
                 bail!(
-                    "checkpoint-v5 requires all live runtime state and operationalAi, and forbids v6 execution state"
+                    "checkpoint-v5 requires all live runtime state and operationalAi, and forbids v6/v7 execution state"
                 );
             }
             if checkpoint.strategic_cycle == u64::MAX {
@@ -3093,24 +3247,46 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.operational_ai.is_none()
                 || checkpoint.operational_execution.is_none()
                 || checkpoint.air_power.is_none()
+                || checkpoint.naval_planning.is_some()
             {
                 bail!(
-                    "checkpoint-v6 requires all live runtime, operational execution, and air power state"
+                    "checkpoint-v6 requires all live runtime, operational execution, and air power state, and forbids v7 naval planning state"
                 );
             }
             if checkpoint.strategic_cycle == u64::MAX {
                 bail!("checkpoint-v6 strategicCycle must leave room for a later cycle");
             }
         }
+        NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+                || checkpoint.influence_runtime.is_none()
+                || checkpoint.side_dynamics.is_none()
+                || checkpoint.battlefield.is_none()
+                || checkpoint.operational_ai.is_none()
+                || checkpoint.operational_execution.is_none()
+                || checkpoint.air_power.is_none()
+                || checkpoint.naval_planning.is_none()
+            {
+                bail!(
+                    "checkpoint-v7 requires all live runtime, execution, air power, and naval planning state"
+                );
+            }
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v7 strategicCycle must leave room for a later cycle");
+            }
+        }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -3902,6 +4078,7 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         operations: prepared.operational_ai.clone(),
         operational_execution: prepared.operational_execution.clone(),
         air_power: prepared.air_power.clone(),
+        naval_planning: prepared.naval_planning.clone(),
     };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
@@ -4423,6 +4600,8 @@ struct RuntimeProductionReport {
 impl PreparedRuntime {
     fn schema(&self) -> &'static str {
         match self.checkpoint.schema.as_str() {
+            NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
@@ -5364,6 +5543,7 @@ mod tests {
             operational_ai: None,
             operational_execution: None,
             air_power: None,
+            naval_planning: None,
         }
     }
 
@@ -5391,6 +5571,61 @@ mod tests {
         checkpoint.operational_execution = Some(OperationalExecutionState::default());
         checkpoint.air_power = Some(AirPowerState::new(Vec::new(), Vec::new()).unwrap());
         checkpoint
+    }
+
+    fn valid_v7_checkpoint() -> RuntimeCheckpointFixture {
+        let mut checkpoint = valid_v6_checkpoint();
+        checkpoint.schema = NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA.to_owned();
+        checkpoint.naval_planning = Some(
+            serde_json::from_value(json!({
+                "schema": "native-naval-planning-v1",
+                "sideStates": [{"side": 0, "nextReassessTick": 0}],
+                "nextOperationSequence": 1
+            }))
+            .unwrap(),
+        );
+        checkpoint
+    }
+
+    fn valid_legacy_checkpoint(schema: &str) -> RuntimeCheckpointFixture {
+        match schema {
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA => minimal_checkpoint(
+                NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+                CheckpointBoundary::PostStartWar,
+                None,
+            ),
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA => minimal_checkpoint(
+                NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+                CheckpointBoundary::MidWar,
+                Some(valid_v2_territory()),
+            ),
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA => {
+                let mut checkpoint = minimal_checkpoint(
+                    NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+                    CheckpointBoundary::MidWar,
+                    Some(valid_v2_territory()),
+                );
+                checkpoint.influence_runtime = Some(valid_influence_runtime());
+                checkpoint
+            }
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA => {
+                let mut checkpoint = valid_v6_checkpoint();
+                checkpoint.schema = NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA.to_owned();
+                checkpoint.operational_ai = None;
+                checkpoint.operational_execution = None;
+                checkpoint.air_power = None;
+                checkpoint
+            }
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA => {
+                let mut checkpoint = valid_v6_checkpoint();
+                checkpoint.schema = NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA.to_owned();
+                checkpoint.operational_execution = None;
+                checkpoint.air_power = None;
+                checkpoint
+            }
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA => valid_v6_checkpoint(),
+            _ => panic!("unsupported legacy checkpoint schema {schema}"),
+        }
     }
 
     #[test]
@@ -5854,6 +6089,76 @@ mod tests {
                 "{legacy_schema} accepted v6 execution state"
             );
         }
+    }
+
+    #[test]
+    fn checkpoint_v7_requires_naval_planning_and_v1_through_v6_forbid_it() {
+        let checkpoint = valid_v7_checkpoint();
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut missing_planning = checkpoint.clone();
+        missing_planning.naval_planning = None;
+        assert!(validate_checkpoint_shape(&missing_planning).is_err());
+
+        for legacy_schema in [
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
+        ] {
+            let mut legacy = valid_legacy_checkpoint(legacy_schema);
+            assert!(
+                validate_checkpoint_shape(&legacy).is_ok(),
+                "{legacy_schema} regression fixture is not valid"
+            );
+            legacy.naval_planning = checkpoint.naval_planning.clone();
+            assert!(
+                validate_checkpoint_shape(&legacy).is_err(),
+                "{legacy_schema} accepted v7 naval planning state"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_v7_naval_planning_wire_is_strict_and_rejects_null() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OptionalNavalPlanning {
+            #[serde(default, deserialize_with = "deserialize_optional_naval_planning")]
+            naval_planning: Option<NavalPlanningState>,
+        }
+
+        let planning_wire = json!({
+            "schema": "native-naval-planning-v1",
+            "sideStates": [{"side": 0, "nextReassessTick": 0}],
+            "nextOperationSequence": 1
+        });
+        let planning: NavalPlanningState = serde_json::from_value(planning_wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&planning).unwrap(), planning_wire);
+        assert!(planning.validate(1).is_ok());
+
+        let mut wrong_schema = planning.clone();
+        wrong_schema.schema = "native-naval-planning-v0".to_owned();
+        assert!(wrong_schema.validate(1).is_err());
+        let mut missing_side = planning.clone();
+        missing_side.side_states.clear();
+        assert!(missing_side.validate(1).is_err());
+        let mut zero_sequence = planning.clone();
+        zero_sequence.next_operation_sequence = 0;
+        assert!(zero_sequence.validate(1).is_err());
+
+        let mut unknown_planning = planning_wire;
+        unknown_planning["unknown"] = json!(true);
+        assert!(serde_json::from_value::<NavalPlanningState>(unknown_planning).is_err());
+
+        let absent: OptionalNavalPlanning = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.naval_planning.is_none());
+        assert!(
+            serde_json::from_value::<OptionalNavalPlanning>(json!({"navalPlanning": null}))
+                .is_err()
+        );
     }
 
     #[test]

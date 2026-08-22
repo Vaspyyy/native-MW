@@ -15,6 +15,7 @@ pub mod dynamics;
 pub mod economy;
 pub mod front;
 pub mod movement;
+pub mod naval_planning;
 pub mod occupation;
 pub mod operational_execution;
 pub mod operations;
@@ -84,6 +85,7 @@ pub use movement::{
     MOVEMENT_SCHEMA_VERSION, MovementError, MovementFactors, MovementInput, MovementOutput,
     MovementState, integrate_unit_step,
 };
+pub use naval_planning::*;
 pub use occupation::{
     OCCUPATION_SCHEMA_VERSION, OccupationAssessment, OccupationControllerCandidate,
     OccupationCycleInput, OccupationError, OccupationState, RebellionCandidate, assess_occupation,

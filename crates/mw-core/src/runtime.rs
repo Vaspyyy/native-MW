@@ -40,6 +40,10 @@ use crate::{
         FrontLayoutConfig, FrontLayoutError, FrontLayoutInput, FrontLayoutPrior, FrontLayoutUnit,
         derive_front_layout,
     },
+    naval_planning::{
+        NavalPlanningCounters, NavalPlanningError, NavalPlanningInput, NavalPlanningState,
+        NavalRouteWorkspace, NavalTopology,
+    },
     occupation::{OccupationState, required_garrison},
     operational_execution::{
         DefenderThreat, DefenderThreatKind, DefenderThreatPhase, ExecutionUnitInput,
@@ -288,6 +292,7 @@ pub struct RuntimeStepCounters {
     pub ai: AiPlanningCounters,
     pub simulation: TickCounters,
     pub air: RuntimeAirCounters,
+    pub naval_planning: NavalPlanningCounters,
     pub operational_execution: OperationalExecutionCounters,
     pub attrition: RuntimeAttritionCounters,
     pub influence: RuntimeInfluenceCounters,
@@ -382,6 +387,8 @@ pub enum RuntimeError {
     Air(#[from] AirError),
     #[error("operational execution: {0}")]
     OperationalExecution(#[from] OperationalExecutionError),
+    #[error("naval planning: {0}")]
+    NavalPlanning(#[from] NavalPlanningError),
 }
 
 fn influence_counters(sources: usize, result: &InfluenceApplyResult) -> RuntimeInfluenceCounters {
@@ -1462,6 +1469,8 @@ pub struct RuntimeCheckpoint {
     pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
     /// Required by checkpoint v5; absent checkpoints retain legacy planning semantics.
     pub operations: Option<OperationalRuntimeState>,
+    /// Native-only deterministic plan origination. Browser v1-v6 handoffs omit this state.
+    pub naval_planning: Option<NavalPlanningState>,
     /// Required by checkpoint v6; absent checkpoints retain legacy land-only execution.
     pub operational_execution: Option<OperationalExecutionState>,
     /// Required by checkpoint v6 and advanced atomically with operational execution.
@@ -1498,6 +1507,7 @@ pub struct NativeRuntimeCheckpointState {
     pub casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     pub side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
     pub operations: Option<OperationalRuntimeState>,
+    pub naval_planning: Option<NavalPlanningState>,
     pub operational_execution: Option<OperationalExecutionState>,
     pub air_power: Option<AirPowerState>,
 }
@@ -1525,6 +1535,9 @@ pub struct NativeRuntime {
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     side_dynamics: Option<BTreeMap<usize, SideDynamics>>,
     operations: Option<OperationalRuntimeState>,
+    naval_planning: Option<NavalPlanningState>,
+    naval_topology: Option<Arc<NavalTopology>>,
+    naval_route_workspace: Option<NavalRouteWorkspace>,
     operational_execution: Option<OperationalExecutionState>,
     air_power: Option<AirPowerState>,
     state: RuntimeState,
@@ -2232,6 +2245,38 @@ impl NativeRuntime {
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             execution.validate_units(checkpoint.territory.max_sides(), &units, checkpoint.tick)?;
         }
+        if checkpoint.naval_planning.is_some()
+            && (checkpoint.operations.is_none()
+                || checkpoint.operational_execution.is_none()
+                || checkpoint.air_power.is_none())
+        {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "naval planning requires operational AI, execution, and air state",
+            ));
+        }
+        let naval_topology = if let Some(planning) = &checkpoint.naval_planning {
+            planning.validate_with_execution(
+                checkpoint.territory.max_sides(),
+                checkpoint
+                    .operational_execution
+                    .as_ref()
+                    .expect("naval planning dependency was checked above"),
+            )?;
+            let world = WorldGridView::new(
+                checkpoint.territory.grid_resolution(),
+                checkpoint.territory.width(),
+                checkpoint.territory.height(),
+                checkpoint.territory.land(),
+            )
+            .map_err(SimulationError::from)?;
+            Some(Arc::new(NavalTopology::derive(world)?))
+        } else {
+            None
+        };
+        let naval_route_workspace = checkpoint
+            .naval_planning
+            .as_ref()
+            .map(|_| NavalRouteWorkspace::default());
 
         // A checkpoint may have an in-progress bounded census. Construction finishes it before
         // exposing the first cross-kernel publication.
@@ -2345,6 +2390,9 @@ impl NativeRuntime {
             casualties_by_victim: checkpoint.casualties_by_victim,
             side_dynamics: checkpoint.side_dynamics,
             operations: checkpoint.operations,
+            naval_planning: checkpoint.naval_planning,
+            naval_topology,
+            naval_route_workspace,
             operational_execution: checkpoint.operational_execution,
             air_power: checkpoint.air_power,
             state: initial_state,
@@ -2436,6 +2484,7 @@ impl NativeRuntime {
             casualties_by_victim: self.casualties_by_victim.clone(),
             side_dynamics: self.side_dynamics.clone(),
             operations: self.operations.clone(),
+            naval_planning: self.naval_planning.clone(),
             operational_execution: self.operational_execution.clone(),
             air_power: self.air_power.clone(),
         })
@@ -2994,6 +3043,7 @@ impl NativeRuntime {
         if let Some(operations) = &mut staged_operations {
             operations.pre_tick(next_tick);
         }
+        let mut staged_naval_planning = self.naval_planning.clone();
         let mut staged_operational_execution = self.operational_execution.clone();
         let mut staged_air_power = self.air_power.clone();
         let air_wing_sovereign_by_id = staged_air_power
@@ -3335,6 +3385,7 @@ impl NativeRuntime {
                 next_tick,
             ));
         }
+        let mut naval_planning_counters = NavalPlanningCounters::default();
         let execution_outcome = if let Some(execution) = &mut staged_operational_execution {
             let units = rollback_try!(execution_unit_inputs(
                 &self.simulation,
@@ -3344,6 +3395,42 @@ impl NativeRuntime {
                 &planning,
                 staged_operations.as_ref(),
             ));
+            if let Some(planner) = &mut staged_naval_planning {
+                let topology = rollback_try!(self.naval_topology.as_deref().ok_or(
+                    RuntimeError::InvalidCheckpoint("naval planning topology is missing"),
+                ));
+                let route_workspace = rollback_try!(self.naval_route_workspace.as_mut().ok_or(
+                    RuntimeError::InvalidCheckpoint("naval route workspace is missing"),
+                ));
+                let world = rollback_try!(
+                    WorldGridView::new(
+                        self.territory.grid_resolution(),
+                        self.territory.width(),
+                        self.territory.height(),
+                        self.territory.land(),
+                    )
+                    .map_err(SimulationError::from)
+                );
+                let originated = rollback_try!(planner.advance(
+                    NavalPlanningInput {
+                        tick: next_tick,
+                        units: &units,
+                        operations: staged_operations.as_ref(),
+                        execution,
+                        topology,
+                        world,
+                        dominant_side_map: self.territory.dominant_side(),
+                        hostility: &self.diplomacy.hostility,
+                        side_count: self.territory.max_sides(),
+                    },
+                    route_workspace,
+                ));
+                naval_planning_counters = originated.counters;
+                execution.naval_operations.extend(originated.created);
+                execution
+                    .naval_operations
+                    .sort_by(|left, right| left.id.cmp(&right.id));
+            }
             let threats = rollback_try!(defender_threats(
                 execution,
                 staged_operations.as_ref(),
@@ -4010,6 +4097,7 @@ impl NativeRuntime {
         self.casualties_by_victim = next_casualties_by_victim;
         self.side_dynamics = staged_side_dynamics;
         self.operations = staged_operations;
+        self.naval_planning = staged_naval_planning;
         self.operational_execution = staged_operational_execution;
         self.air_power = staged_air_power;
         self.tick = next_tick;
@@ -4049,6 +4137,7 @@ impl NativeRuntime {
             ai: planning.counters,
             simulation: simulation_counters,
             air: air_counters(air_outcome.as_ref(), air_damage_outcome.as_ref()),
+            naval_planning: naval_planning_counters,
             operational_execution: execution_outcome
                 .as_ref()
                 .map_or_else(OperationalExecutionCounters::default, |outcome| {
@@ -4995,6 +5084,7 @@ mod tests {
                 casualties_by_victim: BTreeMap::new(),
                 side_dynamics: None,
                 operations: None,
+                naval_planning: None,
                 operational_execution: None,
                 air_power: None,
             },
@@ -5031,6 +5121,7 @@ mod tests {
             casualties_by_victim: state.casualties_by_victim,
             side_dynamics: state.side_dynamics,
             operations: state.operations,
+            naval_planning: state.naval_planning,
             operational_execution: state.operational_execution,
             air_power: state.air_power,
         }

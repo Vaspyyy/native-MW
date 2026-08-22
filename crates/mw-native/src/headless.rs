@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use mw_checkpoint::native_runtime::{
     load_runtime_checkpoint, write_runtime_checkpoint_state_v2, write_runtime_checkpoint_state_v3,
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
-    write_runtime_checkpoint_state_v6,
+    write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v7,
 };
 use mw_core::{
     CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
@@ -176,7 +176,9 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.operational_execution.is_some() && state.air_power.is_some() {
+        let writer = if state.naval_planning.is_some() {
+            write_runtime_checkpoint_state_v7
+        } else if state.operational_execution.is_some() && state.air_power.is_some() {
             write_runtime_checkpoint_state_v6
         } else if state.operations.is_some() {
             write_runtime_checkpoint_state_v5
@@ -235,6 +237,7 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         update_checksum: completion.update_checksum,
         territory_updates: completion.territory_updates,
     })?;
+    let naval_planning = completion.final_snapshot.counters.naval_planning;
 
     if options.json {
         println!(
@@ -250,6 +253,22 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
                 "finalFrame": completion.final_snapshot.frame,
                 "units": units,
                 "territoryUpdates": completion.territory_updates,
+                "navalPlanning": {
+                    "reassessedSides": naval_planning.reassessed_sides,
+                    "coastalCandidates": naval_planning.coastal_candidates,
+                    "eligibleUnits": naval_planning.eligible_units,
+                    "coastalForceUnits": naval_planning.coastal_force_units,
+                    "supportedStagingCells": naval_planning.supported_staging_cells,
+                    "invasionTargetsConsidered": naval_planning.invasion_targets_considered,
+                    "distanceEligibleTargets": naval_planning.distance_eligible_targets,
+                    "nearbyFrontRejections": naval_planning.nearby_front_rejections,
+                    "assignmentEligibleTargets": naval_planning.assignment_eligible_targets,
+                    "routeChecks": naval_planning.route_checks,
+                    "routeVisitedCells": naval_planning.route_visited_cells,
+                    "invasionsCreated": naval_planning.invasions_created,
+                    "supplyOperationsCreated": naval_planning.supply_operations_created,
+                    "fastTransportsCreated": naval_planning.fast_transports_created,
+                },
                 "joined": true,
                 "termination": completion.reason.as_str(),
                 "checksum": checksum,

@@ -111,6 +111,7 @@ fn restored_runtime(state: NativeRuntimeCheckpointState) -> NativeRuntime {
             casualties_by_victim: state.casualties_by_victim,
             side_dynamics: state.side_dynamics,
             operations: state.operations,
+            naval_planning: state.naval_planning,
             operational_execution: state.operational_execution,
             air_power: state.air_power,
         },

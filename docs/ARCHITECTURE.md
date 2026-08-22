@@ -35,7 +35,7 @@ browser runtime's shared mutable `main.js` structure.
 8. Derive production country/city/economy inputs and production front layouts
    from an MWSC scenario, then connect the migrated kernels under one native
    tick owner.
-9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v6 `midWar`
+9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v7 `midWar`
    checkpoints into `mw-native`, run their simulation on a dedicated worker,
    and present immutable runtime publications without blocking rendering on a
    tick.
@@ -61,6 +61,9 @@ browser runtime's shared mutable `main.js` structure.
     airfield capture, persisted country funding coverage, and attributed
     aircraft/land casualties, and retain both execution systems exactly in
     checkpoint v6.
+18. Originate native naval invasion, supply, and fast-transport operations from
+    live scenario geography and unit state, then retain reassessment cadence and
+    operation identity exactly in checkpoint v7.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -69,7 +72,8 @@ also replays the production `NativeRuntime` fixture twice to enforce native
 determinism. It also runs the browser checkpoint exporter smoke tests and the
 native loader/territory-restore tests without depending on an ad hoc live
 checkpoint artifact. The browser checkpoint exporter and native loader share
-strict v1 through v6 handoff schemas, but the complete browser tick is not
+strict v1 through v6 handoff schemas; native v7 extends that state with naval
+planning cadence. The complete browser tick is not
 presented as a cross-language reference implementation. Benchmarks use
 generated production-shaped fixtures rather than the small canonical cases.
 
@@ -83,7 +87,7 @@ Normal `mw-native` startup remains map-only. The opt-in `--demo-units` mode
 finds a real adjacent-country land border in the decoded scenario and
 constructs a small explicit runtime. `--runtime-checkpoint PATH` instead loads
 the shared strict checkpoint adapter and requires either an exact-geography v1
-`postStartWar` handoff or an exact-live-state v2-v6 `midWar` handoff. The viewer
+`postStartWar` handoff or an exact-live-state v2-v7 `midWar` handoff. The viewer
 rejects `baselineReplay`; that boundary remains limited to deterministic
 fixtures and benchmarks. `--headless --ticks N` runs the same checkpoint and
 worker for up to `N` successful steps without constructing a window or GPU
@@ -187,7 +191,7 @@ ms/tick, meeting a 33.33 ms 30 Hz median budget. The conservative p95 remains
 131.183 ms per three-tick sample, or about 43.7 ms/tick, so 30 Hz is not yet a
 tail-latency guarantee and the runtime still misses a 16.67 ms 60 Hz budget.
 
-The browser/native handoff has six strict versions with explicit semantic
+The browser/native handoff has seven strict versions with explicit semantic
 boundaries:
 
 - `native-runtime-checkpoint-v1` retains `postStartWar` as its only
@@ -242,6 +246,22 @@ influence, and casualties, then exposed through immutable runtime snapshots.
 Aircraft losses charge one aircrew casualty each to the owning country and the
 hostile attacker attribution ledger.
 
+Checkpoint v7 retains v6 and requires `native-naval-planning-v1`. It owns one
+ordered reassessment clock per stable side and the next native operation
+sequence. The planner begins at tick 150, staggers sides by two ticks, and then
+reassesses every 300 ticks, at most one side per native step. A reassessment
+samples no more than 96 friendly and 96 hostile coastal cells, tests no more
+than 12 invasion routes, and caps each deterministic four-neighbor water BFS at
+120,000 visits. The BFS intentionally keeps the browser's hard first/last
+column boundary rather than wrapping the dateline. Native also requires five
+actually recruitable units within three degrees of a staging coast before
+creating an invasion; this bounded adaptation makes each emitted plan viable
+for the native executor, whose membership is created up front rather than
+recruited lazily by the browser unit loop. Generation-stamped route-search
+buffers and derived coastal topology are rebuilt from immutable scenario land
+and are not serialized. Planner, execution, AI, movement, combat, and
+territorial state still commit under the same rollback-protected tick.
+
 The browser keeps v1 as the default export. V2 through v6 are explicit and act as
 quiescent save barriers: they synchronously flush census work, then refuse the
 export if any census generation or dirty tile remains. They do not
@@ -251,7 +271,7 @@ and queues a complete renderer replacement from the exact maps while retaining
 the supplied committed generation, commit sequence, mutation sequence, and
 work counters.
 
-V2 through v6 also carry the immutable starting geography from v1. The loader
+V2 through v7 also carry the immutable starting geography from v1. The loader
 applies that baseline to the MWSC scenario and derives production records
 before it overlays live territory. Consequently conquest cannot rewrite immutable core,
 city-population, or economy baselines merely because the save was captured
@@ -321,9 +341,9 @@ retain their frozen phase/policy behavior.
 Remaining omissions are supply-collapse reactions that rebuild task-force
 intent, naval exile/recovery RNG, task-force identity-aware repulsion,
 observer-scoped CONQUEST posture intel, live evolution of captured
-country-desperation overrides, native naval-plan proposal/sea-path generation,
-and aircraft-reserve production/replacement plus pay-cycle funding-coverage
-recalculation. Full gameplay/UI parity is also outside this slice.
+country-desperation overrides, and aircraft-reserve production/replacement plus
+pay-cycle funding-coverage recalculation. Full gameplay/UI parity is also
+outside this slice.
 
 The native runtime advances `frame` once per successful logical step. The
 browser can run multiple logical subticks before advancing its RAF-owned
@@ -412,9 +432,9 @@ The consequence port is intentionally bounded. It does not yet reproduce
 browser releasables, province-border smoothing, equipment-reserve or aircraft
 cleanup, or treaty/UI presentation. Browser-authored legacy v2 checkpoints
 omit the optional native planner block and therefore start a fresh deterministic
-front planning boundary. Native-authored v2-v6 saves include current objectives,
+front planning boundary. Native-authored v2-v7 saves include current objectives,
 assignment priors, layout priors, and the last refresh tick. New native-war
-saves use v6; legacy runtimes select the newest schema supported by their owned
+saves use v7; legacy runtimes select the newest schema supported by their owned
 continuation state.
 
 The native writer accepts only the canonical runtime, simulation, territory
@@ -450,7 +470,7 @@ publication model for cities, frontlines, labels, and effects.
    `NativeRuntime`.**
 8. Derive production scenario inputs and front objectives, then connect AI,
    simulation, territory, and strategic kernels under one runtime owner.
-   **Complete for the bounded v1-v6 checkpoint contracts and runtime.**
+   **Complete for the bounded v1-v7 checkpoint contracts and runtime.**
 9. Load production checkpoints in `mw-native`. **Complete for strict,
    exact-geography `postStartWar` and exact-live-state `midWar` viewer/headless
    operation; `baselineReplay` is deliberately rejected.**
@@ -464,8 +484,8 @@ publication model for cities, frontlines, labels, and effects.
     **Complete.**
 13. Bootstrap a deterministic war directly from MWSC scenario countries and
     save/reload native mid-war checkpoints without a browser handoff.
-    **Complete for all-Army land wars through the viewer and exact-step headless
-    paths, including history-dependent frontline planner state.**
+    **Complete for all-Army forces through the viewer and exact-step headless
+    paths, including history-dependent frontline and naval planner state.**
 14. Recompute live battlefield terrain, urban, encirclement, support,
     concentration, cohesion, repulsion, and active-combat influence policy.
     **Complete for the bounded optional-mid-war/native-bootstrap resolver;
@@ -479,18 +499,19 @@ publication model for cities, frontlines, labels, and effects.
 17. Continue operational AI in checkpoint v5, then execute naval transport,
     air operations, and full defender-reaction planning transactionally in
     checkpoint v6. **Complete for browser handoff and native continuation;
-    native naval-plan proposal/sea-path generation and aircraft-reserve economy
-    evolution remain pending.**
-18. Native UI/editor/community parity remains later work after the remaining
+    aircraft-reserve economy evolution remains pending.**
+18. Originate native naval plans and bounded sea routes, connect them to
+    same-tick execution and defender reaction, and checkpoint their cadence in
+    v7. **Complete.**
+19. Native UI/editor/community parity remains later work after the remaining
     simulation boundaries are chosen and measured.
 
 Observer-scoped CONQUEST posture intel, live desperation/reaction override
 evolution, task-force-aware repulsion suppression,
-naval exile/recovery RNG, native naval-plan proposal/sea-path generation,
-aircraft-reserve economy, the full gameplay HUD, map editor, online/community
-features, and satellite-map parity are still outside the native port. The
-migrated kernel and handoff contracts do not imply exact full-browser tick
-parity.
+naval exile/recovery RNG, aircraft-reserve economy, the full gameplay HUD, map
+editor, online/community features, and satellite-map parity are still outside
+the native port. The migrated kernel and handoff contracts do not imply exact
+full-browser tick parity.
 
 Native-only startup accepts repeated `--side` selectors (numeric IDs or unique
 case-insensitive names), with deterministic all-Army bootstrap forces.
