@@ -713,22 +713,8 @@ impl OperationalRuntimeState {
     }
 
     pub fn advance_task_forces(&mut self, tick: u64, units: &[OperationalUnitInput]) {
-        let by_id = units
-            .iter()
-            .map(|unit| (unit.unit_id, *unit))
-            .collect::<BTreeMap<_, _>>();
+        let by_id = self.retain_live_unit_references(units);
         for task_force in &mut self.task_forces {
-            task_force.members.retain(|member| {
-                by_id
-                    .get(&member.unit_id)
-                    .is_some_and(|unit| unit.side_index == task_force.side_index)
-            });
-            task_force.reserve_unit_ids.retain(|unit_id| {
-                task_force
-                    .members
-                    .binary_search_by_key(unit_id, |member| member.unit_id)
-                    .is_ok()
-            });
             if task_force.members.is_empty() {
                 transition_task_force(task_force, TaskForcePhase::Complete, tick);
                 task_force.completion_reason = Some("NO_LIVE_MEMBERS".to_owned());
@@ -942,6 +928,30 @@ impl OperationalRuntimeState {
     }
 
     pub fn post_movement(&mut self, tick: u64, units: &[OperationalUnitInput]) {
+        let by_id = self.retain_live_unit_references(units);
+        for task_force in &mut self.task_forces {
+            let corridor = corridor(task_force);
+            let mut best_progress = task_force.progress;
+            for member in &mut task_force.members {
+                if let Some(unit) = by_id.get(&member.unit_id) {
+                    let actual = progress_along_corridor(&corridor, unit.position);
+                    member.route_progress = member.route_progress.max(actual).clamp(0.0, 1.0);
+                    best_progress = best_progress.max(actual);
+                }
+            }
+            if best_progress > task_force.progress + 0.02 {
+                task_force.progress = best_progress.min(1.0);
+                task_force.last_progress_tick = tick;
+            }
+        }
+        self.task_forces
+            .retain(|task_force| !task_force.members.is_empty());
+    }
+
+    fn retain_live_unit_references(
+        &mut self,
+        units: &[OperationalUnitInput],
+    ) -> BTreeMap<u64, OperationalUnitInput> {
         let by_id = units
             .iter()
             .map(|unit| (unit.unit_id, *unit))
@@ -963,22 +973,8 @@ impl OperationalRuntimeState {
                     .binary_search_by_key(unit_id, |member| member.unit_id)
                     .is_ok()
             });
-            let corridor = corridor(task_force);
-            let mut best_progress = task_force.progress;
-            for member in &mut task_force.members {
-                if let Some(unit) = by_id.get(&member.unit_id) {
-                    let actual = progress_along_corridor(&corridor, unit.position);
-                    member.route_progress = member.route_progress.max(actual).clamp(0.0, 1.0);
-                    best_progress = best_progress.max(actual);
-                }
-            }
-            if best_progress > task_force.progress + 0.02 {
-                task_force.progress = best_progress.min(1.0);
-                task_force.last_progress_tick = tick;
-            }
         }
-        self.task_forces
-            .retain(|task_force| !task_force.members.is_empty());
+        by_id
     }
 
     pub fn update_country_desperation(
@@ -1371,6 +1367,40 @@ mod tests {
         state.pre_tick(1_811);
         assert!(state.sides[0].intel.contacts.is_empty());
         assert_eq!(state.known_hostile_strength(0), Some(10.0));
+    }
+
+    #[test]
+    fn planning_prunes_contacts_for_units_destroyed_before_ai_resolution() {
+        let mut state = state();
+        state.ingest_tactical_contacts(
+            10,
+            &[TacticalContactObservation {
+                observer_side: 0,
+                enemy_side: 1,
+                target_unit_id: 9,
+                target_country_id: 20,
+                target_position: point(1.0, 2.0),
+                observed_power: 4.0,
+                kind: "army".to_owned(),
+            }],
+        );
+        state.pre_tick(11);
+
+        let surviving_units = [1, 2, 3].map(|unit_id| OperationalUnitInput {
+            unit_id,
+            side_index: 0,
+            country_id: 10,
+            position: point(0.0, unit_id as f64),
+            power: 1.0,
+            readiness: 1.0,
+            supply_collapsed: false,
+            encircled: false,
+        });
+        state.advance_task_forces(11, &surviving_units);
+
+        assert!(state.sides[0].intel.contacts.is_empty());
+        let live_units = BTreeMap::from([(1, 0), (2, 0), (3, 0)]);
+        assert!(state.validate(2, &live_units, &countries(), 11).is_ok());
     }
 
     #[test]

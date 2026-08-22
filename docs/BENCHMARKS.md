@@ -401,7 +401,7 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or v2/v3/v4/v5 `midWar` checkpoint in
+Run an exact browser-exported v1 `postStartWar` or v2-v6 `midWar` checkpoint in
 the production viewer, or validate steps without a window:
 
 ```bash
@@ -414,8 +414,8 @@ Native-only starts use repeated `--side` selectors (ID or unique
 case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
 
 ```bash
-target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v4.json "$scenario"
-target/release/mw-native --runtime-checkpoint /tmp/mw-v4.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v4-resumed.json "$scenario"
+target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v6.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v6.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v6-resumed.json "$scenario"
 ```
 
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
@@ -442,12 +442,15 @@ planes.
 V4 is requested with `window.nativeRuntimeCheckpoint({ version: 4, steps })`.
 It retains v3 and adds the stable-side personnel pools, bounded momentum
 history, four-state phase, three-state posture, and nullable captured browser
-desperation/reaction posture override. New native wars save v4; legacy runtimes
-write v3 when only influence dynamics are available and v2 when neither live
-state block exists. Checkpoint encoding/decoding and restore remain outside the
+desperation/reaction posture override. V5 adds observer-scoped operational AI,
+including contacts, task forces, routes, and desperation state. V6 adds live
+naval/transport execution, persistent defender reactions, airfields, and air
+wings, including ordered per-country air-operations funding coverage. New native
+wars save v6; legacy runtimes choose the newest schema their owned continuation
+state supports. Checkpoint encoding/decoding and restore remain outside the
 timed benchmark region.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2/v3/v4
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v6
 `midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
@@ -469,19 +472,21 @@ browser's RNG reservoir. V4 additionally stages momentum/phase/posture before
 planning, consumes phase and defensive posture in the same tick, and commits
 combat/attrition/desertion personnel loss transactionally. Task-force-aware
 supply-collapse reaction, naval exile/recovery RNG, task-force-aware repulsion
-suppression, and observer-scoped CONQUEST posture intel remain omitted. Native
-also holds any captured desperation/reaction override at its checkpoint value
-until those planners are ported. Native frames advance once per logical runtime step, so
+suppression, observer-scoped CONQUEST posture intel, and native naval-plan
+proposal/sea-path generation remain omitted. Native also holds captured
+country-desperation posture overrides at their checkpoint values until that
+planner is ported, and it holds captured air-operations funding coverage until
+aircraft-reserve production/replacement is ported. Native frames advance once per logical runtime step, so
 frame-window mechanics after handoff follow native cadence rather than a
 browser speed mode that batches several ticks into one RAF frame. Old saves
 without the block retain their frozen resolved inputs.
 
-Browser v2/v3/v4 handoffs carry the exact Float32 terrain plane. Standalone stock
+Browser v2-v6 handoffs carry the exact Float32 terrain plane. Standalone stock
 MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
 stress fixture and therefore do not measure the live resolver or the new
 influence/side-dynamics schedulers; they are not a claim of complete
-browser-tick parity. A v2/v3/v4 restore rebuilds private territory summaries;
+browser-tick parity. A v2-v6 restore rebuilds private territory summaries;
 partial census work and
 render queues are not serialized. V3 separately preserves pending frontier
 work. Map-only viewing and the small scenario-derived `--demo-units` runtime
@@ -492,3 +497,26 @@ used by the CLI. The writer rejects custom cadence/kernel or noncanonical
 territory topology instead of silently restoring defaults. It also skips a
 requested save after clean `ConflictResolved` termination because mid-war
 checkpoints represent resumable running state.
+
+### Live checkpoint v6 execution
+
+Measured on 2026-08-22 on the same host and Rust toolchain. The checkpoint came
+from a 1,000-tick native Germany+France versus Poland+Belgium run on the current
+Modern 2022 scenario. It contained 294 live units, four airfields, eight wings,
+four country-funding records, live influence/control/census state, side
+dynamics, and operational AI. Each sample advanced 30 ticks; the run used two
+warmups and five measured samples.
+
+| Live v6 30-tick sample | Median sample | Median per tick | p95 sample | p95 per tick |
+|---|---:|---:|---:|---:|
+| Fresh checkpoint | 181.671 ms | 6.056 ms | 183.537 ms | 6.118 ms |
+| Persistent runtime | 180.238 ms | 6.008 ms | 182.291 ms | 6.076 ms |
+
+All five persistent samples completed all 150 requested ticks with final
+checksum `a95d7861cf76c239`. The cross-language release gate also matched a
+20+20 checkpoint continuation to an uninterrupted 40-tick run exactly.
+
+```bash
+target/release/mw-tools native-runtime-bench "$scenario" /path/to/native-v6.json \
+  --ticks 30 --repeat 5 --warmup 2 --json
+```

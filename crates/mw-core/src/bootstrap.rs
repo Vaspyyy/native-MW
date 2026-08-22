@@ -4,6 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::{
+    air::{
+        AirCountryCoverage, AirError, AirPowerState, AirRole, AirTargetKind, AirWing, AirWingState,
+        Airfield,
+    },
     battlefield::{
         BattlefieldBuff, BattlefieldConfig, BattlefieldRuntimeState, BattlefieldUnitState,
         BattlefieldUrbanCenter, BattlefieldWarPhase, CountryBattlefieldPrimitives,
@@ -13,6 +17,7 @@ use crate::{
     economy::{
         EconomyState, PAYROLL_PER_UNIT, STARTING_RESERVE_CYCLES, TARGET_STARTING_PAYROLL_SHARE,
     },
+    operational_execution::OperationalExecutionState,
     operations::{CountryDesperationMode, CountryDesperationState, OperationalRuntimeState},
     production::{ProductionConfig, derive_scenario_production},
     runtime::{
@@ -43,12 +48,101 @@ pub enum NativeWarBootstrapError {
     Territory(#[from] crate::territory::TerritoryError),
     #[error("simulation: {0}")]
     Simulation(#[from] crate::simulation::SimulationError),
+    #[error("air power: {0}")]
+    Air(#[from] AirError),
     #[error("strategic: {0}")]
     Strategic(#[from] crate::strategic::StrategicError),
     #[error("runtime: {0}")]
     Runtime(#[from] crate::runtime::RuntimeError),
     #[error("scenario battlefield metadata is invalid: {0}")]
     BattlefieldMetadata(String),
+}
+
+fn bootstrap_air_power(
+    production: &crate::production::ScenarioProduction,
+    country_to_side: &BTreeMap<u16, usize>,
+) -> Result<AirPowerState, AirError> {
+    let mut fields = Vec::new();
+    let mut wings = Vec::new();
+    for (&country_id, &side) in country_to_side {
+        let country = production
+            .countries
+            .iter()
+            .find(|country| country.country_id == country_id)
+            .expect("side topology was derived from production countries");
+        let position = production
+            .cities
+            .iter()
+            .filter(|city| city.owner_id == country_id)
+            .max_by(|left, right| {
+                left.capital
+                    .cmp(&right.capital)
+                    .then_with(|| left.population.total_cmp(&right.population))
+                    .then_with(|| right.city_id.cmp(&left.city_id))
+            })
+            .map(|city| (city.lat, city.lng))
+            .or_else(|| {
+                country.capital_cell.map(|cell| {
+                    let x = cell % production.grid.width;
+                    let y = cell / production.grid.width;
+                    (
+                        -90.0 + (y as f64 + 0.5) * production.grid.grid_res,
+                        -180.0 + (x as f64 + 0.5) * production.grid.grid_res,
+                    )
+                })
+            });
+        let Some((lat, lng)) = position else {
+            continue;
+        };
+        let field_id = fields.len() as u64 + 1;
+        fields.push(Airfield {
+            id: field_id,
+            side,
+            owner_country_id: country_id,
+            controller_country_id: country_id,
+            lat,
+            lng,
+            capacity: 8,
+            health: 100.0,
+            disabled: false,
+            capture_repair_cycles: 0,
+            capital: true,
+        });
+        for role in [AirRole::Fighter, AirRole::Strike] {
+            wings.push(AirWing {
+                id: wings.len() as u64 + 1,
+                side,
+                sovereign_country_id: country_id,
+                airfield_id: field_id,
+                return_airfield_id: None,
+                role,
+                quality: 50.0,
+                max_count: 100,
+                count: 100,
+                lat,
+                lng,
+                state: AirWingState::Grounded,
+                target_kind: None::<AirTargetKind>,
+                target_id: None,
+                rearm_ticks: 0,
+                cooldown_ticks: 0,
+                endurance_ticks: 0,
+                next_mission_tick: None,
+                force_mission: false,
+            });
+        }
+    }
+    let mut air_power = AirPowerState::new(fields, wings)?;
+    air_power.country_coverage = country_to_side
+        .keys()
+        .copied()
+        .map(|country_id| AirCountryCoverage {
+            country_id,
+            operations_coverage: 1.0,
+        })
+        .collect();
+    air_power.validate()?;
+    Ok(air_power)
 }
 
 fn parse_battlefield_buff(value: Option<&serde_json::Value>) -> BattlefieldBuff {
@@ -529,6 +623,7 @@ pub fn bootstrap_native_war(
             stall_ticks: 0,
         })
         .collect();
+    let air_power = bootstrap_air_power(&production, &country_to_side)?;
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
         RuntimeCheckpoint {
@@ -553,6 +648,8 @@ pub fn bootstrap_native_war(
             casualties_by_victim: BTreeMap::new(),
             side_dynamics: Some(side_dynamics),
             operations: Some(operations),
+            operational_execution: Some(OperationalExecutionState::default()),
+            air_power: Some(air_power),
         },
     )?)
 }
@@ -630,6 +727,17 @@ mod tests {
         }
         let state = first.checkpoint_state().unwrap();
         assert_eq!(state.economies.len(), 3);
+        assert_eq!(
+            state
+                .air_power
+                .as_ref()
+                .unwrap()
+                .country_coverage
+                .iter()
+                .map(|coverage| (coverage.country_id, coverage.operations_coverage))
+                .collect::<Vec<_>>(),
+            vec![(10, 1.0), (20, 1.0), (30, 1.0)]
+        );
         assert_eq!(state.territory_config.maps.land[3], 0);
         assert_eq!(state.territory_config.maps.land[0], 2);
         assert_eq!(state.territory_config.maps.dominant_side[0], 0);

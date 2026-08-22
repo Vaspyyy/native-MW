@@ -4,6 +4,7 @@
 //! APIs. Native and future web frontends should consume snapshots from here.
 
 pub mod ai;
+pub mod air;
 pub mod battlefield;
 pub mod bootstrap;
 pub mod combat;
@@ -15,6 +16,7 @@ pub mod economy;
 pub mod front;
 pub mod movement;
 pub mod occupation;
+pub mod operational_execution;
 pub mod operations;
 pub mod production;
 pub mod runtime;
@@ -31,6 +33,7 @@ pub use ai::{
     AiTacticalContactRecord, AiUnitInput, AiWorldInput, AssignmentReason, FrontAssignmentRecord,
     FrontObjective, ResolvedCombatModifiers, ResolvedMovementModifiers, resolve_ai_orders,
 };
+pub use air::*;
 pub use battlefield::{
     ATTRITION_DAMAGE, BATTLEFIELD_SCHEMA_VERSION, BattlefieldAttritionResult, BattlefieldBuff,
     BattlefieldCellState, BattlefieldCohesionGroup, BattlefieldConfig, BattlefieldDirectionInput,
@@ -87,6 +90,7 @@ pub use occupation::{
     garrison_priority, required_garrison, resistance_delta, select_occupation_controller,
     select_rebellion_candidates,
 };
+pub use operational_execution::*;
 pub use operations::*;
 pub use production::{
     ARMOR_PAYROLL_PER_100, PRODUCTION_SCHEMA_VERSION, ProductionCity, ProductionConfig,
@@ -98,10 +102,10 @@ pub use production::{
 pub use runtime::{
     DEFAULT_CENSUS_BUDGET, DEFAULT_CENSUS_FLUSH_CHUNK, DEFAULT_FRONT_REFRESH_TICKS,
     DEFAULT_RUNTIME_FRONT_STICKINESS, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
-    NativeRuntimeCheckpointState, RuntimeAttritionCounters, RuntimeCensusCounters,
-    RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeError, RuntimeInfluenceCounters,
-    RuntimeSnapshot, RuntimeState, RuntimeStepCounters, RuntimeUnitPolicy, UnitAiPolicy,
-    UnitCommandPolicy, UnitInfluencePolicy,
+    NativeRuntimeCheckpointState, RuntimeAirCounters, RuntimeAttritionCounters,
+    RuntimeCensusCounters, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeError,
+    RuntimeInfluenceCounters, RuntimeSnapshot, RuntimeState, RuntimeStepCounters,
+    RuntimeUnitPolicy, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
 };
 pub use scenario::{
     DecodedScenario, GridSpec, ScenarioError, decode_mwsc, decode_mwsc_gzip, decode_mwsc_gzip_file,

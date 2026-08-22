@@ -20,19 +20,19 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use mw_core::{
-    ARMOR_PAYROLL_PER_100, BATTLEFIELD_SCHEMA_VERSION, BattlefieldBuff, BattlefieldConfig,
-    BattlefieldRuntimeState, BattlefieldUnitState, BattlefieldUrbanCenter, BattlefieldWarPhase,
-    CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand, CommandHomeTarget,
-    ConflictResolutionPlan, CountryBattlefieldPrimitives, DecodedScenario, EconomyState,
-    FrontLayoutPrior, FrontObjective, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
-    OccupationState, OperationalRuntimeState, PAYROLL_PER_UNIT, ProductionConfig,
-    ResolvedCombatModifiers, ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig,
-    RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES,
-    ScenarioProduction, Simulation, SimulationConfig, SimulationUnit, StrategicSimulation,
-    TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState, TerritoryConfig,
-    TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
-    UnitKind, WorldGridView, browser_discipline, command_refusal_share, decode_mwsc_gzip,
-    derive_scenario_production,
+    ARMOR_PAYROLL_PER_100, AirPowerState, BATTLEFIELD_SCHEMA_VERSION, BattlefieldBuff,
+    BattlefieldConfig, BattlefieldRuntimeState, BattlefieldUnitState, BattlefieldUrbanCenter,
+    BattlefieldWarPhase, CombatConfig, CombatEvent, CombatLayer, CombatUnit, CommandBand,
+    CommandHomeTarget, ConflictResolutionPlan, CountryBattlefieldPrimitives, DecodedScenario,
+    EconomyState, FrontLayoutPrior, FrontObjective, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION,
+    NativeRuntime, OccupationState, OperationalExecutionState, OperationalRuntimeState,
+    PAYROLL_PER_UNIT, ProductionConfig, ResolvedCombatModifiers, ResolvedMovementModifiers,
+    RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState,
+    RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation, SimulationConfig,
+    SimulationUnit, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE, TerritoryCity,
+    TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps, UnitAiPolicy,
+    UnitCommandPolicy, UnitInfluencePolicy, UnitKind, WorldGridView, browser_discipline,
+    command_refusal_share, decode_mwsc_gzip, derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +42,7 @@ pub const NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA: &str = "native-runtime-checkpoint
 pub const NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA: &str = "native-runtime-checkpoint-v3";
 pub const NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA: &str = "native-runtime-checkpoint-v4";
 pub const NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA: &str = "native-runtime-checkpoint-v5";
+pub const NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA: &str = "native-runtime-checkpoint-v6";
 pub const NATIVE_SIDE_DYNAMICS_SCHEMA: &str = "native-side-dynamics-v1";
 pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
 
@@ -174,6 +175,8 @@ pub fn write_runtime_checkpoint_state_v4(
         Some(influence_runtime),
         Some(side_dynamics),
         None,
+        None,
+        None,
     )
 }
 
@@ -250,6 +253,100 @@ pub fn write_runtime_checkpoint_state_v5(
         Some(influence_runtime),
         Some(side_dynamics),
         Some(operational_ai.clone()),
+        None,
+        None,
+    )
+}
+
+/// Serialize a v6 checkpoint with persistent naval/defender execution and air-power state.
+pub fn write_runtime_checkpoint_state_v6(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    validate_checkpoint_write_steps(steps)?;
+    state
+        .battlefield
+        .as_ref()
+        .context("checkpoint-v6 writer requires live battlefield state")?;
+    let raw = fs::read(scenario_path)
+        .with_context(|| format!("failed to read {}", scenario_path.display()))?;
+    let influence_runtime = state
+        .influence_runtime
+        .as_ref()
+        .context("checkpoint-v6 writer requires influence runtime state")?;
+    let cell_count = state
+        .territory_config
+        .width
+        .checked_mul(state.territory_config.height)
+        .context("checkpoint-v6 territory cell count overflows")?;
+    let influence_runtime = influence_runtime_fixture(influence_runtime, cell_count)?;
+    let dynamics = state
+        .side_dynamics
+        .as_ref()
+        .context("checkpoint-v6 writer requires side dynamics state")?;
+    let side_dynamics = side_dynamics_fixture(dynamics)?;
+    validate_side_dynamics(
+        &side_dynamics,
+        state.territory_config.max_sides,
+        state.frame,
+        u64::try_from(cell_count).context("checkpoint-v6 territory cell count exceeds u64")?,
+    )?;
+    let operational_ai = state
+        .operations
+        .as_ref()
+        .context("checkpoint-v6 writer requires operational AI state")?;
+    let live_units = state
+        .units
+        .iter()
+        .map(|unit| {
+            usize::try_from(unit.combat.side)
+                .context("unit side exceeds the checkpoint platform")
+                .map(|side| (unit.combat.id, side))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let countries = state
+        .scenario
+        .countries
+        .iter()
+        .map(|country| country.country_id)
+        .collect::<BTreeSet<_>>();
+    validate_operational_ai(
+        operational_ai,
+        state.territory_config.max_sides,
+        &live_units,
+        &countries,
+        state.tick,
+        &state.diplomacy.hostility,
+    )?;
+    let operational_execution = state
+        .operational_execution
+        .as_ref()
+        .context("checkpoint-v6 writer requires operational execution state")?;
+    operational_execution
+        .validate_shape(state.tick, state.territory_config.max_sides)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let air_power = state
+        .air_power
+        .as_ref()
+        .context("checkpoint-v6 writer requires air power state")?;
+    air_power
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    write_runtime_checkpoint_state_with_hash(
+        &raw,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
+        Some(influence_runtime),
+        Some(side_dynamics),
+        Some(operational_ai.clone()),
+        Some(operational_execution.clone()),
+        Some(air_power.clone()),
     )
 }
 
@@ -314,6 +411,8 @@ fn write_runtime_checkpoint_state_v2_with_hash(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -344,6 +443,8 @@ fn write_runtime_checkpoint_state_v3_with_hash(
         Some(influence_runtime),
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -358,6 +459,8 @@ fn write_runtime_checkpoint_state_with_hash(
     influence_runtime: Option<InfluenceRuntimeFixture>,
     side_dynamics: Option<SideDynamicsFixture>,
     operational_ai: Option<OperationalRuntimeState>,
+    operational_execution: Option<OperationalExecutionState>,
+    air_power: Option<AirPowerState>,
 ) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
     if state.runtime_config != RuntimeConfig::default() {
@@ -611,13 +714,29 @@ fn write_runtime_checkpoint_state_with_hash(
                 serde_json::to_value(operational_ai)?,
             );
     }
-    if schema == NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA {
+    if let Some(operational_execution) = operational_execution {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert(
+                "operationalExecution".to_owned(),
+                serde_json::to_value(operational_execution)?,
+            );
+    }
+    if let Some(air_power) = air_power {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert("airPower".to_owned(), serde_json::to_value(air_power)?);
+    }
+    if matches!(
+        schema,
+        NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
+    ) {
         validate_checkpoint_v5_required_nullable_fields(&body)
-            .context("checkpoint-v5 writer omitted required nullable operational fields")?;
+            .context("checkpoint writer omitted required nullable operational fields")?;
         let fixture: RuntimeCheckpointFixture = serde_json::from_value(body.clone())
-            .context("checkpoint-v5 writer produced an invalid wire object")?;
+            .context("checkpoint writer produced an invalid wire object")?;
         validate_checkpoint_shape(&fixture)
-            .context("checkpoint-v5 writer produced an invalid checkpoint shape")?;
+            .context("checkpoint writer produced an invalid checkpoint shape")?;
     }
     let bytes = serde_json::to_vec(&body)?;
     let parent = checkpoint_output_parent(output);
@@ -662,6 +781,36 @@ where
     if value.is_none() {
         return Err(serde::de::Error::custom(
             "operationalAi must be an object, not null",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_operational_execution<'de, D>(
+    deserializer: D,
+) -> Result<Option<OperationalExecutionState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<OperationalExecutionState>::deserialize(deserializer)?;
+    if value.is_none() {
+        return Err(serde::de::Error::custom(
+            "operationalExecution must be an object, not null",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_optional_air_power<'de, D>(
+    deserializer: D,
+) -> Result<Option<AirPowerState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<AirPowerState>::deserialize(deserializer)?;
+    if value.is_none() {
+        return Err(serde::de::Error::custom(
+            "airPower must be an object, not null",
         ));
     }
     Ok(value)
@@ -1443,6 +1592,13 @@ struct RuntimeCheckpointFixture {
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
     #[serde(default, deserialize_with = "deserialize_optional_operational_ai")]
     operational_ai: Option<OperationalRuntimeState>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_operational_execution"
+    )]
+    operational_execution: Option<OperationalExecutionState>,
+    #[serde(default, deserialize_with = "deserialize_optional_air_power")]
+    air_power: Option<AirPowerState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2231,6 +2387,8 @@ struct PreparedRuntime {
     influence_runtime: Option<mw_core::diffusion::InfluenceRuntimeState>,
     side_dynamics: Option<BTreeMap<usize, mw_core::SideDynamics>>,
     operational_ai: Option<OperationalRuntimeState>,
+    operational_execution: Option<OperationalExecutionState>,
+    air_power: Option<AirPowerState>,
 }
 
 /// Fully validated production handoff for native rendering and simulation.
@@ -2287,12 +2445,13 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
     let checkpoint_bytes = read_file(checkpoint_path)?;
     let checkpoint_value: Value = serde_json::from_slice(&checkpoint_bytes)
         .with_context(|| format!("failed to parse {}", checkpoint_path.display()))?;
-    if checkpoint_value.get("schema").and_then(Value::as_str)
-        == Some(NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA)
-    {
+    if matches!(
+        checkpoint_value.get("schema").and_then(Value::as_str),
+        Some(NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA)
+    ) {
         validate_checkpoint_v5_required_nullable_fields(&checkpoint_value).with_context(|| {
             format!(
-                "failed to validate required v5 fields in {}",
+                "failed to validate required v5/v6 operational fields in {}",
                 checkpoint_path.display()
             )
         })?;
@@ -2411,6 +2570,18 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
             &checkpoint.hostility_matrix,
         )?;
     }
+    let operational_execution = checkpoint.operational_execution.clone();
+    if let Some(execution) = operational_execution.as_ref() {
+        execution
+            .validate_shape(checkpoint.tick, checkpoint.sides.len())
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
+    let air_power = checkpoint.air_power.clone();
+    if let Some(air_power) = air_power.as_ref() {
+        air_power
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    }
 
     Ok(PreparedRuntime {
         raw_sha256,
@@ -2426,6 +2597,8 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
         influence_runtime,
         side_dynamics,
         operational_ai,
+        operational_execution,
+        air_power,
     })
 }
 
@@ -2827,6 +3000,8 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.planner.is_some()
                 || checkpoint.side_dynamics.is_some()
                 || checkpoint.operational_ai.is_some()
+                || checkpoint.operational_execution.is_some()
+                || checkpoint.air_power.is_some()
             {
                 bail!("checkpoint-v1 cannot contain checkpoint-v2 live state");
             }
@@ -2835,8 +3010,10 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             if checkpoint.influence_runtime.is_some()
                 || checkpoint.side_dynamics.is_some()
                 || checkpoint.operational_ai.is_some()
+                || checkpoint.operational_execution.is_some()
+                || checkpoint.air_power.is_some()
             {
-                bail!("checkpoint-v2 cannot contain checkpoint-v3/v4/v5 runtime state");
+                bail!("checkpoint-v2 cannot contain checkpoint-v3/v4/v5/v6 runtime state");
             }
             if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
                 || checkpoint.territory.is_none()
@@ -2857,6 +3034,8 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.influence_runtime.is_none()
                 || checkpoint.side_dynamics.is_some()
                 || checkpoint.operational_ai.is_some()
+                || checkpoint.operational_execution.is_some()
+                || checkpoint.air_power.is_some()
             {
                 bail!(
                     "checkpoint-v3 requires boundary midWar, immutable baseline geography, live territory, and influence runtime state"
@@ -2874,8 +3053,12 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.side_dynamics.is_none()
                 || checkpoint.battlefield.is_none()
                 || checkpoint.operational_ai.is_some()
+                || checkpoint.operational_execution.is_some()
+                || checkpoint.air_power.is_some()
             {
-                bail!("checkpoint-v4 requires its complete live state and forbids operationalAi");
+                bail!(
+                    "checkpoint-v4 requires its complete live state and forbids v5/v6 operational state"
+                );
             }
             if checkpoint.strategic_cycle == u64::MAX {
                 bail!("checkpoint-v4 strategicCycle must leave room for a later cycle");
@@ -2889,21 +3072,45 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.side_dynamics.is_none()
                 || checkpoint.battlefield.is_none()
                 || checkpoint.operational_ai.is_none()
+                || checkpoint.operational_execution.is_some()
+                || checkpoint.air_power.is_some()
             {
-                bail!("checkpoint-v5 requires all live runtime state and operationalAi");
+                bail!(
+                    "checkpoint-v5 requires all live runtime state and operationalAi, and forbids v6 execution state"
+                );
             }
             if checkpoint.strategic_cycle == u64::MAX {
                 bail!("checkpoint-v5 strategicCycle must leave room for a later cycle");
             }
         }
+        NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA => {
+            if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
+                || checkpoint.territory.is_none()
+                || checkpoint.geography.is_none()
+                || checkpoint.influence_runtime.is_none()
+                || checkpoint.side_dynamics.is_none()
+                || checkpoint.battlefield.is_none()
+                || checkpoint.operational_ai.is_none()
+                || checkpoint.operational_execution.is_none()
+                || checkpoint.air_power.is_none()
+            {
+                bail!(
+                    "checkpoint-v6 requires all live runtime, operational execution, and air power state"
+                );
+            }
+            if checkpoint.strategic_cycle == u64::MAX {
+                bail!("checkpoint-v6 strategicCycle must leave room for a later cycle");
+            }
+        }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -3693,6 +3900,8 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         casualties_by_victim: checkpoint.casualties_by_victim.clone(),
         side_dynamics: prepared.side_dynamics.clone(),
         operations: prepared.operational_ai.clone(),
+        operational_execution: prepared.operational_execution.clone(),
+        air_power: prepared.air_power.clone(),
     };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
@@ -4334,6 +4543,10 @@ struct RuntimeSnapshotReport {
     strategic: Option<StrategicSnapshotReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     operational: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operational_execution: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    air_power: Option<Value>,
     counters: Value,
     casualty_totals: BTreeMap<u16, f64>,
     casualties_by_victim: BTreeMap<u16, BTreeMap<u16, f64>>,
@@ -4578,6 +4791,16 @@ fn snapshot_report(
             .as_ref()
             .map(|operational| serde_json::to_value(operational.as_ref()))
             .transpose()?,
+        operational_execution: snapshot
+            .operational_execution_snapshot
+            .as_ref()
+            .map(|execution| serde_json::to_value(execution.as_ref()))
+            .transpose()?,
+        air_power: snapshot
+            .air_power_snapshot
+            .as_ref()
+            .map(|air_power| serde_json::to_value(air_power.as_ref()))
+            .transpose()?,
         counters: counters_json(snapshot),
         casualty_totals: snapshot.casualty_totals.as_ref().clone(),
         casualties_by_victim: snapshot.casualties_by_victim.as_ref().clone(),
@@ -4764,6 +4987,18 @@ fn snapshot_checksum(snapshot: &RuntimeSnapshot) -> Result<String> {
     if let Some(operational) = &snapshot.operational_snapshot {
         checksum.write_bool(true);
         checksum.write_bytes(&serde_json::to_vec(operational.as_ref())?);
+    } else {
+        checksum.write_bool(false);
+    }
+    if let Some(execution) = &snapshot.operational_execution_snapshot {
+        checksum.write_bool(true);
+        checksum.write_bytes(&serde_json::to_vec(execution.as_ref())?);
+    } else {
+        checksum.write_bool(false);
+    }
+    if let Some(air_power) = &snapshot.air_power_snapshot {
+        checksum.write_bool(true);
+        checksum.write_bytes(&serde_json::to_vec(air_power.as_ref())?);
     } else {
         checksum.write_bool(false);
     }
@@ -5127,7 +5362,35 @@ mod tests {
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
             operational_ai: None,
+            operational_execution: None,
+            air_power: None,
         }
+    }
+
+    fn valid_v6_checkpoint() -> RuntimeCheckpointFixture {
+        let mut checkpoint = minimal_checkpoint(
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
+            CheckpointBoundary::MidWar,
+            Some(valid_v2_territory()),
+        );
+        checkpoint.battlefield = Some(valid_battlefield());
+        checkpoint.influence_runtime = Some(valid_influence_runtime());
+        checkpoint.side_dynamics = Some(SideDynamicsFixture {
+            schema: NATIVE_SIDE_DYNAMICS_SCHEMA.to_owned(),
+            sides: vec![SideDynamicsSideFixture {
+                side_index: 0,
+                initial_personnel: 100.0,
+                personnel: 100.0,
+                momentum_history: Vec::new(),
+                war_phase: SideDynamicsWarPhaseFixture::Stalemate,
+                posture: SideDynamicsPostureFixture::Balanced,
+                posture_override: None,
+            }],
+        });
+        checkpoint.operational_ai = Some(OperationalRuntimeState::bootstrap(1, &[0], &[0.0]));
+        checkpoint.operational_execution = Some(OperationalExecutionState::default());
+        checkpoint.air_power = Some(AirPowerState::new(Vec::new(), Vec::new()).unwrap());
+        checkpoint
     }
 
     #[test]
@@ -5560,6 +5823,78 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn checkpoint_v6_requires_both_execution_states_and_v1_through_v5_forbid_them() {
+        let checkpoint = valid_v6_checkpoint();
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let mut missing_execution = checkpoint.clone();
+        missing_execution.operational_execution = None;
+        assert!(validate_checkpoint_shape(&missing_execution).is_err());
+        let mut missing_air = checkpoint.clone();
+        missing_air.air_power = None;
+        assert!(validate_checkpoint_shape(&missing_air).is_err());
+        let mut missing_operations = checkpoint.clone();
+        missing_operations.operational_ai = None;
+        assert!(validate_checkpoint_shape(&missing_operations).is_err());
+
+        for legacy_schema in [
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+        ] {
+            let mut legacy = checkpoint.clone();
+            legacy.schema = legacy_schema.to_owned();
+            assert!(
+                validate_checkpoint_shape(&legacy).is_err(),
+                "{legacy_schema} accepted v6 execution state"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_v6_execution_wire_round_trips_strictly_and_rejects_null() {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OptionalExecution {
+            #[serde(
+                default,
+                deserialize_with = "deserialize_optional_operational_execution"
+            )]
+            operational_execution: Option<OperationalExecutionState>,
+            #[serde(default, deserialize_with = "deserialize_optional_air_power")]
+            air_power: Option<AirPowerState>,
+        }
+
+        let execution = OperationalExecutionState::default();
+        let execution_wire = serde_json::to_value(&execution).unwrap();
+        let decoded_execution: OperationalExecutionState =
+            serde_json::from_value(execution_wire.clone()).unwrap();
+        assert_eq!(decoded_execution, execution);
+        let mut unknown_execution = execution_wire;
+        unknown_execution["unknown"] = json!(true);
+        assert!(serde_json::from_value::<OperationalExecutionState>(unknown_execution).is_err());
+
+        let air_power = AirPowerState::new(Vec::new(), Vec::new()).unwrap();
+        let air_wire = serde_json::to_value(&air_power).unwrap();
+        let decoded_air: AirPowerState = serde_json::from_value(air_wire.clone()).unwrap();
+        assert_eq!(decoded_air, air_power);
+        let mut unknown_air = air_wire;
+        unknown_air["unknown"] = json!(true);
+        assert!(serde_json::from_value::<AirPowerState>(unknown_air).is_err());
+
+        let absent: OptionalExecution = serde_json::from_value(json!({})).unwrap();
+        assert!(absent.operational_execution.is_none());
+        assert!(absent.air_power.is_none());
+        assert!(
+            serde_json::from_value::<OptionalExecution>(json!({"operationalExecution": null}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<OptionalExecution>(json!({"airPower": null})).is_err());
     }
 
     #[test]
