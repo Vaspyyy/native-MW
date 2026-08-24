@@ -35,7 +35,7 @@ browser runtime's shared mutable `main.js` structure.
 8. Derive production country/city/economy inputs and production front layouts
    from an MWSC scenario, then connect the migrated kernels under one native
    tick owner.
-9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v11 `midWar`
+9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v12 `midWar`
    checkpoints into `mw-native`, run their simulation on a dedicated worker,
    and present immutable runtime publications without blocking rendering on a
    tick.
@@ -115,7 +115,7 @@ Normal `mw-native` startup remains map-only. The opt-in `--demo-units` mode
 finds a real adjacent-country land border in the decoded scenario and
 constructs a small explicit runtime. `--runtime-checkpoint PATH` instead loads
 the shared strict checkpoint adapter and requires either an exact-geography v1
-`postStartWar` handoff or an exact-live-state v2-v11 `midWar` handoff. The viewer
+`postStartWar` handoff or an exact-live-state v2-v12 `midWar` handoff. The viewer
 rejects `baselineReplay`; that boundary remains limited to deterministic
 fixtures and benchmarks. `--headless --ticks N` runs the same checkpoint and
 worker for up to `N` successful steps without constructing a window or GPU
@@ -350,7 +350,12 @@ armor/fighter/strike purchases, existing armor/wing reinforcement, then at most
 one armor formation and one wing per role. Crew and treasury bounds are committed
 with one immutable material snapshot. Capitulation clears reserves and resolves
 aircraft evacuation or loss. Native v10 checkpoints remain loadable; this is not
-a claim of full UI parity.
+a claim of full UI parity. Checkpoint v12 retains v11 and adds exact strategic
+missile continuation: browser-style silos seed default modern native sandbox
+wars, autonomous launches use the exact shared RNG, trails rise and fall through
+40 points, hostile radial damage is limited to 0.5 degrees, explosions last 30
+frames, and observer publication is immutable. Older v1-v11 checkpoints remain
+loadable without missile state; native new wars save v12.
 
 The browser keeps v1 as the default export. V2 through v6 are explicit and act as
 quiescent save barriers: they synchronously flush census work, then refuse the
@@ -519,9 +524,9 @@ The consequence port is intentionally bounded. It does not yet reproduce
 browser releasables, province-border smoothing, or treaty/UI presentation.
 Checkpoint v11 covers material reserve and aircraft cleanup. Browser-authored legacy v2 checkpoints
 omit the optional native planner block and therefore start a fresh deterministic
-front planning boundary. Native-authored v2-v11 saves include current objectives,
+front planning boundary. Native-authored v2-v12 saves include current objectives,
 assignment priors, layout priors, and the last refresh tick. New native-war
-saves use v11; legacy runtimes select the newest schema supported by their owned
+saves use v12; legacy runtimes select the newest schema supported by their owned
 continuation state.
 
 The native writer accepts only the canonical runtime, simulation, territory
@@ -582,7 +587,7 @@ then the observer HUD.
    `NativeRuntime`.**
 8. Derive production scenario inputs and front objectives, then connect AI,
    simulation, territory, and strategic kernels under one runtime owner.
-   **Complete for the bounded v1-v11 checkpoint contracts and runtime.**
+   **Complete for the bounded v1-v12 checkpoint contracts and runtime.**
 9. Load production checkpoints in `mw-native`. **Complete for strict,
    exact-geography `postStartWar` and exact-live-state `midWar` viewer/headless
    operation; `baselineReplay` is deliberately rejected.**

@@ -12,6 +12,7 @@ use mw_checkpoint::native_runtime::{
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
     write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
     write_runtime_checkpoint_state_v10, write_runtime_checkpoint_state_v11,
+    write_runtime_checkpoint_state_v12,
 };
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
@@ -819,7 +820,13 @@ impl App {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.material_logistics.is_some()
+        let writer = if state.strategic_missiles.is_some()
+            && state.material_logistics.is_some()
+            && state.reinforcement.is_some()
+            && state.naval_planning.is_some()
+        {
+            write_runtime_checkpoint_state_v12
+        } else if state.material_logistics.is_some()
             && state.reinforcement.is_some()
             && state.naval_planning.is_some()
         {
@@ -1289,6 +1296,7 @@ impl App {
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.draw(0..3, 0..1);
+            gpu.world_overlay.draw_missiles(&mut pass);
             gpu.world_overlay.draw_air(&mut pass);
             gpu.map_labels.draw_cities(&mut pass);
             gpu.unit_renderer.draw(&mut pass);
@@ -1954,6 +1962,7 @@ fn create_demo_runtime(
             naval_planning: None,
             reinforcement: None,
             material_logistics: None,
+            strategic_missiles: None,
         },
     )?;
     Ok(runtime)

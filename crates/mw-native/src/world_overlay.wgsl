@@ -26,6 +26,7 @@ fn vs_marker(
     @location(4) value: f32,
     @location(5) kind: u32,
     @location(6) flags: u32,
+    @location(7) angle: f32,
 ) -> MarkerOutput {
     var corners = array<vec2<f32>, 6>(
         vec2(-1.0, -1.0),
@@ -36,7 +37,23 @@ fn vs_marker(
         vec2(-1.0, 1.0),
     );
     let local = corners[vertex_index];
-    let screen = (world - view.center) * view.pixels_per_world + view.viewport * 0.5 + local * size;
+    var screen_local = local;
+    // The browser renderer sizes these effects in Leaflet zoom space. Native world width is two,
+    // so pixels_per_world * 2 == 256 * 2^zoom.
+    let browser_zoom = log2(max(view.pixels_per_world, 1.0) / 128.0);
+    var marker_size = size;
+    if (kind == 6u || kind == 9u) {
+        marker_size *= pow(1.2, browser_zoom - 3.0);
+    } else if (kind == 7u) {
+        marker_size = max(4.0, browser_zoom * 1.5) * 1.2;
+    } else if (kind == 8u) {
+        marker_size *= max(browser_zoom, 0.0) / 5.0;
+    }
+    if (kind == 6u) {
+        let c = cos(angle); let s = sin(angle);
+        screen_local = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
+    }
+    let screen = (world - view.center) * view.pixels_per_world + view.viewport * 0.5 + screen_local * marker_size;
     var output: MarkerOutput;
     output.position = vec4((screen / view.viewport) * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 0.0, 1.0);
     output.color = color;
@@ -125,6 +142,54 @@ fn fs_marker(input: MarkerOutput) -> @location(0) vec4<f32> {
             if (edge > 0.88 || edge < 0.62) { discard; }
         }
         return input.color;
+    }
+
+    // Strategic missile: bright rotated body with a hot engine flare.
+    if (input.kind == 6u) {
+        let body = abs(input.local.y) < 0.16 && input.local.x > -0.72 && input.local.x < 0.72;
+        let nose = input.local.x > 0.52 && abs(input.local.y) < (0.9 - input.local.x) * 0.55;
+        let fins = input.local.x < -0.35 && abs(input.local.y) < 0.52;
+        if (!(body || nose || fins)) { discard; }
+        if (input.local.x < -0.60 && abs(input.local.y) < 0.24) {
+            return vec4(input.color.rgb, input.color.a * 0.72);
+        }
+        let inner_body = abs(input.local.y) < 0.10 && input.local.x > -0.61 && input.local.x < 0.70;
+        let inner_nose = input.local.x > 0.50 && abs(input.local.y) < (0.84 - input.local.x) * 0.42;
+        let inner_fins = input.local.x < -0.38 && abs(input.local.y) < 0.40;
+        if (inner_body || inner_nose || inner_fins) { return vec4(1.0, 1.0, 1.0, 0.98); }
+        return vec4(input.color.rgb, 0.98);
+    }
+    // Silo and impact use the same soft procedural radial treatment.
+    if (input.kind == 7u) {
+        let r = length(input.local);
+        if (r > 1.0) { discard; }
+        let square_edge = max(abs(input.local.x), abs(input.local.y));
+        if (square_edge <= 0.42) {
+            let outline = square_edge > 0.28;
+            let cross = abs(input.local.x) < 0.13 || abs(input.local.y) < 0.13;
+            if (outline || cross) { return vec4(input.color.rgb, 1.0); }
+            return vec4(1.0, 1.0, 1.0, 1.0);
+        }
+        return vec4(input.color.rgb, 0.30);
+    }
+    if (input.kind == 8u) {
+        let r = length(input.local);
+        if (r > 1.0) { discard; }
+        let white_core = 1.0 - smoothstep(0.0, 0.28, r);
+        let hot_core = 1.0 - smoothstep(0.15, 0.58, r);
+        let edge = 1.0 - smoothstep(0.58, 1.0, r);
+        let rgb = mix(vec3(1.0, 0.08, 0.01), vec3(1.0, 0.78, 0.20), hot_core);
+        return vec4(mix(rgb, vec3(1.0), white_core), input.color.a * edge);
+    }
+    // Browser trail: side-colour glow, solid core, and a white-hot newest fifth.
+    if (input.kind == 9u) {
+        let r = length(input.local);
+        if (r > 1.0) { discard; }
+        let glow = 1.0 - smoothstep(0.28, 1.0, r);
+        let core = 1.0 - smoothstep(0.20, 0.34, r);
+        let white_hot = select(0.0, 1.0 - smoothstep(0.0, 0.17, r), input.value > 0.8);
+        let rgb = mix(input.color.rgb, vec3(1.0), white_hot);
+        return vec4(rgb, input.color.a * max(glow * 0.30, core));
     }
 
     discard;

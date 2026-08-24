@@ -6,7 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use mw_core::{
     AirPowerState, AirRole, AirWingState, FrameSnapshot, IntelStatus, NavalOperationPhase,
     OperationalContact, OperationalExecutionState, OperationalPoint, OperationalSnapshot, Point,
-    RuntimeSnapshot, TaskForcePhase,
+    RuntimeSnapshot, StrategicMissileState, TaskForcePhase,
 };
 
 use crate::unit_renderer::geographic_to_world;
@@ -17,6 +17,10 @@ const MARKER_STRIKE: u32 = 2;
 const MARKER_BATTLE: u32 = 3;
 const MARKER_CONTACT: u32 = 4;
 const MARKER_ANCHOR: u32 = 5;
+const MARKER_MISSILE: u32 = 6;
+const MARKER_SILO: u32 = 7;
+const MARKER_EXPLOSION: u32 = 8;
+const MARKER_MISSILE_TRAIL: u32 = 9;
 
 const FLAG_DISABLED_OR_STALE: u32 = 1;
 const FLAG_ANCHOR_TARGET: u32 = 1;
@@ -43,6 +47,7 @@ struct MarkerInstance {
     value: f32,
     kind: u32,
     flags: u32,
+    angle: f32,
 }
 
 #[repr(C)]
@@ -62,6 +67,7 @@ struct OverlayProjection {
     air_markers: [usize; 2],
     battle_markers: [usize; 2],
     operation_markers: [usize; 2],
+    missile_markers: [usize; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -84,6 +90,7 @@ pub struct WorldOverlayRenderer {
     air_markers: [u32; 2],
     battle_markers: [u32; 2],
     operation_markers: [u32; 2],
+    missile_markers: [u32; 2],
     markers: Vec<MarkerInstance>,
     segments: Vec<SegmentInstance>,
 }
@@ -141,7 +148,8 @@ impl WorldOverlayRenderer {
                         3 => Float32,
                         4 => Float32,
                         5 => Uint32,
-                        6 => Uint32
+                        6 => Uint32,
+                        7 => Float32
                     ],
                 }],
                 compilation_options: Default::default(),
@@ -204,6 +212,7 @@ impl WorldOverlayRenderer {
             air_markers: [0; 2],
             battle_markers: [0; 2],
             operation_markers: [0; 2],
+            missile_markers: [0; 2],
             markers: Vec::new(),
             segments: Vec::new(),
         }
@@ -251,6 +260,7 @@ impl WorldOverlayRenderer {
         self.air_markers = projection.air_markers.map(|index| index as u32);
         self.battle_markers = projection.battle_markers.map(|index| index as u32);
         self.operation_markers = projection.operation_markers.map(|index| index as u32);
+        self.missile_markers = projection.missile_markers.map(|index| index as u32);
     }
 
     pub fn draw_air<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
@@ -269,6 +279,11 @@ impl WorldOverlayRenderer {
             pass.draw(0..6, 0..self.segment_count);
         }
         self.draw_marker_range(pass, self.operation_markers);
+    }
+
+    /// Draw silos, bounded missile trails, in-flight bodies, and fading impacts.
+    pub fn draw_missiles<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.draw_marker_range(pass, self.missile_markers);
     }
 
     fn draw_marker_range<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, range: [u32; 2]) {
@@ -332,7 +347,78 @@ fn project_world_overlays(
         append_execution(execution, side, &mut projection);
     }
     projection.operation_markers = [operation_start, projection.markers.len()];
+    let missile_start = projection.markers.len();
+    append_missiles(
+        snapshot.strategic_missile_snapshot.as_deref(),
+        &mut projection,
+    );
+    projection.missile_markers = [missile_start, projection.markers.len()];
     projection
+}
+
+fn append_missiles(state: Option<&StrategicMissileState>, projection: &mut OverlayProjection) {
+    let Some(state) = state else {
+        return;
+    };
+    // Browser ordering: impacts under trails/bodies, with silo landmarks on top.
+    for explosion in &state.explosions {
+        let life = explosion.life as f32;
+        let life_fraction = (life / 30.0).clamp(0.0, 1.0);
+        projection.markers.push(MarkerInstance {
+            world: geographic_to_world(explosion.lat, explosion.lng),
+            color: [1.0, 0.28, 0.06, life_fraction],
+            size: (explosion.max_radius as f32 * (1.0 - life_fraction)).max(1.0),
+            value: life_fraction,
+            kind: MARKER_EXPLOSION,
+            flags: 0,
+            angle: 0.0,
+        });
+    }
+    if state.enabled && state.technology_allowed {
+        for missile in &state.missiles {
+            let trail_len = missile.trail.len().max(1) as f32;
+            for (index, point) in missile.trail.iter().enumerate() {
+                let progress = index as f32 / trail_len;
+                if progress <= 0.0 {
+                    continue;
+                }
+                let mut color = side_color(missile.side_index);
+                color[3] = progress * 0.7;
+                projection.markers.push(MarkerInstance {
+                    world: geographic_to_world(point.lat, point.lng),
+                    color,
+                    // The shader quad covers the browser's 3x outer glow.
+                    size: 7.5 * progress,
+                    value: progress,
+                    kind: MARKER_MISSILE_TRAIL,
+                    flags: 0,
+                    angle: 0.0,
+                });
+            }
+            let d_lng = missile.next_lng - missile.current_lng;
+            let d_lat = missile.next_lat - missile.current_lat;
+            projection.markers.push(MarkerInstance {
+                world: geographic_to_world(missile.current_lat, missile.current_lng),
+                color: side_color(missile.side_index),
+                size: 10.0,
+                value: missile.progress as f32,
+                kind: MARKER_MISSILE,
+                flags: 0,
+                angle: (-d_lat).atan2(d_lng) as f32,
+            });
+        }
+    }
+    for base in &state.bases {
+        projection.markers.push(MarkerInstance {
+            world: geographic_to_world(base.lat, base.lng),
+            color: side_color(base.side_index),
+            size: 8.0,
+            value: 1.0,
+            kind: MARKER_SILO,
+            flags: 0,
+            angle: 0.0,
+        });
+    }
 }
 
 fn append_air_markers(air: Option<&AirPowerState>, markers: &mut Vec<MarkerInstance>) {
@@ -346,6 +432,7 @@ fn append_air_markers(air: Option<&AirPowerState>, markers: &mut Vec<MarkerInsta
         value: (field.health / 100.0).clamp(0.0, 1.0) as f32,
         kind: MARKER_AIRFIELD,
         flags: u32::from(field.disabled || field.health <= 0.0),
+        angle: 0.0,
     }));
     markers.extend(
         air.wings
@@ -365,6 +452,7 @@ fn append_air_markers(air: Option<&AirPowerState>, markers: &mut Vec<MarkerInsta
                     AirRole::Strike => MARKER_STRIKE,
                 },
                 flags: 0,
+                angle: 0.0,
             }),
     );
 }
@@ -388,6 +476,7 @@ fn append_battle_markers(snapshot: &FrameSnapshot, frame: u64, markers: &mut Vec
             value: (battle.participants as f32 / 15.0).clamp(0.0, 1.0),
             kind: MARKER_BATTLE,
             flags: 0,
+            angle: 0.0,
         }
     }));
 }
@@ -513,6 +602,7 @@ fn append_operations(
                     value: confidence as f32,
                     kind: MARKER_CONTACT,
                     flags: u32::from(stale) * FLAG_DISABLED_OR_STALE,
+                    angle: 0.0,
                 }
             }),
     );
@@ -694,6 +784,7 @@ fn append_anchor(
             value: 1.0,
             kind: MARKER_ANCHOR,
             flags,
+            angle: 0.0,
         });
     }
 }
@@ -711,6 +802,7 @@ fn append_execution_anchor(
         value: 1.0,
         kind: MARKER_ANCHOR,
         flags,
+        angle: 0.0,
     });
 }
 
@@ -736,7 +828,10 @@ fn normalize_longitude(value: f64) -> f64 {
 mod tests {
     use std::sync::Arc;
 
-    use mw_core::{CombatEvent, CombatLayer, UnitKind, UnitSnapshot};
+    use mw_core::{
+        CombatEvent, CombatLayer, MissileBase, MissileExplosion, MissilePhase, MissilePoint,
+        STRATEGIC_MISSILE_SCHEMA_VERSION, StrategicMissile, UnitKind, UnitSnapshot,
+    };
 
     use super::*;
 
@@ -941,5 +1036,127 @@ mod tests {
         assert!(markers[0].world.into_iter().all(f32::is_finite));
         assert!(markers[0].color.into_iter().all(f32::is_finite));
         assert!(markers[0].size.is_finite() && markers[0].size > 0.0);
+    }
+
+    #[test]
+    fn browser_missile_projection_orders_impact_trail_body_and_silo() {
+        let state = StrategicMissileState {
+            schema: STRATEGIC_MISSILE_SCHEMA_VERSION.to_owned(),
+            enabled: true,
+            technology_allowed: true,
+            bases: vec![MissileBase {
+                lat: 2.0,
+                lng: 3.0,
+                side_index: 1,
+            }],
+            missiles: vec![StrategicMissile {
+                id: 0.25,
+                start_lat: 0.0,
+                start_lng: 0.0,
+                target_lat: 0.0,
+                target_lng: 10.0,
+                current_lat: 0.0,
+                current_lng: 4.0,
+                next_lat: 0.0,
+                next_lng: 4.1,
+                progress: 0.4,
+                side_index: 1,
+                phase: MissilePhase::Rising,
+                trail: vec![
+                    MissilePoint { lat: 0.0, lng: 1.0 },
+                    MissilePoint { lat: 0.0, lng: 2.0 },
+                    MissilePoint { lat: 0.0, lng: 3.0 },
+                ],
+                peak_alt: 2.0,
+            }],
+            explosions: vec![MissileExplosion {
+                lat: 0.0,
+                lng: 10.0,
+                life: 15,
+                max_radius: 20.0,
+            }],
+        };
+        let mut projection = OverlayProjection::default();
+        append_missiles(Some(&state), &mut projection);
+        assert_eq!(
+            projection
+                .markers
+                .iter()
+                .map(|marker| marker.kind)
+                .collect::<Vec<_>>(),
+            [
+                MARKER_EXPLOSION,
+                MARKER_MISSILE_TRAIL,
+                MARKER_MISSILE_TRAIL,
+                MARKER_MISSILE,
+                MARKER_SILO,
+            ]
+        );
+        assert!(projection.segments.is_empty());
+        let missile = projection
+            .markers
+            .iter()
+            .find(|marker| marker.kind == MARKER_MISSILE)
+            .unwrap();
+        assert!(missile.angle.abs() < f32::EPSILON);
+        assert_eq!(missile.color, side_color(1));
+        assert!(projection.markers.iter().all(|marker| {
+            marker.world.into_iter().all(f32::is_finite)
+                && marker.color.into_iter().all(f32::is_finite)
+                && marker.size.is_finite()
+                && marker.size > 0.0
+        }));
+    }
+
+    #[test]
+    fn disabled_missile_state_projects_nothing() {
+        let mut projection = OverlayProjection::default();
+        append_missiles(Some(&StrategicMissileState::disabled()), &mut projection);
+        assert!(projection.markers.is_empty());
+        assert!(projection.segments.is_empty());
+    }
+
+    #[test]
+    fn disabled_launches_still_render_browser_silos_and_existing_explosions() {
+        let mut state = StrategicMissileState::disabled();
+        state.bases.push(MissileBase {
+            lat: 2.0,
+            lng: 3.0,
+            side_index: 0,
+        });
+        state.explosions.push(MissileExplosion {
+            lat: 4.0,
+            lng: 5.0,
+            life: 10,
+            max_radius: 20.0,
+        });
+        state.missiles.push(StrategicMissile {
+            id: 0.25,
+            start_lat: 2.0,
+            start_lng: 3.0,
+            target_lat: 4.0,
+            target_lng: 5.0,
+            current_lat: 2.0,
+            current_lng: 3.0,
+            next_lat: 2.1,
+            next_lng: 3.1,
+            progress: 0.25,
+            side_index: 0,
+            phase: MissilePhase::Rising,
+            trail: vec![MissilePoint { lat: 2.0, lng: 3.0 }],
+            peak_alt: 2.0,
+        });
+        let mut projection = OverlayProjection::default();
+
+        append_missiles(Some(&state), &mut projection);
+
+        assert_eq!(
+            projection
+                .markers
+                .iter()
+                .map(|marker| marker.kind)
+                .collect::<Vec<_>>(),
+            [MARKER_EXPLOSION, MARKER_SILO]
+        );
     }
 }

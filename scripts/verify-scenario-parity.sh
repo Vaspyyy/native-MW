@@ -27,6 +27,7 @@ cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpo
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v9
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v10
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v11
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v12
 
 scenarios=(
 	"world-map-2022-v2.mwsc.gz"
@@ -51,6 +52,7 @@ for scenario in "${scenarios[@]}"; do
 done
 
 modern_path="$web_root/assets/maps/compiled/world-map-2022-v2.mwsc.gz"
+historical_path="$web_root/assets/maps/compiled/world-war-1-1914-v2.mwsc.gz"
 for resolution in "${resolutions[@]}"; do
 	rust_output=$("$native_root/target/debug/mw-tools" field-bench "$modern_path" --grid-res "$resolution" --repeat 1 --json)
 	js_output=$(node "$native_root/scripts/js-direction-parity.mjs" "$web_root" "$modern_path" "$resolution")
@@ -120,7 +122,7 @@ fi
 
 if ! jq -e '
 	.schema == "native-runtime-checkpoint-v1"
-	and .runtimeSchema == "native-runtime-v3"
+	and .runtimeSchema == "native-runtime-v4"
 	and .checkpointBoundary.kind == "baselineReplay"
 	and .checkpointBoundary.resumable == false
 	and .requestedSteps == 3
@@ -142,12 +144,27 @@ save_tmp=$(mktemp -d)
 trap 'rm -rf "$save_tmp"' EXIT
 native_bin="$native_root/target/debug/mw-native"
 naval_bin="$native_root/target/release/mw-native"
+if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+	"$native_bin" --smoke --side Germany,France --side Poland,Belgium "$modern_path"
+	printf 'native GPU missile/silo shader smoke gate ok\n'
+fi
+"$native_bin" --side "German Empire" --side France --headless --ticks 1 --tick-ms 1 \
+	--save-checkpoint "$save_tmp/historical.json" "$historical_path" >/dev/null
+jq -e '
+	.schema == "native-runtime-checkpoint-v12"
+	and .strategicMissiles.enabled == false
+	and .strategicMissiles.technologyAllowed == true
+	and (.strategicMissiles.bases | length) > 0
+	and (.strategicMissiles.missiles | length) == 0
+	and .gameplayRng.state != 1297567793
+' "$save_tmp/historical.json" >/dev/null
+printf 'native WW1 browser name gate disables launches but preserves silo RNG seeding\n'
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/part.json" "$modern_path" >/dev/null
 "$native_bin" --runtime-checkpoint "$save_tmp/part.json" --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/resumed.json" "$modern_path" >/dev/null
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 40 --tick-ms 1 --save-checkpoint "$save_tmp/full.json" "$modern_path" >/dev/null
 for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full.json"; do
 	jq -e '
-		.schema == "native-runtime-checkpoint-v11"
+		.schema == "native-runtime-checkpoint-v12"
 		and .gameplayRng.schema == "native-gameplay-rng-v1"
 		and .gameplayRng.algorithm == "mulberry32"
 		and (.gameplayRng.state | type == "number" and . >= 0 and . <= 4294967295)
@@ -160,6 +177,12 @@ for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full
 		and .navalPlanning.schema == "native-naval-planning-v1"
 		and .reinforcement.schema == "native-reinforcement-v1"
 		and .materialLogistics.schema == "native-material-logistics-v1"
+		and .strategicMissiles.schema == "native-strategic-missile-v1"
+		and .strategicMissiles.enabled == true
+		and .strategicMissiles.technologyAllowed == true
+		and (.strategicMissiles.bases | length) >= 4
+		and ([.strategicMissiles.bases[].sideIndex] | unique | length) == (.sides | length)
+		and ([.strategicMissiles.missiles[].trail | length] | all(. <= 40))
 		and (.reinforcement.countries | length) == (.economies | length)
 		and (.navalPlanning.sideStates | length) == (.sides | length)
 		and ([.navalPlanning.sideStates[].side] ==
@@ -173,8 +196,54 @@ for checkpoint in "$save_tmp/part.json" "$save_tmp/resumed.json" "$save_tmp/full
 		and (.sideDynamics.sides | length) == (.sides | length)
 	' "$checkpoint" >/dev/null
 done
+jq -e '
+	(.strategicMissiles.bases | length) > 0
+	and ([.units[] | select(.side == 1)] | length) > 0
+' "$save_tmp/part.json" >/dev/null
+jq '(.strategicMissiles.bases[0]) as $base
+	| (.units | map(select(.side == 1))[0]) as $target
+	| .strategicMissiles.missiles = [{
+		id: 0.25,
+		startLat: $base.lat, startLng: $base.lng,
+		targetLat: $target.lat, targetLng: $target.lng,
+		currentLat: $base.lat, currentLng: $base.lng,
+		nextLat: $base.lat, nextLng: $base.lng,
+		progress: 0.98, sideIndex: 0, phase: "falling", trail: [], peakAlt: 2.0
+	}]
+	| .strategicMissiles.explosions = []' \
+	"$save_tmp/part.json" >"$save_tmp/forced-missile.json"
+"$native_bin" --runtime-checkpoint "$save_tmp/forced-missile.json" --headless --ticks 1 \
+	--tick-ms 1 --save-checkpoint "$save_tmp/forced-flight-part.json" "$modern_path" --json \
+	>"$save_tmp/forced-flight-report.json"
+jq -e '
+	.missileCounters.impacts == 0
+	and (.strategicMissiles.missiles | length) == 1
+	and (.strategicMissiles.missiles[0].trail | length) == 1
+' "$save_tmp/forced-flight-report.json" >/dev/null
+"$native_bin" --runtime-checkpoint "$save_tmp/forced-flight-part.json" --headless --ticks 1 \
+	--tick-ms 1 --save-checkpoint "$save_tmp/forced-impact.json" "$modern_path" --json \
+	>"$save_tmp/forced-impact-report.json"
+"$native_bin" --runtime-checkpoint "$save_tmp/forced-missile.json" --headless --ticks 2 \
+	--tick-ms 1 --save-checkpoint "$save_tmp/forced-impact-full.json" "$modern_path" >/dev/null
+jq -e '
+	.missileCounters.impacts == 1
+	and .missileCounters.damagedUnits > 0
+	and .missileCounters.personnelLoss > 0
+	and (.strategicMissiles.missiles | length) == 0
+	and (.strategicMissiles.explosions | length) == 1
+	and .strategicMissiles.explosions[0].life == 29
+' "$save_tmp/forced-impact-report.json" >/dev/null
+jq -e '
+	.schema == "native-runtime-checkpoint-v12"
+	and (.strategicMissiles.missiles | length) == 0
+	and .strategicMissiles.explosions[0].life == 29
+' "$save_tmp/forced-impact.json" >/dev/null
+diff -u \
+	<(jq -S 'del(.steps)' "$save_tmp/forced-impact.json") \
+	<(jq -S 'del(.steps)' "$save_tmp/forced-impact-full.json")
+printf 'native browser-style missile flight, radial damage, explosion, and v12 split-resume gate ok\n'
 jq '.schema = "native-runtime-checkpoint-v5"
-	| del(.operationalExecution, .airPower, .navalPlanning, .gameplayRng, .personnelReserves, .reinforcement, .materialLogistics)
+	| del(.operationalExecution, .airPower, .navalPlanning, .gameplayRng, .personnelReserves, .reinforcement, .materialLogistics, .strategicMissiles)
 	| del(.battlefield.units[].supplyCollapsedTick)' \
 	"$save_tmp/part.json" >"$save_tmp/part-v5.json"
 node "$native_root/scripts/js-browser-v5-wire.mjs" \
@@ -183,7 +252,7 @@ node "$native_root/scripts/js-browser-v5-wire.mjs" \
 	"$modern_path" "$save_tmp/browser-v5-wire.json" --ticks 1 --json >/dev/null
 printf 'browser v5 operationalAi wire to native loader gate ok\n'
 jq '.schema = "native-runtime-checkpoint-v6"
-	| del(.navalPlanning, .gameplayRng, .personnelReserves, .reinforcement, .materialLogistics)
+	| del(.navalPlanning, .gameplayRng, .personnelReserves, .reinforcement, .materialLogistics, .strategicMissiles)
 	| del(.battlefield.units[].supplyCollapsedTick)' \
 	"$save_tmp/part.json" >"$save_tmp/part-v6.json"
 "$native_bin" --runtime-checkpoint "$save_tmp/part-v6.json" --headless --ticks 1 --tick-ms 1 \
@@ -212,7 +281,7 @@ jq -e '
 "$native_root/target/debug/mw-tools" native-runtime-fixture \
 	"$modern_path" "$save_tmp/browser-v6-wire.json" --ticks 1 --json >/dev/null
 printf 'browser v6 execution and air-power wire to native loader gate ok\n'
-jq '.schema = "native-runtime-checkpoint-v10" | del(.materialLogistics)' \
+jq '.schema = "native-runtime-checkpoint-v10" | del(.materialLogistics, .strategicMissiles)' \
 	"$save_tmp/part.json" >"$save_tmp/part-v10.json"
 "$native_bin" --runtime-checkpoint "$save_tmp/part-v10.json" --headless --ticks 1 --tick-ms 1 \
 	--save-checkpoint "$save_tmp/upgraded-v11.json" "$modern_path" >/dev/null
@@ -223,17 +292,18 @@ jq -e '
 ' "$save_tmp/upgraded-v11.json" >/dev/null
 printf 'legacy native v10 load and deterministic v11 material upgrade gate ok\n'
 diff -u <(jq -S 'del(.steps)' "$save_tmp/resumed.json") <(jq -S 'del(.steps)' "$save_tmp/full.json")
-printf 'native v11 save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'
+printf 'native v12 missile save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'
 
 "$naval_bin" --side "United Kingdom" --side Iceland --headless --ticks 1000 --tick-ms 1 \
 	--save-checkpoint "$save_tmp/naval-part.json" "$modern_path" >/dev/null
 jq -e '
-	.schema == "native-runtime-checkpoint-v11"
+	.schema == "native-runtime-checkpoint-v12"
 	and .gameplayRng.schema == "native-gameplay-rng-v1"
 	and (.personnelReserves | length) == (.sides | length)
 	and .navalPlanning.schema == "native-naval-planning-v1"
 	and .reinforcement.schema == "native-reinforcement-v1"
 	and .materialLogistics.schema == "native-material-logistics-v1"
+	and .strategicMissiles.schema == "native-strategic-missile-v1"
 	and .navalPlanning.nextOperationSequence > 1
 	and (.operationalExecution.navalOperations | length) >= 1
 	and ([.operationalExecution.navalOperations[]

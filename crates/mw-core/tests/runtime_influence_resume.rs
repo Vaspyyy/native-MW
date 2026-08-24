@@ -118,6 +118,7 @@ fn restored_runtime(state: NativeRuntimeCheckpointState) -> NativeRuntime {
             air_power: state.air_power,
             reinforcement: state.reinforcement,
             material_logistics: state.material_logistics,
+            strategic_missiles: state.strategic_missiles,
         },
     )
     .unwrap()

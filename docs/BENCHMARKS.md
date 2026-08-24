@@ -401,7 +401,7 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or native v2-v11 `midWar`
+Run an exact browser-exported v1 `postStartWar` or native v2-v12 `midWar`
 checkpoint in the production viewer, or validate steps without a window:
 
 ```bash
@@ -414,8 +414,8 @@ Native-only starts use repeated `--side` selectors (ID or unique
 case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
 
 ```bash
-target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v11.json "$scenario"
-target/release/mw-native --runtime-checkpoint /tmp/mw-v11.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v11-resumed.json "$scenario"
+target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v12.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v12.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v12-resumed.json "$scenario"
 ```
 
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
@@ -449,7 +449,7 @@ wings, including ordered per-country air-operations funding coverage. V7 retains
 v6 and adds the exact per-side naval reassessment
 clocks plus next native operation sequence. Coastal topology and reusable BFS
 scratch are derived from immutable land and remain outside the serialized
-contract. New native wars save v11. V8 adds required nullable per-unit supply
+contract. New native wars save v12. V8 adds required nullable per-unit supply
 collapse markers for exact operational-feedback continuation; v9 adds the
 Mulberry32 gameplay cursor and complete side-level recruitable reserves; v10
 adds persistent aircraft logistics and monotonic unit/wing allocators. Legacy runtimes
@@ -457,7 +457,7 @@ choose the newest schema their owned continuation
 state supports. Checkpoint encoding/decoding and restore remain outside the timed
 benchmark region.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v11
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v12
 `midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
@@ -499,7 +499,7 @@ MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
 stress fixture and therefore do not measure the live resolver or the new
 influence/side-dynamics schedulers; they are not a claim of complete
-browser-tick parity. A v2-v11 restore rebuilds private territory summaries;
+browser-tick parity. A v2-v12 restore rebuilds private territory summaries;
 partial census work and
 render queues are not serialized. V3 separately preserves pending frontier
 work. Map-only viewing and the small scenario-derived `--demo-units` runtime
@@ -641,3 +641,12 @@ one-armor and one-wing-per-role creation. Crew and treasury bounds, immutable
 material snapshots, and capitulation reserve cleanup plus aircraft evacuation or
 loss are included. This slice has not been benchmarked separately yet; the v10
 numbers above remain unchanged and this does not claim full UI parity.
+
+### Native checkpoint v12 strategic-missile contract
+
+V12 retains v11 and adds exact strategic missile continuation. Default modern
+native sandbox wars seed browser-style silos; autonomous launches use the exact
+shared RNG, trails rise and fall through 40 points, hostile radial damage is
+limited to 0.5 degrees, explosions last 30 frames, and observer publication is
+immutable. No separate missile benchmark is claimed here; older v1-v11 saves
+remain loadable without missile state, and native new wars save v12.

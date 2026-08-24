@@ -13,6 +13,7 @@ use mw_checkpoint::native_runtime::{
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
     write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
     write_runtime_checkpoint_state_v10, write_runtime_checkpoint_state_v11,
+    write_runtime_checkpoint_state_v12,
 };
 use mw_core::{
     CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
@@ -177,7 +178,13 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.material_logistics.is_some()
+        let writer = if state.strategic_missiles.is_some()
+            && state.material_logistics.is_some()
+            && state.reinforcement.is_some()
+            && state.naval_planning.is_some()
+        {
+            write_runtime_checkpoint_state_v12
+        } else if state.material_logistics.is_some()
             && state.reinforcement.is_some()
             && state.naval_planning.is_some()
         {
@@ -263,6 +270,15 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
                 "gameplayRngState": completion.final_snapshot.gameplay_rng_state.state,
                 "personnelReserves": completion.final_snapshot.personnel_reserves.as_ref(),
                 "reinforcement": completion.final_snapshot.reinforcement_snapshot.as_deref(),
+                "strategicMissiles": completion.final_snapshot.strategic_missile_snapshot.as_deref(),
+                "missileCounters": {
+                    "launches": completion.final_snapshot.counters.missiles.launches,
+                    "impacts": completion.final_snapshot.counters.missiles.impacts,
+                    "damagedUnits": completion.final_snapshot.counters.missiles.damaged_units,
+                    "removedUnits": completion.final_snapshot.counters.missiles.removed_units,
+                    "personnelLoss": completion.final_snapshot.counters.missiles.personnel_loss,
+                    "equipmentLoss": completion.final_snapshot.counters.missiles.equipment_loss,
+                },
                 "reinforcementCounters": {
                     "recruitedUnits": completion.final_snapshot.counters.reinforcement.recruited_units,
                     "recruitedPersonnel": completion.final_snapshot.counters.reinforcement.recruited_personnel,
@@ -661,6 +677,12 @@ fn checksum_runtime_snapshot(checksum: &mut Fnv64, snapshot: &RuntimeSnapshot) -
     checksum.write_bytes(&serde_json::to_vec(snapshot.personnel_reserves.as_ref())?);
     checksum.write_bytes(&serde_json::to_vec(
         &snapshot.reinforcement_snapshot.as_deref(),
+    )?);
+    checksum.write_bytes(&serde_json::to_vec(
+        &snapshot.material_logistics_snapshot.as_deref(),
+    )?);
+    checksum.write_bytes(&serde_json::to_vec(
+        &snapshot.strategic_missile_snapshot.as_deref(),
     )?);
     Ok(())
 }

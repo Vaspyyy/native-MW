@@ -26,6 +26,7 @@ pub mod runtime;
 pub mod scenario;
 pub mod simulation;
 pub mod strategic;
+pub mod strategic_missile;
 pub mod surrender;
 pub mod tactical;
 pub mod territory;
@@ -113,8 +114,8 @@ pub use runtime::{
     DEFAULT_RUNTIME_FRONT_STICKINESS, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
     NativeRuntimeCheckpointState, RuntimeAirCounters, RuntimeAttritionCounters,
     RuntimeCensusCounters, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeError,
-    RuntimeInfluenceCounters, RuntimeSnapshot, RuntimeState, RuntimeStepCounters,
-    RuntimeUnitPolicy, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
+    RuntimeInfluenceCounters, RuntimeMissileCounters, RuntimeSnapshot, RuntimeState,
+    RuntimeStepCounters, RuntimeUnitPolicy, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
 };
 pub use scenario::{
     DecodedScenario, GridSpec, ScenarioError, decode_mwsc, decode_mwsc_gzip, decode_mwsc_gzip_file,
@@ -132,6 +133,7 @@ pub use strategic::{
     StrategicSnapshot, SurrenderAllocationInput, SurrenderAllocationPlan, SurrenderCellTransfer,
     SurrenderCommand, SurrenderUnitPosition, plan_surrender_allocation,
 };
+pub use strategic_missile::*;
 pub use surrender::{
     CapitulationDecision, CapitulationInput, CapitulationReason, CasualtyEntry, CasualtyShare,
     ConflictResolution, ConflictResolutionKind, DEFENDED_CONTROL_PERCENT, OwnerTransfer,

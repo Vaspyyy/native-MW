@@ -28,6 +28,7 @@ use crate::{
     scenario::DecodedScenario,
     simulation::{Simulation, SimulationConfig, SimulationUnit},
     strategic::StrategicSimulation,
+    strategic_missile::StrategicMissileState,
     territory::{TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps},
     world::WorldGridView,
 };
@@ -58,10 +59,40 @@ pub enum NativeWarBootstrapError {
     Reinforcement(#[from] ReinforcementError),
     #[error("strategic: {0}")]
     Strategic(#[from] crate::strategic::StrategicError),
+    #[error("strategic missiles: {0}")]
+    StrategicMissile(#[from] crate::strategic_missile::StrategicMissileError),
     #[error("runtime: {0}")]
     Runtime(#[from] crate::runtime::RuntimeError),
     #[error("scenario battlefield metadata is invalid: {0}")]
     BattlefieldMetadata(String),
+}
+
+const PRE_MISSILE_SCENARIO_KEYWORDS: &[&str] = &[
+    "1936",
+    "1914",
+    "1804",
+    "1492",
+    "1 ad",
+    "napoleonic",
+    "ww1",
+    "great war",
+    "renaissance",
+    "classical",
+    "antique",
+];
+
+fn scenario_enables_strategic_missiles(scenario: &DecodedScenario) -> bool {
+    // Native sandbox has no campaign clock. Preserve the browser's independent name gate exactly
+    // so pre-missile scenarios still suppress silo seeding and autonomous launches.
+    let name = scenario
+        .metadata
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+    !PRE_MISSILE_SCENARIO_KEYWORDS
+        .iter()
+        .any(|keyword| name.contains(keyword))
 }
 
 fn bootstrap_air_power(
@@ -676,6 +707,28 @@ pub fn bootstrap_native_war(
             (side, reserve)
         })
         .collect();
+    // Native sandbox starts with the same row-major controlled-cell ordering as the browser.
+    // Missile base placement consumes the shared gameplay stream after all other bootstrap work.
+    let mut controlled_cells_by_side = vec![Vec::new(); n];
+    for cell in 0..cell_count {
+        if scenario.land[cell] == 0 {
+            continue;
+        }
+        if let Some(&side) = country_to_side.get(&scenario.world_control[cell]) {
+            controlled_cells_by_side[side].push(cell);
+        }
+    }
+    let mut gameplay_rng =
+        crate::gameplay_rng::GameplayRng::new(crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED);
+    let missiles_enabled = scenario_enables_strategic_missiles(scenario);
+    let strategic_missiles = StrategicMissileState::bootstrap(
+        &controlled_cells_by_side,
+        scenario.target.width,
+        scenario.target.grid_res,
+        missiles_enabled,
+        true,
+        &mut gameplay_rng,
+    )?;
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
         RuntimeCheckpoint {
@@ -698,9 +751,8 @@ pub fn bootstrap_native_war(
             last_front_refresh_tick: None,
             casualties: BTreeMap::new(),
             casualties_by_victim: BTreeMap::new(),
-            gameplay_rng: crate::gameplay_rng::GameplayRngState {
-                state: crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED,
-            },
+            gameplay_rng: gameplay_rng.state(),
+            strategic_missiles: Some(strategic_missiles),
             personnel_reserves,
             side_dynamics: Some(side_dynamics),
             operations: Some(operations),
@@ -786,6 +838,17 @@ mod tests {
         }
         let state = first.checkpoint_state().unwrap();
         assert_eq!(state.economies.len(), 3);
+        let missiles = state.strategic_missiles.as_ref().unwrap();
+        assert!(missiles.enabled && missiles.technology_allowed);
+        assert_eq!(missiles.bases.len(), 4);
+        assert_eq!(missiles.bases[0].side_index, 0);
+        assert_eq!(missiles.bases[2].side_index, 1);
+        let mut expected_rng =
+            crate::gameplay_rng::GameplayRng::new(crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED);
+        for _ in 0..4 {
+            expected_rng.next_f64();
+        }
+        assert_eq!(state.gameplay_rng, expected_rng.state());
         assert_eq!(state.naval_planning.as_ref().unwrap().side_states.len(), 2);
         assert_eq!(
             state
@@ -845,6 +908,26 @@ mod tests {
                 && unit.armor_support_last_tick.is_none()
                 && unit.last_ally_count == 1.0
         }));
+    }
+
+    #[test]
+    fn pre_missile_scenario_name_disables_launches_but_still_seeds_silos() {
+        let mut scenario = scenario();
+        scenario.metadata["name"] = json!("World war 1 (1914)");
+        let mut runtime =
+            bootstrap_native_war(&scenario, &config(vec![vec![10], vec![20]])).unwrap();
+        let state = runtime.checkpoint_state().unwrap();
+        let missiles = state.strategic_missiles.unwrap();
+
+        assert!(!missiles.enabled);
+        assert!(missiles.technology_allowed);
+        assert_eq!(missiles.bases.len(), 4);
+        let mut expected_rng =
+            crate::gameplay_rng::GameplayRng::new(crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED);
+        for _ in 0..4 {
+            expected_rng.next_f64();
+        }
+        assert_eq!(state.gameplay_rng, expected_rng.state());
     }
 
     #[test]

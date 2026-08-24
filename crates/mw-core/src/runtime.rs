@@ -77,6 +77,9 @@ use crate::{
         StrategicError, StrategicSimulation, StrategicSnapshot, SurrenderAllocationInput,
         SurrenderUnitPosition, plan_surrender_allocation,
     },
+    strategic_missile::{
+        StrategicMissileAdvanceOutcome, StrategicMissileError, StrategicMissileState,
+    },
     surrender::evaluate_global_conflict,
     tactical::SideKey,
     territory::{
@@ -87,7 +90,7 @@ use crate::{
     world::WorldGridView,
 };
 
-pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v3";
+pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v4";
 pub const DEFAULT_FRONT_REFRESH_TICKS: u64 = 30;
 pub const DEFAULT_CENSUS_BUDGET: usize = 16_384;
 pub const DEFAULT_CENSUS_FLUSH_CHUNK: usize = 65_536;
@@ -314,6 +317,16 @@ pub struct RuntimeReinforcementCounters {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeMissileCounters {
+    pub launches: usize,
+    pub impacts: usize,
+    pub damaged_units: usize,
+    pub removed_units: usize,
+    pub personnel_loss: u64,
+    pub equipment_loss: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeStepCounters {
     pub front_refreshed: bool,
     pub front_segments: usize,
@@ -321,6 +334,7 @@ pub struct RuntimeStepCounters {
     pub ai: AiPlanningCounters,
     pub simulation: TickCounters,
     pub air: RuntimeAirCounters,
+    pub missiles: RuntimeMissileCounters,
     pub reinforcement: RuntimeReinforcementCounters,
     pub naval_planning: NavalPlanningCounters,
     pub operational_execution: OperationalExecutionCounters,
@@ -371,6 +385,8 @@ pub struct RuntimeSnapshot {
     pub operational_execution_snapshot: Option<Arc<OperationalExecutionState>>,
     /// Immutable airfields and live wing mission state for renderers.
     pub air_power_snapshot: Option<Arc<AirPowerState>>,
+    /// Immutable silos, in-flight missiles, trails, and impact explosions for observers.
+    pub strategic_missile_snapshot: Option<Arc<StrategicMissileState>>,
     pub counters: RuntimeStepCounters,
     pub pending_render_updates: usize,
     pub casualty_totals: Arc<BTreeMap<u16, f64>>,
@@ -430,6 +446,8 @@ pub enum RuntimeError {
     OperationalExecution(#[from] OperationalExecutionError),
     #[error("naval planning: {0}")]
     NavalPlanning(#[from] NavalPlanningError),
+    #[error("strategic missiles: {0}")]
+    StrategicMissile(#[from] StrategicMissileError),
 }
 
 fn influence_counters(sources: usize, result: &InfluenceApplyResult) -> RuntimeInfluenceCounters {
@@ -762,6 +780,30 @@ fn air_counters(
     }
     if let Some(damage) = damage {
         counters.damaged_land_units = damage.results.len();
+        for result in damage.results.iter() {
+            counters.personnel_loss = counters
+                .personnel_loss
+                .saturating_add(result.personnel_loss);
+            counters.equipment_loss = counters
+                .equipment_loss
+                .saturating_add(result.equipment_loss);
+        }
+    }
+    counters
+}
+
+fn missile_counters(
+    outcome: Option<&StrategicMissileAdvanceOutcome>,
+    damages: &[DamageOutcome],
+) -> RuntimeMissileCounters {
+    let mut counters = RuntimeMissileCounters::default();
+    if let Some(outcome) = outcome {
+        counters.launches = outcome.launches;
+        counters.impacts = outcome.impacts.len();
+    }
+    for damage in damages {
+        counters.damaged_units += damage.results.len();
+        counters.removed_units += damage.removed_ids.len();
         for result in damage.results.iter() {
             counters.personnel_loss = counters
                 .personnel_loss
@@ -1528,6 +1570,8 @@ pub struct RuntimeCheckpoint {
     pub reinforcement: Option<ReinforcementState>,
     /// Checkpoint v11 armor reserves and material-maintenance state.
     pub material_logistics: Option<MaterialLogisticsState>,
+    /// Checkpoint v12 autonomous strategic missile continuation state.
+    pub strategic_missiles: Option<StrategicMissileState>,
 }
 
 /// Owned state captured at a committed, serialization-ready runtime boundary.
@@ -1567,6 +1611,7 @@ pub struct NativeRuntimeCheckpointState {
     pub air_power: Option<AirPowerState>,
     pub reinforcement: Option<ReinforcementState>,
     pub material_logistics: Option<MaterialLogisticsState>,
+    pub strategic_missiles: Option<StrategicMissileState>,
 }
 
 /// Shared native simulation owner. No mutable kernel state is exposed to renderers.
@@ -1601,6 +1646,7 @@ pub struct NativeRuntime {
     air_power: Option<AirPowerState>,
     reinforcement: Option<ReinforcementState>,
     material_logistics: Option<MaterialLogisticsState>,
+    strategic_missiles: Option<StrategicMissileState>,
     state: RuntimeState,
     latest: Arc<RuntimeSnapshot>,
     render_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
@@ -2782,6 +2828,9 @@ impl NativeRuntime {
         validate_runtime_config(config)?;
         validate_diplomacy(&checkpoint.diplomacy, &checkpoint.territory)?;
         validate_scenario_grid(&checkpoint.scenario, &checkpoint.territory)?;
+        if let Some(missiles) = &checkpoint.strategic_missiles {
+            missiles.validate(checkpoint.territory.max_sides())?;
+        }
 
         let mut unit_policies = collect_unit_policies(
             &checkpoint.simulation,
@@ -3215,6 +3264,10 @@ impl NativeRuntime {
                 .air_power
                 .as_ref()
                 .map(|air_power| Arc::new(air_power.clone())),
+            strategic_missile_snapshot: checkpoint
+                .strategic_missiles
+                .as_ref()
+                .map(|missiles| Arc::new(missiles.clone())),
             counters: RuntimeStepCounters::default(),
             pending_render_updates: render_updates.len(),
             casualty_totals: Arc::new(checkpoint.casualties.clone()),
@@ -3262,6 +3315,7 @@ impl NativeRuntime {
             air_power: checkpoint.air_power,
             reinforcement: checkpoint.reinforcement,
             material_logistics: checkpoint.material_logistics,
+            strategic_missiles: checkpoint.strategic_missiles,
             state: initial_state,
             latest,
             render_updates,
@@ -3364,6 +3418,7 @@ impl NativeRuntime {
             air_power: self.air_power.clone(),
             reinforcement: self.reinforcement.clone(),
             material_logistics: self.material_logistics.clone(),
+            strategic_missiles: self.strategic_missiles.clone(),
         })
     }
 
@@ -3934,6 +3989,7 @@ impl NativeRuntime {
         let mut staged_air_power = self.air_power.clone();
         let mut staged_reinforcement = self.reinforcement.clone();
         let mut staged_material_logistics = self.material_logistics.clone();
+        let mut staged_strategic_missiles = self.strategic_missiles.clone();
         let mut staged_strategic = self.strategic.clone();
         let mut staged_gameplay_rng = self.gameplay_rng;
         let mut staged_personnel_reserves = self.personnel_reserves.clone();
@@ -4733,7 +4789,52 @@ impl NativeRuntime {
                 return Err(RuntimeError::Simulation(error));
             }
         };
-        if air_damage_outcome.is_some() || exile_outcome.is_some() || attrition_outcome.is_some() {
+        // Browser missiles advance after land movement/combat. Stage their transient state and
+        // shared-RNG draws, then apply each impact in reverse missile-array order. Rebuilding only
+        // the unit slice keeps the land combat event publication while reflecting impact damage.
+        let (missile_outcome, missile_damage_outcomes) =
+            if let Some(missiles) = &mut staged_strategic_missiles {
+                let outcome = rollback_try!(missiles.advance(
+                    &self.diplomacy.active_sides,
+                    &self.diplomacy.hostility,
+                    self.territory.max_sides(),
+                    &self.simulation.units,
+                    simulation_config.combat.combat_damage,
+                    &mut staged_gameplay_rng,
+                ));
+                let mut damages = Vec::new();
+                for impact in &outcome.impacts {
+                    let live_ids = self
+                        .simulation
+                        .units
+                        .iter()
+                        .map(|unit| unit.combat.id)
+                        .collect::<BTreeSet<_>>();
+                    let commands = impact
+                        .damage_commands
+                        .iter()
+                        .copied()
+                        .filter(|command| live_ids.contains(&command.unit_id))
+                        .collect::<Vec<_>>();
+                    if !commands.is_empty() {
+                        damages.push(rollback_try!(self.simulation.apply_batch_damage(&commands)));
+                    }
+                }
+                if !damages.is_empty() {
+                    frame_snapshot.units = self
+                        .simulation
+                        .initial_snapshot(next_tick, next_frame)
+                        .units;
+                }
+                (Some(outcome), damages)
+            } else {
+                (None, Vec::new())
+            };
+        if air_damage_outcome.is_some()
+            || exile_outcome.is_some()
+            || attrition_outcome.is_some()
+            || !missile_damage_outcomes.is_empty()
+        {
             let mut removed_ids = frame_snapshot.removed_ids.to_vec();
             if let Some(outcome) = &air_damage_outcome {
                 removed_ids.extend(outcome.removed_ids.iter().copied());
@@ -4742,6 +4843,9 @@ impl NativeRuntime {
                 removed_ids.extend(outcome.removed_ids.iter().copied());
             }
             if let Some(outcome) = &attrition_outcome {
+                removed_ids.extend(outcome.removed_ids.iter().copied());
+            }
+            for outcome in &missile_damage_outcomes {
                 removed_ids.extend(outcome.removed_ids.iter().copied());
             }
             removed_ids.sort_unstable();
@@ -4770,6 +4874,15 @@ impl NativeRuntime {
             &self.unit_sovereign_by_id,
             attrition_outcome.as_ref(),
         );
+        for outcome in &missile_damage_outcomes {
+            // Browser missile damage has no attacker argument: it increments victim country/side
+            // totals but deliberately creates no attacker-attribution entry.
+            add_attrition_casualties(
+                &mut next_casualties,
+                &self.unit_sovereign_by_id,
+                Some(outcome),
+            );
+        }
         apply_runtime_casualties_to_side_dynamics(
             &mut staged_side_dynamics,
             &self.casualties,
@@ -5299,6 +5412,7 @@ impl NativeRuntime {
         self.air_power = staged_air_power;
         self.reinforcement = staged_reinforcement;
         self.material_logistics = staged_material_logistics;
+        self.strategic_missiles = staged_strategic_missiles;
         self.strategic = staged_strategic;
         self.gameplay_rng = staged_gameplay_rng;
         self.personnel_reserves = staged_personnel_reserves;
@@ -5339,6 +5453,7 @@ impl NativeRuntime {
             ai: planning.counters,
             simulation: simulation_counters,
             air: air_counters(air_outcome.as_ref(), air_damage_outcome.as_ref()),
+            missiles: missile_counters(missile_outcome.as_ref(), &missile_damage_outcomes),
             reinforcement: reinforcement_counters,
             naval_planning: naval_planning_counters,
             operational_execution: execution_outcome
@@ -5380,6 +5495,10 @@ impl NativeRuntime {
                 .air_power
                 .as_ref()
                 .map(|air_power| Arc::new(air_power.clone())),
+            strategic_missile_snapshot: self
+                .strategic_missiles
+                .as_ref()
+                .map(|missiles| Arc::new(missiles.clone())),
             counters,
             pending_render_updates: self.render_updates.len(),
             casualty_totals: Arc::new(self.casualties.clone()),
@@ -6409,6 +6528,7 @@ mod tests {
                 air_power: None,
                 reinforcement: None,
                 material_logistics: None,
+                strategic_missiles: None,
             },
         )
         .unwrap()
@@ -6450,7 +6570,208 @@ mod tests {
             air_power: state.air_power,
             reinforcement: state.reinforcement,
             material_logistics: state.material_logistics,
+            strategic_missiles: state.strategic_missiles,
         }
+    }
+
+    fn with_test_missile(mut runtime: NativeRuntime, progress: f64) -> NativeRuntime {
+        let config = runtime.config;
+        let mut captured = runtime.checkpoint_state().unwrap();
+        captured.simulation_config.combat.combat_damage = 0.7;
+        let target = captured
+            .units
+            .iter()
+            .find(|unit| unit.combat.side == 1)
+            .unwrap();
+        captured.strategic_missiles = Some(StrategicMissileState {
+            schema: crate::strategic_missile::STRATEGIC_MISSILE_SCHEMA_VERSION.to_owned(),
+            enabled: true,
+            technology_allowed: true,
+            bases: Vec::new(),
+            missiles: vec![crate::strategic_missile::StrategicMissile {
+                id: 0.25,
+                start_lat: 0.0,
+                start_lng: 0.0,
+                target_lat: target.combat.lat,
+                target_lng: target.combat.lng,
+                current_lat: 0.0,
+                current_lng: 0.0,
+                next_lat: 0.0,
+                next_lng: 0.0,
+                progress,
+                side_index: 0,
+                phase: crate::strategic_missile::MissilePhase::Falling,
+                trail: Vec::new(),
+                peak_alt: 2.0,
+            }],
+            explosions: Vec::new(),
+        });
+        NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap()
+    }
+
+    #[test]
+    fn missile_impact_publishes_damage_and_effects_without_mutating_old_snapshot() {
+        let mut runtime = with_test_missile(fixture(0, false), 0.999);
+        let old = runtime.latest_snapshot();
+        let target_before = old
+            .frame_snapshot
+            .units
+            .iter()
+            .find(|unit| unit.side == 1)
+            .unwrap()
+            .health;
+
+        let next = runtime.step().unwrap();
+        let missiles = next.strategic_missile_snapshot.as_ref().unwrap();
+        assert!(missiles.missiles.is_empty());
+        assert_eq!(missiles.explosions.len(), 1);
+        assert_eq!(missiles.explosions[0].life, 29);
+        let target_after = next
+            .frame_snapshot
+            .units
+            .iter()
+            .find(|unit| unit.side == 1)
+            .unwrap()
+            .health;
+        assert!(target_after < target_before);
+        assert_eq!(next.counters.missiles.impacts, 1);
+        assert_eq!(next.counters.missiles.damaged_units, 1);
+        assert!(next.counters.missiles.personnel_loss > 0);
+        assert!(next.casualty_totals.values().sum::<f64>() > 0.0);
+        assert_eq!(next.strategic_snapshot, old.strategic_snapshot);
+
+        let old_missiles = old.strategic_missile_snapshot.as_ref().unwrap();
+        assert_eq!(old_missiles.missiles.len(), 1);
+        assert!(old_missiles.explosions.is_empty());
+        assert_eq!(
+            old.frame_snapshot
+                .units
+                .iter()
+                .find(|unit| unit.side == 1)
+                .unwrap()
+                .health,
+            target_before
+        );
+    }
+
+    #[test]
+    fn same_tick_land_combat_events_survive_missile_snapshot_refresh() {
+        let mut base = fixture(0, false);
+        base.war_grace_end = 0;
+        base.simulation.units[0].combat.lng = 0.0;
+        base.simulation.units[1].combat.lng = 0.1;
+        let base = with_live_battlefield(base, vec![0.0; 8]);
+        let mut runtime = with_test_missile(base, 0.999);
+
+        let next = runtime.step().unwrap();
+
+        assert!(next.counters.simulation.accepted_contacts > 0);
+        assert!(!next.frame_snapshot.events.is_empty());
+        assert_eq!(next.counters.missiles.impacts, 1);
+        assert_eq!(next.counters.missiles.damaged_units, 1);
+    }
+
+    #[test]
+    fn missile_flight_and_impact_continue_exactly_across_checkpoint_split() {
+        let mut uninterrupted = with_test_missile(fixture(0, false), 0.98);
+        uninterrupted.step().unwrap();
+        assert_eq!(
+            uninterrupted
+                .latest_snapshot()
+                .strategic_missile_snapshot
+                .as_ref()
+                .unwrap()
+                .missiles
+                .len(),
+            1
+        );
+        let config = uninterrupted.config;
+        let split = uninterrupted.checkpoint_state().unwrap();
+        let mut resumed = NativeRuntime::new(config, runtime_checkpoint(split)).unwrap();
+
+        let expected = uninterrupted.step().unwrap();
+        let actual = resumed.step().unwrap();
+        assert_eq!(actual.frame_snapshot, expected.frame_snapshot);
+        assert_eq!(
+            actual.strategic_missile_snapshot,
+            expected.strategic_missile_snapshot
+        );
+        assert_eq!(actual.counters.missiles, expected.counters.missiles);
+        assert_eq!(actual.casualty_totals, expected.casualty_totals);
+        assert_eq!(actual.gameplay_rng_state, expected.gameplay_rng_state);
+    }
+
+    #[test]
+    fn runtime_launch_consumes_browser_rng_sequence_and_resumes_in_flight() {
+        let mut base = fixture(0, false);
+        let config = base.config;
+        let mut captured = base.checkpoint_state().unwrap();
+        captured.simulation_config.combat.combat_damage = 0.7;
+        captured.gameplay_rng = GameplayRngState { state: 35 };
+        captured.strategic_missiles = Some(StrategicMissileState {
+            schema: crate::strategic_missile::STRATEGIC_MISSILE_SCHEMA_VERSION.to_owned(),
+            enabled: true,
+            technology_allowed: true,
+            bases: vec![
+                crate::strategic_missile::MissileBase {
+                    lat: -45.0,
+                    lng: -135.0,
+                    side_index: 0,
+                },
+                crate::strategic_missile::MissileBase {
+                    lat: 45.0,
+                    lng: 45.0,
+                    side_index: 1,
+                },
+            ],
+            missiles: Vec::new(),
+            explosions: Vec::new(),
+        });
+        let mut uninterrupted = NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap();
+
+        let launch = uninterrupted.step().unwrap();
+        assert_eq!(launch.counters.missiles.launches, 1);
+        assert_eq!(launch.gameplay_rng_state.state, 4_231_026_134);
+        let flight = launch.strategic_missile_snapshot.as_ref().unwrap();
+        assert_eq!(flight.missiles.len(), 1);
+        assert_eq!(flight.missiles[0].side_index, 1);
+        assert_eq!(flight.missiles[0].progress, 0.0);
+        assert!(flight.missiles[0].trail.is_empty());
+
+        let split = uninterrupted.checkpoint_state().unwrap();
+        let mut resumed = NativeRuntime::new(config, runtime_checkpoint(split)).unwrap();
+        let expected = uninterrupted.step().unwrap();
+        let actual = resumed.step().unwrap();
+        assert_eq!(
+            actual.strategic_missile_snapshot,
+            expected.strategic_missile_snapshot
+        );
+        assert_eq!(actual.gameplay_rng_state, expected.gameplay_rng_state);
+        assert_eq!(actual.frame_snapshot, expected.frame_snapshot);
+    }
+
+    #[test]
+    fn invalid_staged_missile_tick_rolls_back_simulation_rng_and_publication() {
+        let mut runtime = with_test_missile(fixture(0, false), 0.25);
+        runtime.strategic_missiles.as_mut().unwrap().missiles[0].progress = f64::NAN;
+        let units_before = runtime.simulation.units.clone();
+        let rng_before = runtime.gameplay_rng.state();
+        let publication_before = runtime.latest_snapshot();
+
+        assert!(matches!(
+            runtime.step(),
+            Err(RuntimeError::StrategicMissile(
+                StrategicMissileError::InvalidState("missile")
+            ))
+        ));
+        assert_eq!(runtime.simulation.units, units_before);
+        assert_eq!(runtime.gameplay_rng.state(), rng_before);
+        assert!(Arc::ptr_eq(&runtime.latest_snapshot(), &publication_before));
+        assert!(
+            runtime.strategic_missiles.as_ref().unwrap().missiles[0]
+                .progress
+                .is_nan()
+        );
     }
 
     fn with_live_battlefield(

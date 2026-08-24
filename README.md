@@ -44,7 +44,7 @@ reference while systems move into the renderer-independent `mw-core` crate.
   immutable territory and unit publications
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
-- versioned browser-to-native checkpoints: loadable v1-v11 state with strict
+- versioned browser-to-native checkpoints: loadable v1-v12 state with strict
   native continuation of influence work, side dynamics,
   observer-scoped operational AI, naval planning/execution, air missions, and
   per-unit operational-feedback history, replay-safe gameplay RNG, and
@@ -93,7 +93,7 @@ cargo run --release -p mw-tools -- native-runtime-fixture ../modern-wars/assets/
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
-`native-runtime-fixture` accepts eleven versioned checkpoint
+`native-runtime-fixture` accepts twelve versioned checkpoint
 boundaries. Checkpoint v1 retains `postStartWar`, which is
 production-resumable only at tick, frame, and strategic cycle zero, and the
 synthetic non-resumable `baselineReplay` fixture/benchmark boundary.
@@ -137,6 +137,13 @@ repair, armor/fighter/strike purchases, existing armor/wing reinforcement, and
 bounded creation of one armor formation and one wing per role. Crew and treasury
 bounds are transactional. Capitulation clears reserves and resolves aircraft
 evacuation/loss; v10 remains loadable. This does not claim full UI parity.
+Checkpoint v12 retains v11 and adds strategic missiles: default modern native
+sandbox startup seeds browser-style silos; autonomous launches consume the
+exact shared RNG; trails rise and fall through 40 points; hostile impacts apply
+radial damage within 0.5 degrees; explosions last 30 frames; and missile state
+is published immutably to observers. V12 continuation is exact. Older v1-v11
+checkpoints remain loadable without missile state; this does not claim broader
+full parity.
 
 The browser exports v1 by default for compatibility. After a war has advanced,
 request the current v6 handoff explicitly from its console:
@@ -189,7 +196,7 @@ cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" "$scenari
 cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
 ```
 
-Both production paths accept exact-state v1 `postStartWar` and v2-v11 `midWar`
+Both production paths accept exact-state v1 `postStartWar` and v2-v12 `midWar`
 checkpoints. V1/v2 remain loadable under their legacy influence behavior; v3
 restores the strict `influenceRuntime` state, v4 enables live side dynamics, v5
 restores operational AI, v6 enables naval/defender/air execution, and native v7
@@ -236,7 +243,7 @@ Native-only startup accepts repeated `--side` selectors (country ID or unique
 case-insensitive name) and uses deterministic all-Army bootstrap forces. Use
 `--save-checkpoint PATH` for exact-step headless saves; windowed mode also
 supports `S` and save-on-exit when a path is configured. New native-war saves
-use v11; legacy runtimes select the newest schema supported by their owned state.
+use v12; legacy runtimes select the newest schema supported by their owned state.
 All retain frontline objectives, assignment priors, and the refresh phase; v3+
 retain frontier queues, v4+ retain momentum/phase/posture/personnel, v5 adds
 operational AI, v6 adds naval/defender/air execution, v7 adds native naval
@@ -246,14 +253,14 @@ adds live aircraft logistics plus formation allocators. Stock MWSC bootstrap
 uses the explicit flat-terrain fallback described above. This path does not yet cover every
 browser AI/combat resolver or non-land force system.
 
-Checkpoints v2-v11 are resumable-running-state formats. If a requested headless
+Checkpoints v2-v12 are resumable-running-state formats. If a requested headless
 or windowed save reaches `ConflictResolved`, the runtime finishes cleanly and
 reports that the save was skipped instead of writing a terminal file that the
 loader could not resume.
 
 ```bash
-cargo run --release -p mw-native -- --side Germany --side Czechia --headless --ticks 2 --save-checkpoint /tmp/mw-v11.json "$scenario"
-cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v11.json --headless --ticks 3 --save-checkpoint /tmp/mw-v11-resumed.json "$scenario"
+cargo run --release -p mw-native -- --side Germany --side Czechia --headless --ticks 2 --save-checkpoint /tmp/mw-v12.json "$scenario"
+cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v12.json --headless --ticks 3 --save-checkpoint /tmp/mw-v12-resumed.json "$scenario"
 ```
 
 `mw-native --demo-units`, production checkpoint viewing, native headless
@@ -349,7 +356,7 @@ map. Conflict resolution publishes a final immutable result and enters a clean
 terminal state instead of requiring an external acknowledge-and-continue
 step.
 
-This remains a bounded simulation port. Mid-war v2-v11 do not serialize a
+This remains a bounded simulation port. Mid-war v2-v12 do not serialize a
 partial census or render queues; v3+ preserve pending influence frontier work,
 and v4+ preserve side dynamics. The surrender path does not yet include
 the browser's
