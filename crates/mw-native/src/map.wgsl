@@ -5,12 +5,19 @@ struct View {
     palette_len: u32,
     grid_size: vec2<u32>,
     frontlines_active: u32,
+    output_is_srgb: u32,
 };
 
 @group(0) @binding(0) var ownership: texture_2d<u32>;
 @group(0) @binding(1) var<uniform> view: View;
 @group(0) @binding(2) var<storage, read> palette: array<vec4<f32>>;
 @group(0) @binding(3) var dominant_sides: texture_2d<i32>;
+@group(0) @binding(4) var sovereign_ownership: texture_2d<u32>;
+@group(0) @binding(5) var geographic_land: texture_2d<u32>;
+@group(0) @binding(6) var biome: texture_2d<u32>;
+@group(0) @binding(7) var<storage, read> sovereign_sides: array<i32>;
+@group(0) @binding(8) var<storage, read> country_y_bounds: array<vec2<u32>>;
+@group(0) @binding(9) var<storage, read> occupation_palette: array<vec4<f32>>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -36,6 +43,102 @@ fn owner_at(cell: vec2<i32>) -> u32 {
 fn side_at(cell: vec2<i32>) -> i32 {
     let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
     return textureLoad(dominant_sides, clamp(cell, vec2<i32>(0), maximum), 0).r;
+}
+
+fn sovereign_at(cell: vec2<i32>) -> u32 {
+    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
+    return textureLoad(sovereign_ownership, clamp(cell, vec2<i32>(0), maximum), 0).r;
+}
+
+fn land_at(cell: vec2<i32>) -> u32 {
+    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
+    return textureLoad(geographic_land, clamp(cell, vec2<i32>(0), maximum), 0).r;
+}
+
+fn biome_at(cell: vec2<i32>) -> u32 {
+    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
+    return textureLoad(biome, clamp(cell, vec2<i32>(0), maximum), 0).r;
+}
+
+fn country_side_at(country_id: u32) -> i32 {
+    if (country_id >= view.palette_len) {
+        return -1;
+    }
+    return sovereign_sides[country_id];
+}
+
+fn political_id(cell: vec2<i32>) -> i32 {
+    if (land_at(cell) == 0u) {
+        return -1;
+    }
+    return i32(sovereign_at(cell));
+}
+
+fn desert_transform(color: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        min(1.0, color.r * 1.1 + 30.0 / 255.0),
+        min(1.0, color.g * 1.1 + 10.0 / 255.0),
+        max(0.0, color.b * 0.85),
+    );
+}
+
+fn country_gradient(color: vec3<f32>, country_id: u32, grid_y: f32) -> vec3<f32> {
+    if (country_id == 0u || country_id >= view.palette_len) {
+        return color;
+    }
+    let bounds = country_y_bounds[country_id];
+    let span = max(f32(bounds.y - bounds.x), 1.0);
+    let t = clamp((grid_y - f32(bounds.x)) / span, 0.0, 1.0);
+    let bright = min(color + vec3<f32>(25.0 / 255.0), vec3<f32>(1.0));
+    if (t < 0.3) {
+        return mix(bright, color, t / 0.3);
+    }
+    return mix(color, floor(color * 0.65 * 255.0) / 255.0, (t - 0.3) / 0.7);
+}
+
+fn ocean_color(screen_y: f32) -> vec3<f32> {
+    // Browser WarGames paints a 12-stop viewport gradient. Preserve its
+    // viewport-relative latitude sample and stop-index/center-longitude noise.
+    let pct = clamp(screen_y / max(view.viewport.y, 1.0), 0.0, 1.0);
+    let scaled = pct * 12.0;
+    let lower = u32(floor(scaled));
+    let upper = min(lower + 1u, 12u);
+    let center_lng = view.center.x * 180.0 - 180.0;
+    let lower_y = view.viewport.y * f32(lower) / 12.0;
+    let upper_y = view.viewport.y * f32(upper) / 12.0;
+    let lower_world_y = view.center.y + (lower_y - view.viewport.y * 0.5) / view.pixels_per_world;
+    let upper_world_y = view.center.y + (upper_y - view.viewport.y * 0.5) / view.pixels_per_world;
+    let lower_lat = 90.0 - lower_world_y * 180.0;
+    let upper_lat = 90.0 - upper_world_y * 180.0;
+    let lower_noise = sin(f32(lower) * 0.7 + center_lng * 0.04) * 3.5;
+    let upper_noise = sin(f32(upper) * 0.7 + center_lng * 0.04) * 3.5;
+    let lower_t = clamp((abs(lower_lat) + lower_noise) / 90.0, 0.0, 1.0);
+    let upper_t = clamp((abs(upper_lat) + upper_noise) / 90.0, 0.0, 1.0);
+    let lower_rgb = floor(mix(vec3<f32>(5.0, 52.0, 72.0), vec3<f32>(2.0, 18.0, 34.0), lower_t) + 0.5) / 255.0;
+    let upper_rgb = floor(mix(vec3<f32>(5.0, 52.0, 72.0), vec3<f32>(2.0, 18.0, 34.0), upper_t) + 0.5) / 255.0;
+    return mix(lower_rgb, upper_rgb, fract(scaled));
+}
+
+fn srgb_channel_to_linear(value: f32) -> f32 {
+    if (value <= 0.04045) {
+        return value / 12.92;
+    }
+    return pow((value + 0.055) / 1.055, 2.4);
+}
+
+fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(
+        srgb_channel_to_linear(color.r),
+        srgb_channel_to_linear(color.g),
+        srgb_channel_to_linear(color.b),
+    );
+}
+
+fn output_color(color: vec3<f32>) -> vec3<f32> {
+    if (view.output_is_srgb != 0u) {
+        return srgb_to_linear(color);
+    }
+    return color;
 }
 
 fn hostile_side_edge(side: i32, other: i32) -> bool {
@@ -91,8 +194,9 @@ fn frontline_distance(grid_position: vec2<f32>, cell: vec2<i32>) -> f32 {
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let world = view.center + (position.xy - view.viewport * 0.5) / view.pixels_per_world;
+    let ocean = ocean_color(position.y);
     if (world.x < 0.0 || world.x >= 2.0 || world.y < 0.0 || world.y >= 1.0) {
-        return vec4<f32>(0.006, 0.009, 0.016, 1.0);
+        return vec4<f32>(output_color(ocean), 1.0);
     }
 
     // Scenario rows run south-to-north, while framebuffer Y runs top-to-bottom.
@@ -101,8 +205,42 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let grid_position = grid_uv * vec2<f32>(view.grid_size);
     let cell = min(vec2<i32>(grid_position), vec2<i32>(view.grid_size) - vec2<i32>(1));
     let local = fract(grid_position);
-    let owner = owner_at(cell);
-    var color = palette[min(owner, view.palette_len - 1u)];
+    let sovereign = sovereign_at(cell);
+    let effective_owner = owner_at(cell);
+    let land = land_at(cell);
+    if (land == 0u) {
+        return vec4<f32>(output_color(ocean), 1.0);
+    }
+    let dominant_side = side_at(cell);
+    let sovereign_side = country_side_at(sovereign);
+    let war_material_active = view.frontlines_active != 0u;
+    let occupied = war_material_active && dominant_side >= 0 && dominant_side != sovereign_side;
+    let friendly_war_land = war_material_active && dominant_side >= 0 && dominant_side == sovereign_side;
+    var display_owner = sovereign;
+    var color = vec3<f32>(20.0 / 255.0, 38.0 / 255.0, 20.0 / 255.0);
+    var alpha = 1.0;
+    if (sovereign != 0u) {
+        if (occupied && effective_owner != 0u) {
+            display_owner = effective_owner;
+            color = occupation_palette[min(effective_owner, view.palette_len - 1u)].rgb;
+            color = mix(color, vec3<f32>(1.0), 0.3);
+            alpha = 0.85;
+        } else {
+            color = palette[min(sovereign, view.palette_len - 1u)].rgb;
+            if (friendly_war_land) {
+                alpha = 0.70;
+            }
+        }
+    } else if (biome_at(cell) == 1u) {
+        color = vec3<f32>(140.0 / 255.0, 120.0 / 255.0, 70.0 / 255.0);
+    }
+    if (biome_at(cell) == 1u) {
+        color = desert_transform(color);
+    }
+    color = country_gradient(color, display_owner, grid_position.y);
+    // The swapchain is opaque. Match browser alpha fills by compositing them
+    // against the simplified ocean rather than dropping alpha at the output.
+    var map_color = mix(ocean, color, alpha);
 
     let cell_pixels = max(
         min(
@@ -125,18 +263,21 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
     // Browser pass 2 draws the black controller frontline before its thin
     // political-border pass.
-    color = vec4<f32>(mix(color.rgb, vec3<f32>(0.0), frontline_alpha), 1.0);
+    map_color = mix(map_color, vec3<f32>(0.0), frontline_alpha);
 
-    if (owner != 0u) {
+    let political = political_id(cell);
+    if (political >= 0) {
         let border_half = clamp(0.5 / cell_pixels, 0.0, 0.5);
         let border =
-            (local.x < border_half && owner_at(cell + vec2<i32>(-1, 0)) != owner) ||
-            (1.0 - local.x < border_half && owner_at(cell + vec2<i32>(1, 0)) != owner) ||
-            (local.y < border_half && owner_at(cell + vec2<i32>(0, -1)) != owner) ||
-            (1.0 - local.y < border_half && owner_at(cell + vec2<i32>(0, 1)) != owner);
+            (local.x < border_half && political_id(cell + vec2<i32>(-1, 0)) != political) ||
+            (1.0 - local.x < border_half && political_id(cell + vec2<i32>(1, 0)) != political) ||
+            (local.y < border_half && political_id(cell + vec2<i32>(0, -1)) != political) ||
+            (1.0 - local.y < border_half && political_id(cell + vec2<i32>(0, 1)) != political);
         if (border) {
-            color = vec4<f32>(mix(color.rgb, vec3<f32>(0.0), 0.3), 1.0);
+            map_color = mix(map_color, vec3<f32>(0.0), 0.3);
         }
     }
-    return vec4<f32>(color.rgb, 1.0);
+    // The preferred swapchain format is sRGB. All browser material math above
+    // operates in Canvas/CSS sRGB space, so linearize only at the final write.
+    return vec4<f32>(output_color(map_color), 1.0);
 }

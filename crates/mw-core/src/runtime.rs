@@ -3405,6 +3405,11 @@ impl NativeRuntime {
         &self.scenario
     }
 
+    /// Authoritative immutable sovereign-to-side topology for renderer setup.
+    pub fn country_to_side(&self) -> &BTreeMap<u16, usize> {
+        self.territory.country_to_side()
+    }
+
     pub const fn state(&self) -> RuntimeState {
         self.state
     }

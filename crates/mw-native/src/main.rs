@@ -35,6 +35,7 @@ use winit::{
 
 mod headless;
 mod map_label;
+mod map_material;
 mod observer;
 mod observer_hud;
 mod options;
@@ -43,6 +44,7 @@ mod unit_renderer;
 mod world_overlay;
 
 use map_label::{MapLabelRenderer, MapLabelView};
+use map_material::MapMaterial;
 use observer::ObserverHudModel;
 use observer_hud::{
     HudHit, ObserverHudRenderer, ObserverHudUpload, PlaybackAction, PlaybackPresentation,
@@ -67,7 +69,8 @@ struct ViewUniform {
     palette_len: u32,
     grid_size: [u32; 2],
     frontlines_active: u32,
-    _padding: [u32; 3],
+    output_is_srgb: u32,
+    _padding: [u32; 2],
 }
 
 struct GpuState {
@@ -84,6 +87,35 @@ struct GpuState {
     world_overlay: WorldOverlayRenderer,
     map_labels: MapLabelRenderer,
     observer_hud: ObserverHudRenderer,
+}
+
+fn texture_binding(
+    binding: u32,
+    sample_type: wgpu::TextureSampleType,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn storage_binding(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,7 +143,9 @@ struct App {
     dominant_sides: Vec<i16>,
     dominant_city_controlled: Vec<u8>,
     land: Vec<u8>,
+    map_material: Option<MapMaterial>,
     palette: Vec<[f32; 4]>,
+    occupation_palette: Vec<[f32; 4]>,
     metadata: Value,
     map_cities: Arc<[ProductionCity]>,
     country_names: HashMap<u16, String>,
@@ -168,7 +202,9 @@ impl App {
             dominant_sides: Vec::new(),
             dominant_city_controlled: Vec::new(),
             land: Vec::new(),
+            map_material: None,
             palette: Vec::new(),
+            occupation_palette: Vec::new(),
             metadata: Value::Null,
             map_cities: Arc::from([]),
             country_names: HashMap::new(),
@@ -212,90 +248,100 @@ impl App {
     fn initialize(&mut self, window: Arc<Window>) -> Result<()> {
         let load_started = Instant::now();
         let checkpoint_path = self.runtime_checkpoint_path.clone();
-        let (decoded, mut pending_runtime, demo_border, runtime_label, checkpoint_baseline) =
-            if let Some(checkpoint_path) = checkpoint_path.as_ref() {
-                let loaded = load_runtime_checkpoint(&self.scenario_path, checkpoint_path)
-                    .with_context(|| {
-                        format!(
-                            "failed to load native runtime checkpoint {}",
-                            checkpoint_path.display()
-                        )
-                    })?;
-                validate_production_checkpoint(
-                    loaded.checkpoint_boundary,
-                    loaded.resumable,
-                    loaded.exact_geography_supplied,
-                )?;
-                let label = format!(
-                    "checkpoint {} ({} units)",
-                    checkpoint_path.display(),
-                    loaded.unit_count
-                );
-                let baseline = self
-                    .save_checkpoint_path
-                    .is_some()
-                    .then_some(loaded.baseline);
+        let (
+            decoded,
+            mut pending_runtime,
+            demo_border,
+            runtime_label,
+            checkpoint_baseline,
+            mut map_material,
+        ) = if let Some(checkpoint_path) = checkpoint_path.as_ref() {
+            let loaded = load_runtime_checkpoint(&self.scenario_path, checkpoint_path)
+                .with_context(|| {
+                    format!(
+                        "failed to load native runtime checkpoint {}",
+                        checkpoint_path.display()
+                    )
+                })?;
+            validate_production_checkpoint(
+                loaded.checkpoint_boundary,
+                loaded.resumable,
+                loaded.exact_geography_supplied,
+            )?;
+            let label = format!(
+                "checkpoint {} ({} units)",
+                checkpoint_path.display(),
+                loaded.unit_count
+            );
+            let map_material = MapMaterial::from_scenario(&loaded.baseline);
+            let baseline = self
+                .save_checkpoint_path
+                .is_some()
+                .then_some(loaded.baseline);
+            (
+                loaded.decoded,
+                Some(loaded.runtime),
+                None,
+                Some(label),
+                baseline,
+                map_material,
+            )
+        } else {
+            let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
+            let decoded = decode_mwsc_gzip_file(&self.scenario_path, Some(target))
+                .with_context(|| format!("failed to decode {}", self.scenario_path.display()))?;
+            let baseline = self.save_checkpoint_path.is_some().then(|| decoded.clone());
+            let map_material = MapMaterial::from_scenario(&decoded);
+            if !self.native_war_sides.is_empty() {
+                let sides = resolve_native_war_sides(&decoded, &self.native_war_sides)?;
+                let runtime = bootstrap_native_war(
+                    &decoded,
+                    &NativeWarBootstrapConfig {
+                        sides,
+                        hostility: None,
+                        production: ProductionConfig::default(),
+                        war_grace_end: 600,
+                    },
+                )
+                .context("failed to bootstrap native war")?;
+                let unit_count = runtime.latest_snapshot().frame_snapshot.units.len();
                 (
-                    loaded.decoded,
-                    Some(loaded.runtime),
+                    decoded,
+                    Some(runtime),
                     None,
-                    Some(label),
+                    Some(format!("native new war ({unit_count} units)")),
                     baseline,
+                    map_material,
+                )
+            } else if self.demo_units_requested {
+                let border = find_demo_border(
+                    &decoded.world_control,
+                    &decoded.land,
+                    decoded.target.width,
+                    decoded.target.height,
+                    decoded.target.grid_res,
+                )
+                .context("--demo-units requires an adjacent-country land border")?;
+                let production = derive_scenario_production(&decoded, &ProductionConfig::default())
+                    .context("failed to derive scenario production data for native runtime")?;
+                let runtime = create_demo_runtime(border, &decoded, production)?;
+                (
+                    decoded,
+                    Some(runtime),
+                    Some(border),
+                    Some("scenario-derived demo".to_owned()),
+                    baseline,
+                    map_material,
                 )
             } else {
-                let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
-                let decoded = decode_mwsc_gzip_file(&self.scenario_path, Some(target))
-                    .with_context(|| {
-                        format!("failed to decode {}", self.scenario_path.display())
-                    })?;
-                let baseline = self.save_checkpoint_path.is_some().then(|| decoded.clone());
-                if !self.native_war_sides.is_empty() {
-                    let sides = resolve_native_war_sides(&decoded, &self.native_war_sides)?;
-                    let runtime = bootstrap_native_war(
-                        &decoded,
-                        &NativeWarBootstrapConfig {
-                            sides,
-                            hostility: None,
-                            production: ProductionConfig::default(),
-                            war_grace_end: 600,
-                        },
-                    )
-                    .context("failed to bootstrap native war")?;
-                    let unit_count = runtime.latest_snapshot().frame_snapshot.units.len();
-                    (
-                        decoded,
-                        Some(runtime),
-                        None,
-                        Some(format!("native new war ({unit_count} units)")),
-                        baseline,
-                    )
-                } else if self.demo_units_requested {
-                    let border = find_demo_border(
-                        &decoded.world_control,
-                        &decoded.land,
-                        decoded.target.width,
-                        decoded.target.height,
-                        decoded.target.grid_res,
-                    )
-                    .context("--demo-units requires an adjacent-country land border")?;
-                    let production =
-                        derive_scenario_production(&decoded, &ProductionConfig::default())
-                            .context(
-                                "failed to derive scenario production data for native runtime",
-                            )?;
-                    let runtime = create_demo_runtime(border, &decoded, production)?;
-                    (
-                        decoded,
-                        Some(runtime),
-                        Some(border),
-                        Some("scenario-derived demo".to_owned()),
-                        baseline,
-                    )
-                } else {
-                    (decoded, None, None, None, None)
-                }
-            };
+                (decoded, None, None, None, None, map_material)
+            }
+        };
+        if let Some(runtime) = pending_runtime.as_ref() {
+            map_material.set_sovereign_sides(runtime.country_to_side());
+        }
         self.checkpoint_baseline = checkpoint_baseline;
+        self.map_material = Some(map_material);
         log::info!(
             "loaded {} entries into {}x{} in {:.1} ms",
             decoded.entry_count,
@@ -340,7 +386,7 @@ impl App {
         self.ownership = decoded.world_control;
         self.land = decoded.land;
         self.metadata = decoded.metadata;
-        self.palette = build_palette(&self.metadata, &self.ownership);
+        (self.palette, self.occupation_palette) = build_palettes(&self.metadata, &self.ownership);
         let size = window.inner_size();
         self.zoom = reset_zoom(size);
         if let Some(runtime) = pending_runtime.as_mut() {
@@ -510,7 +556,84 @@ impl App {
             dominant_texture.size(),
         );
 
-        let view_uniform = self.view_uniform(size, self.palette.len() as u32);
+        let material = self
+            .map_material
+            .as_ref()
+            .context("native map material was not initialized")?;
+        let geographic_size = ownership_texture.size();
+        let sovereign_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("immutable sovereign ownership R16Uint"),
+            size: geographic_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        upload_full_texture(
+            &queue,
+            &sovereign_texture,
+            &material.sovereign,
+            self.grid_width,
+            self.grid_height,
+        )?;
+        let geographic_land_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("immutable geographic land R8Uint"),
+            size: geographic_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        upload_full_texture(
+            &queue,
+            &geographic_land_texture,
+            &material.land,
+            self.grid_width,
+            self.grid_height,
+        )?;
+        let biome_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("immutable biome R8Uint"),
+            size: geographic_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        upload_full_texture(
+            &queue,
+            &biome_texture,
+            &material.biome,
+            self.grid_width,
+            self.grid_height,
+        )?;
+        let sovereign_view = sovereign_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let geographic_land_view =
+            geographic_land_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let biome_view = biome_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut sovereign_sides = vec![-1_i32; self.palette.len()];
+        let copy_len = sovereign_sides.len().min(material.sovereign_sides.len());
+        sovereign_sides[..copy_len].copy_from_slice(&material.sovereign_sides[..copy_len]);
+        let sovereign_side_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("immutable sovereign sides"),
+            contents: bytemuck::cast_slice(&sovereign_sides),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let mut country_y_bounds = vec![[0_u32, 0_u32]; self.palette.len()];
+        let bounds_len = country_y_bounds.len().min(material.country_y_bounds.len());
+        country_y_bounds[..bounds_len].copy_from_slice(&material.country_y_bounds[..bounds_len]);
+        let country_bounds_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("immutable sovereign vertical bounds"),
+            contents: bytemuck::cast_slice(&country_y_bounds),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let view_uniform = self.view_uniform(size, self.palette.len() as u32, format.is_srgb());
         let view_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("map view uniform"),
             contents: bytemuck::bytes_of(&view_uniform),
@@ -521,6 +644,12 @@ impl App {
             contents: bytemuck::cast_slice(&self.palette),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let occupation_palette_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("raw country occupation palette"),
+                contents: bytemuck::cast_slice(&self.occupation_palette),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let shader = device.create_shader_module(wgpu::include_wgsl!("map.wgsl"));
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("map bindings"),
@@ -565,6 +694,12 @@ impl App {
                     },
                     count: None,
                 },
+                texture_binding(4, wgpu::TextureSampleType::Uint),
+                texture_binding(5, wgpu::TextureSampleType::Uint),
+                texture_binding(6, wgpu::TextureSampleType::Uint),
+                storage_binding(7),
+                storage_binding(8),
+                storage_binding(9),
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -586,6 +721,30 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&dominant_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&sovereign_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&geographic_land_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&biome_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: sovereign_side_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: country_bounds_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: occupation_palette_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -702,6 +861,11 @@ impl App {
             map_labels,
             observer_hud,
         });
+        // Geographic material is now immutable GPU state; retaining a second
+        // CPU copy would only increase the viewer's baseline memory use.
+        self.map_material = None;
+        self.occupation_palette.clear();
+        self.occupation_palette.shrink_to_fit();
         self.window = Some(window);
         if let Some(runtime) = pending_runtime {
             let step_limit = self.smoke_frames.map(|_| 1);
@@ -729,7 +893,12 @@ impl App {
         Ok(())
     }
 
-    fn view_uniform(&self, size: PhysicalSize<u32>, palette_len: u32) -> ViewUniform {
+    fn view_uniform(
+        &self,
+        size: PhysicalSize<u32>,
+        palette_len: u32,
+        output_is_srgb: bool,
+    ) -> ViewUniform {
         let frontlines_active = self.latest_snapshot.as_ref().is_some_and(|snapshot| {
             matches!(
                 snapshot.state,
@@ -743,7 +912,8 @@ impl App {
             palette_len,
             grid_size: [self.grid_width, self.grid_height],
             frontlines_active: u32::from(frontlines_active),
-            _padding: [0; 3],
+            output_is_srgb: u32::from(output_is_srgb),
+            _padding: [0; 2],
         }
     }
 
@@ -1151,7 +1321,11 @@ impl App {
         };
         let size = window.inner_size();
         let palette_len = self.palette.len() as u32;
-        let uniform = self.view_uniform(size, palette_len);
+        let output_is_srgb = self
+            .gpu
+            .as_ref()
+            .is_some_and(|gpu| gpu.config.format.is_srgb());
+        let uniform = self.view_uniform(size, palette_len, output_is_srgb);
         let map_label_view = self.map_label_view(size);
         let map_labels_static_dirty = self.map_labels_static_dirty;
         let map_labels_sides_dirty = self.map_labels_sides_dirty;
@@ -2152,6 +2326,53 @@ fn pack_territory_tile(tile: &TerritoryTilePixels) -> Result<(Vec<u8>, u32, u32)
     ))
 }
 
+fn pack_full_texture<T: Pod>(pixels: &[T], width: u32, height: u32) -> Result<(Vec<u8>, u32)> {
+    let expected = width as usize * height as usize;
+    anyhow::ensure!(
+        pixels.len() == expected,
+        "texture has {} pixels, expected {expected}",
+        pixels.len()
+    );
+    let unpadded_bpr = width as usize * std::mem::size_of::<T>();
+    let padded_bpr = unpadded_bpr.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+    let source = bytemuck::cast_slice(pixels);
+    let mut packed = vec![0_u8; padded_bpr * height as usize];
+    for row in 0..height as usize {
+        let source_start = row * unpadded_bpr;
+        let target_start = row * padded_bpr;
+        packed[target_start..target_start + unpadded_bpr]
+            .copy_from_slice(&source[source_start..source_start + unpadded_bpr]);
+    }
+    Ok((packed, padded_bpr as u32))
+}
+
+fn upload_full_texture<T: Pod>(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    pixels: &[T],
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    anyhow::ensure!(texture.size().width == width && texture.size().height == height);
+    let (packed, padded_bpr) = pack_full_texture(pixels, width, height)?;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &packed,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(padded_bpr),
+            rows_per_image: Some(height),
+        },
+        texture.size(),
+    );
+    Ok(())
+}
+
 fn pack_dominant_tile(tile: &TerritoryTilePixels) -> Result<(Vec<u8>, u32, u32)> {
     let bounds = tile.bounds;
     anyhow::ensure!(
@@ -2328,7 +2549,7 @@ fn world_to_cell(world: [f64; 2], width: u32, height: u32) -> Option<(usize, usi
     Some((x, y))
 }
 
-fn build_palette(metadata: &Value, ownership: &[u16]) -> Vec<[f32; 4]> {
+fn build_palettes(metadata: &Value, ownership: &[u16]) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
     let max_id = ownership.iter().copied().max().unwrap_or(0) as usize;
     let mut palette = (0..=max_id)
         .map(|id| {
@@ -2349,6 +2570,7 @@ fn build_palette(metadata: &Value, ownership: &[u16]) -> Vec<[f32; 4]> {
         .get("metadata")
         .and_then(Value::as_array)
         .or_else(|| metadata.as_array());
+    let mut overlord_by_id = Vec::new();
     for country in countries.into_iter().flatten() {
         let Some(id) = country
             .get("id")
@@ -2364,11 +2586,38 @@ fn build_palette(metadata: &Value, ownership: &[u16]) -> Vec<[f32; 4]> {
         else {
             continue;
         };
-        if let Some(slot) = palette.get_mut(id) {
-            *slot = color;
+        if id >= palette.len() {
+            palette.resize(id + 1, [0.59, 0.59, 0.59, 1.0]);
+        }
+        palette[id] = color;
+        if let Some(overlord_id) = country
+            .get("overlordId")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if id >= overlord_by_id.len() {
+                overlord_by_id.resize(id + 1, None);
+            }
+            overlord_by_id[id] = Some(overlord_id);
         }
     }
-    palette
+    let unblended_palette = palette.clone();
+    for (subject_id, overlord_id) in overlord_by_id.into_iter().enumerate() {
+        let Some(overlord_id) = overlord_id else {
+            continue;
+        };
+        if subject_id < palette.len() && overlord_id < palette.len() {
+            let subject = unblended_palette[subject_id];
+            let overlord = unblended_palette[overlord_id];
+            palette[subject_id] = [
+                (overlord[0] * 0.75 * 255.0 + subject[0] * 0.25 * 255.0).round() / 255.0,
+                (overlord[1] * 0.75 * 255.0 + subject[1] * 0.25 * 255.0).round() / 255.0,
+                (overlord[2] * 0.75 * 255.0 + subject[2] * 0.25 * 255.0).round() / 255.0,
+                subject[3],
+            ];
+        }
+    }
+    (palette, unblended_palette)
 }
 
 fn parse_color(value: &str) -> Option<[f32; 4]> {
@@ -2389,6 +2638,45 @@ fn parse_color(value: &str) -> Option<[f32; 4]> {
             ]),
             _ => None,
         };
+    }
+    if let Some(body) = value
+        .strip_prefix("hsla(")
+        .or_else(|| value.strip_prefix("hsl("))
+        .and_then(|body| body.strip_suffix(')'))
+    {
+        let parts = body.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() < 3 {
+            return None;
+        }
+        let hue = parts[0].strip_suffix("deg").unwrap_or(parts[0]);
+        let saturation = parts[1].strip_suffix('%')?;
+        let lightness = parts[2].strip_suffix('%')?;
+        let hue = hue.parse::<f32>().ok()?.rem_euclid(360.0) / 60.0;
+        let saturation = (saturation.parse::<f32>().ok()? / 100.0).clamp(0.0, 1.0);
+        let lightness = (lightness.parse::<f32>().ok()? / 100.0).clamp(0.0, 1.0);
+        let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+        let secondary = chroma * (1.0 - (hue.rem_euclid(2.0) - 1.0).abs());
+        let (red, green, blue) = match hue as u32 {
+            0 => (chroma, secondary, 0.0),
+            1 => (secondary, chroma, 0.0),
+            2 => (0.0, chroma, secondary),
+            3 => (0.0, secondary, chroma),
+            4 => (secondary, 0.0, chroma),
+            _ => (chroma, 0.0, secondary),
+        };
+        let match_value = lightness - chroma * 0.5;
+        let byte_channel = |channel: f32| ((channel + match_value) * 255.0).round() / 255.0;
+        return Some([
+            byte_channel(red),
+            byte_channel(green),
+            byte_channel(blue),
+            parts
+                .get(3)
+                .and_then(|alpha| alpha.parse::<f32>().ok())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0)
+                .max(0.65),
+        ]);
     }
     let body = value
         .strip_prefix("rgba(")
@@ -2493,6 +2781,51 @@ mod tests {
             Some([10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 0.65])
         );
         assert_eq!(parse_color("not-a-color"), None);
+        assert_eq!(
+            parse_color("hsla(301, 63%, 53%, 1)"),
+            Some([211.0 / 255.0, 60.0 / 255.0, 208.0 / 255.0, 1.0])
+        );
+        assert_eq!(
+            parse_color("hsla(19, 63%, 50%, 1)"),
+            Some([208.0 / 255.0, 98.0 / 255.0, 47.0 / 255.0, 1.0])
+        );
+        assert_eq!(
+            parse_color("hsla(145, 85%, 54%, 1)"),
+            Some([38.0 / 255.0, 237.0 / 255.0, 121.0 / 255.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn palette_blends_one_level_of_overlord_color_before_material_shading() {
+        let metadata = serde_json::json!([
+            {"id": 1, "color": "#010203"},
+            {"id": 2, "color": "#050607", "overlordId": 1},
+            {"id": 3, "color": "#090a0b", "overlordId": 2}
+        ]);
+        let (palette, occupation_palette) = build_palettes(&metadata, &[0, 1, 2, 3]);
+        assert_eq!(palette[1], [1.0 / 255.0, 2.0 / 255.0, 3.0 / 255.0, 1.0]);
+        assert_eq!(palette[2], [2.0 / 255.0, 3.0 / 255.0, 4.0 / 255.0, 1.0]);
+        assert_eq!(palette[3], [6.0 / 255.0, 7.0 / 255.0, 8.0 / 255.0, 1.0]);
+        assert_eq!(
+            occupation_palette[2],
+            [5.0 / 255.0, 6.0 / 255.0, 7.0 / 255.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn immutable_texture_rows_use_gpu_alignment_without_reordering_pixels() {
+        let (u8_rows, u8_stride) = pack_full_texture(&[1_u8, 2, 3, 4, 5, 6], 3, 2).unwrap();
+        assert_eq!(u8_stride, ROW_ALIGNMENT as u32);
+        assert_eq!(&u8_rows[..3], &[1, 2, 3]);
+        assert_eq!(&u8_rows[ROW_ALIGNMENT..ROW_ALIGNMENT + 3], &[4, 5, 6]);
+
+        let (u16_rows, u16_stride) = pack_full_texture(&[0x0102_u16, 0x0304], 1, 2).unwrap();
+        assert_eq!(u16_stride, ROW_ALIGNMENT as u32);
+        assert_eq!(&u16_rows[..2], &0x0102_u16.to_ne_bytes());
+        assert_eq!(
+            &u16_rows[ROW_ALIGNMENT..ROW_ALIGNMENT + 2],
+            &0x0304_u16.to_ne_bytes()
+        );
     }
 
     #[test]
