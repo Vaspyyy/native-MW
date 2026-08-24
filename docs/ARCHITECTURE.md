@@ -81,6 +81,8 @@ browser runtime's shared mutable `main.js` structure.
 23. Project immutable runtime publications into a compact read-only sandbox
     observer HUD. Country selection remains renderer-local and cannot mutate or
     issue commands to the simulation.
+24. Mirror the browser sandbox's top status bar and `pause / down / speed / up`
+    playback strip with exact 1x/2x/3x selection semantics.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -205,6 +207,14 @@ reordering territory work. A renderer drain applies every delta in FIFO order
 and may retain only the newest snapshot among the complete publications it
 received. The separate latest-snapshot mailbox is newest-wins telemetry; it is
 not used to splice a snapshot onto unrelated delta state.
+
+Windowed playback controls are asynchronous worker requests. Pause, resume,
+and tick-interval changes take effect only at a published runtime boundary; a
+control received while a completed tick is backpressured is deferred until
+that publication is enqueued and installed as the latest snapshot. While
+paused, the worker performs no steps but continues serving checkpoint and stop
+requests. Resume schedules one immediate tick and never catches up wall time
+spent paused. Headless exact-step execution does not send these controls.
 
 Application teardown sends an explicit stop request and joins the worker. A
 blocked full-FIFO publication remains cancellable, and initialization, worker,
@@ -580,7 +590,10 @@ publication model for cities, frontlines, labels, and effects.
 23. Add a read-only sandbox observer HUD over immutable runtime publications,
     with renderer-local country selection and no command path back into the
     worker. **Complete.**
-24. Native gameplay UI/editor/community parity remains later work after the
+24. Add the browser sandbox's top status bar and exact four-button playback
+    strip, including tick-boundary pause/resume and live 1x/2x/3x cadence.
+    **Complete.**
+25. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

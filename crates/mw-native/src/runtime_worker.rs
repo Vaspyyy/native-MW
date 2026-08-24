@@ -74,7 +74,59 @@ impl std::error::Error for RuntimeWorkerCheckpointError {}
 enum RuntimeWorkerControl {
     Stop,
     Checkpoint(Sender<Result<NativeRuntimeCheckpointState, RuntimeWorkerCheckpointError>>),
+    Pause,
+    Resume,
+    SetTickInterval(Duration),
 }
+
+/// Nonterminal acknowledgement emitted after a live control takes effect at a published runtime
+/// boundary. These events are separate from [`RuntimeWorkerStatus`] so exact-step/headless callers
+/// can continue treating every status as terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeWorkerControlEvent {
+    Paused {
+        tick: u64,
+        frame: u64,
+    },
+    Resumed {
+        tick: u64,
+        frame: u64,
+    },
+    TickIntervalChanged {
+        interval: Duration,
+        tick: u64,
+        frame: u64,
+    },
+    /// The worker has entered terminal/checkpoint-service mode and rejected a live control.
+    Unavailable {
+        tick: u64,
+        frame: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeWorkerControlError {
+    ZeroTickInterval,
+    Stopped,
+}
+
+struct RuntimeWorkerEventSenders {
+    status: Sender<RuntimeWorkerStatus>,
+    control: Sender<RuntimeWorkerControlEvent>,
+}
+
+impl std::fmt::Display for RuntimeWorkerControlError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroTickInterval => {
+                formatter.write_str("runtime worker tick interval must be nonzero")
+            }
+            Self::Stopped => formatter.write_str("runtime worker stopped"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeWorkerControlError {}
 
 /// One atomic producer-to-renderer transaction. A receiver sees a tick's terrain deltas and its
 /// corresponding snapshot together, or sees neither.
@@ -96,6 +148,7 @@ pub struct RuntimeWorker {
     latest: Arc<Mutex<Arc<RuntimeSnapshot>>>,
     messages: Receiver<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
     statuses: Receiver<RuntimeWorkerStatus>,
+    control_events: Receiver<RuntimeWorkerControlEvent>,
     control: Sender<RuntimeWorkerControl>,
     join: Option<JoinHandle<()>>,
 }
@@ -134,6 +187,7 @@ impl RuntimeWorker {
         let worker_latest = Arc::clone(&latest);
         let (message_tx, messages) = mpsc::sync_channel(update_queue_capacity);
         let (status_tx, statuses) = mpsc::channel();
+        let (control_event_tx, control_events) = mpsc::channel();
         let (control, control_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("mw-native-runtime".to_owned())
@@ -144,7 +198,10 @@ impl RuntimeWorker {
                         tick_interval,
                         worker_latest,
                         message_tx,
-                        status_tx.clone(),
+                        RuntimeWorkerEventSenders {
+                            status: status_tx.clone(),
+                            control: control_event_tx,
+                        },
                         control_rx,
                         max_steps,
                     );
@@ -158,6 +215,7 @@ impl RuntimeWorker {
             latest,
             messages,
             statuses,
+            control_events,
             control,
             join: Some(join),
         })
@@ -185,6 +243,41 @@ impl RuntimeWorker {
     /// Receives one terminal status without blocking.
     pub fn poll_status(&self) -> Option<RuntimeWorkerStatus> {
         self.statuses.try_recv().ok()
+    }
+
+    /// Requests a pause without blocking the caller. [`RuntimeWorkerControlEvent::Paused`] is
+    /// emitted only after any already-completed tick has been published and made current.
+    pub fn request_pause(&self) -> Result<(), RuntimeWorkerControlError> {
+        self.send_control(RuntimeWorkerControl::Pause)
+    }
+
+    /// Requests a resume without blocking the caller. Resuming schedules one immediately due tick;
+    /// time spent paused is never replayed as a catch-up burst.
+    pub fn request_resume(&self) -> Result<(), RuntimeWorkerControlError> {
+        self.send_control(RuntimeWorkerControl::Resume)
+    }
+
+    /// Changes the live tick interval without blocking the caller. The new interval starts when
+    /// the worker applies the command at a published boundary.
+    pub fn request_tick_interval(
+        &self,
+        interval: Duration,
+    ) -> Result<(), RuntimeWorkerControlError> {
+        if interval.is_zero() {
+            return Err(RuntimeWorkerControlError::ZeroTickInterval);
+        }
+        self.send_control(RuntimeWorkerControl::SetTickInterval(interval))
+    }
+
+    /// Receives one nonterminal live-control acknowledgement without blocking.
+    pub fn poll_control_event(&self) -> Option<RuntimeWorkerControlEvent> {
+        self.control_events.try_recv().ok()
+    }
+
+    fn send_control(&self, control: RuntimeWorkerControl) -> Result<(), RuntimeWorkerControlError> {
+        self.control
+            .send(control)
+            .map_err(|_| RuntimeWorkerControlError::Stopped)
     }
 
     /// Makes the worker stop promptly, including while its bounded update FIFO is full.
@@ -231,57 +324,110 @@ fn run_worker(
     tick_interval: Duration,
     latest: Arc<Mutex<Arc<RuntimeSnapshot>>>,
     messages: SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
-    statuses: Sender<RuntimeWorkerStatus>,
+    events: RuntimeWorkerEventSenders,
     control: Receiver<RuntimeWorkerControl>,
     max_steps: Option<u64>,
 ) {
-    if !forward_initial_state(&mut runtime, &messages, &latest, &control) {
-        let _ = statuses.send(RuntimeWorkerStatus::Stopped);
-        return;
-    }
+    let initial_controls = match forward_initial_state(&mut runtime, &messages, &latest, &control) {
+        Some(controls) => controls,
+        None => {
+            let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+            return;
+        }
+    };
     if is_terminal_state(runtime.state()) {
-        let _ = statuses.send(RuntimeWorkerStatus::Terminal(runtime.state()));
-        serve_terminal(&mut runtime, &control);
+        let _ = events
+            .status
+            .send(RuntimeWorkerStatus::Terminal(runtime.state()));
+        serve_terminal(&mut runtime, &control, &events.control);
         return;
     }
 
+    let mut tick_interval = tick_interval;
     let mut due_at = Instant::now();
+    let mut paused = false;
+    for request in initial_controls {
+        if apply_live_control(
+            request,
+            &mut runtime,
+            &mut due_at,
+            &mut tick_interval,
+            &mut paused,
+            &events.control,
+        ) {
+            let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+            return;
+        }
+    }
     let mut completed_steps = 0_u64;
     loop {
-        if wait_until_due(&mut runtime, due_at, &control) {
-            let _ = statuses.send(RuntimeWorkerStatus::Stopped);
+        if wait_until_due(
+            &mut runtime,
+            &mut due_at,
+            &mut tick_interval,
+            &mut paused,
+            &events.control,
+            &control,
+        ) {
+            let _ = events.status.send(RuntimeWorkerStatus::Stopped);
             return;
         }
         let snapshot = match runtime.step() {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let _ = statuses.send(RuntimeWorkerStatus::Failed(error.to_string()));
+                let _ = events
+                    .status
+                    .send(RuntimeWorkerStatus::Failed(error.to_string()));
                 return;
             }
         };
-        if !forward_tick(&mut runtime, snapshot.clone(), &messages, &latest, &control) {
-            let _ = statuses.send(RuntimeWorkerStatus::Stopped);
-            return;
+        let deferred =
+            match forward_tick(&mut runtime, snapshot.clone(), &messages, &latest, &control) {
+                Some(deferred) => deferred,
+                None => {
+                    let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+                    return;
+                }
+            };
+        // Establish the ordinary next deadline first. Deferred controls were received while this
+        // tick's publication was backpressured and may intentionally replace this schedule.
+        due_at = next_due(due_at, tick_interval, Instant::now());
+        for request in deferred {
+            if apply_live_control(
+                request,
+                &mut runtime,
+                &mut due_at,
+                &mut tick_interval,
+                &mut paused,
+                &events.control,
+            ) {
+                let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+                return;
+            }
         }
         completed_steps += 1;
         if reached_limit(max_steps, completed_steps) {
-            let _ = statuses.send(RuntimeWorkerStatus::Completed {
+            let _ = events.status.send(RuntimeWorkerStatus::Completed {
                 steps: completed_steps,
             });
-            serve_terminal(&mut runtime, &control);
+            serve_terminal(&mut runtime, &control, &events.control);
             return;
         }
         if is_terminal_state(snapshot.state) {
-            let _ = statuses.send(RuntimeWorkerStatus::Terminal(snapshot.state));
-            serve_terminal(&mut runtime, &control);
+            let _ = events
+                .status
+                .send(RuntimeWorkerStatus::Terminal(snapshot.state));
+            serve_terminal(&mut runtime, &control, &events.control);
             return;
         }
-
-        due_at = next_due(due_at, tick_interval, Instant::now());
     }
 }
 
-fn serve_terminal(runtime: &mut NativeRuntime, control: &Receiver<RuntimeWorkerControl>) {
+fn serve_terminal(
+    runtime: &mut NativeRuntime,
+    control: &Receiver<RuntimeWorkerControl>,
+    control_events: &Sender<RuntimeWorkerControlEvent>,
+) {
     while let Ok(request) = control.recv() {
         match request {
             RuntimeWorkerControl::Stop => break,
@@ -291,6 +437,15 @@ fn serve_terminal(runtime: &mut NativeRuntime, control: &Receiver<RuntimeWorkerC
                         .checkpoint_state()
                         .map_err(|error| RuntimeWorkerCheckpointError(error.to_string())),
                 );
+            }
+            RuntimeWorkerControl::Pause
+            | RuntimeWorkerControl::Resume
+            | RuntimeWorkerControl::SetTickInterval(_) => {
+                let snapshot = runtime.latest_snapshot();
+                let _ = control_events.send(RuntimeWorkerControlEvent::Unavailable {
+                    tick: snapshot.tick,
+                    frame: snapshot.frame,
+                });
             }
         }
     }
@@ -319,37 +474,118 @@ fn next_due(previous_due: Instant, tick_interval: Duration, now: Instant) -> Ins
 /// Returns true when stop was requested.
 fn wait_until_due(
     runtime: &mut NativeRuntime,
-    due_at: Instant,
+    due_at: &mut Instant,
+    tick_interval: &mut Duration,
+    paused: &mut bool,
+    control_events: &Sender<RuntimeWorkerControlEvent>,
     control: &Receiver<RuntimeWorkerControl>,
 ) -> bool {
     loop {
-        let remaining = due_at.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return match control.try_recv() {
-                Ok(RuntimeWorkerControl::Stop) | Err(TryRecvError::Disconnected) => true,
-                Ok(RuntimeWorkerControl::Checkpoint(reply)) => {
-                    let _ = reply.send(
-                        runtime
-                            .checkpoint_state()
-                            .map_err(|e| RuntimeWorkerCheckpointError(e.to_string())),
-                    );
+        if *paused {
+            match control.recv() {
+                Ok(request) => {
+                    if apply_live_control(
+                        request,
+                        runtime,
+                        due_at,
+                        tick_interval,
+                        paused,
+                        control_events,
+                    ) {
+                        return true;
+                    }
                     continue;
                 }
-                Err(TryRecvError::Empty) => false,
-            };
+                Err(_) => return true,
+            }
+        }
+        let remaining = due_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            match control.try_recv() {
+                Ok(request) => {
+                    if apply_live_control(
+                        request,
+                        runtime,
+                        due_at,
+                        tick_interval,
+                        paused,
+                        control_events,
+                    ) {
+                        return true;
+                    }
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => return true,
+                Err(TryRecvError::Empty) => return false,
+            }
         }
         match control.recv_timeout(remaining) {
-            Ok(RuntimeWorkerControl::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return true;
+            Ok(request) => {
+                if apply_live_control(
+                    request,
+                    runtime,
+                    due_at,
+                    tick_interval,
+                    paused,
+                    control_events,
+                ) {
+                    return true;
+                }
             }
-            Ok(RuntimeWorkerControl::Checkpoint(reply)) => {
-                let _ = reply.send(
-                    runtime
-                        .checkpoint_state()
-                        .map_err(|e| RuntimeWorkerCheckpointError(e.to_string())),
-                );
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return true,
             Err(mpsc::RecvTimeoutError::Timeout) => return false,
+        }
+    }
+}
+
+fn apply_live_control(
+    request: RuntimeWorkerControl,
+    runtime: &mut NativeRuntime,
+    due_at: &mut Instant,
+    tick_interval: &mut Duration,
+    paused: &mut bool,
+    events: &Sender<RuntimeWorkerControlEvent>,
+) -> bool {
+    let snapshot = runtime.latest_snapshot();
+    match request {
+        RuntimeWorkerControl::Stop => true,
+        RuntimeWorkerControl::Checkpoint(reply) => {
+            let _ = reply.send(
+                runtime
+                    .checkpoint_state()
+                    .map_err(|error| RuntimeWorkerCheckpointError(error.to_string())),
+            );
+            false
+        }
+        RuntimeWorkerControl::Pause => {
+            *paused = true;
+            let _ = events.send(RuntimeWorkerControlEvent::Paused {
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
+        RuntimeWorkerControl::Resume => {
+            *paused = false;
+            *due_at = Instant::now();
+            let _ = events.send(RuntimeWorkerControlEvent::Resumed {
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
+        RuntimeWorkerControl::SetTickInterval(interval) => {
+            debug_assert!(!interval.is_zero());
+            *tick_interval = interval;
+            if !*paused {
+                *due_at = Instant::now() + interval;
+            }
+            let _ = events.send(RuntimeWorkerControlEvent::TickIntervalChanged {
+                interval,
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
         }
     }
 }
@@ -360,7 +596,7 @@ fn forward_initial_state(
     messages: &SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
     latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
     control: &Receiver<RuntimeWorkerControl>,
-) -> bool {
+) -> Option<Vec<RuntimeWorkerControl>> {
     let snapshot = runtime.latest_snapshot();
     forward_tick(runtime, snapshot, messages, latest, control)
 }
@@ -371,12 +607,12 @@ fn forward_tick(
     messages: &SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
     latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
     control: &Receiver<RuntimeWorkerControl>,
-) -> bool {
+) -> Option<Vec<RuntimeWorkerControl>> {
     let mut territory_updates = Vec::new();
     while let Some(update) = runtime.pop_render_update() {
         territory_updates.push(update);
     }
-    if !send_lossless(
+    let deferred = send_lossless(
         Some(runtime),
         messages,
         control,
@@ -384,13 +620,11 @@ fn forward_tick(
             territory_updates,
             snapshot: snapshot.clone(),
         },
-    ) {
-        return false;
-    }
+    )?;
     *latest
         .lock()
         .expect("runtime worker latest snapshot mutex poisoned") = snapshot;
-    true
+    Some(deferred)
 }
 
 fn drain_publications<T, S>(receiver: &Receiver<Publication<T, S>>) -> (Vec<T>, Option<S>) {
@@ -410,15 +644,16 @@ fn send_lossless<T>(
     updates: &SyncSender<T>,
     control: &Receiver<RuntimeWorkerControl>,
     mut value: T,
-) -> bool {
+) -> Option<Vec<RuntimeWorkerControl>> {
+    let mut deferred = Vec::new();
     loop {
         match updates.try_send(value) {
-            Ok(()) => return true,
+            Ok(()) => return Some(deferred),
             Err(TrySendError::Full(returned)) => {
                 value = returned;
                 match control.recv_timeout(CONTROL_POLL_INTERVAL) {
                     Ok(RuntimeWorkerControl::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return false;
+                        return None;
                     }
                     Ok(RuntimeWorkerControl::Checkpoint(reply)) => {
                         let result = runtime.as_deref_mut().map_or_else(
@@ -435,10 +670,15 @@ fn send_lossless<T>(
                         );
                         let _ = reply.send(result);
                     }
+                    Ok(request @ RuntimeWorkerControl::Pause)
+                    | Ok(request @ RuntimeWorkerControl::Resume)
+                    | Ok(request @ RuntimeWorkerControl::SetTickInterval(_)) => {
+                        deferred.push(request);
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
-            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Disconnected(_)) => return None,
         }
     }
 }
@@ -509,7 +749,7 @@ mod tests {
         let started = Instant::now();
         let handle = thread::spawn(move || send_lossless(None, &updates, &control_rx, 2_u8));
         control_tx.send(RuntimeWorkerControl::Stop).unwrap();
-        assert!(!handle.join().unwrap());
+        assert!(handle.join().unwrap().is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -520,7 +760,7 @@ mod tests {
         updates.send(1_u8).unwrap();
         let sender = thread::spawn(move || send_lossless(None, &updates, &control_rx, 2_u8));
         assert_eq!(receiver.recv().unwrap(), 1);
-        assert!(sender.join().unwrap());
+        assert!(sender.join().unwrap().is_some());
         assert_eq!(receiver.recv().unwrap(), 2);
     }
 
@@ -540,7 +780,7 @@ mod tests {
         assert_eq!(state.tick, 0);
         assert_eq!(state.frame, 0);
         assert_eq!(receiver.recv().unwrap(), 1);
-        assert!(worker.join().unwrap());
+        assert!(worker.join().unwrap().is_some());
         assert_eq!(receiver.recv().unwrap(), 2);
     }
 
@@ -551,7 +791,18 @@ mod tests {
         let (finished_tx, finished_rx) = mpsc::channel();
         let due_at = Instant::now() + Duration::from_millis(250);
         let waiter = thread::spawn(move || {
-            let stopped = wait_until_due(&mut runtime, due_at, &control_rx);
+            let mut due_at = due_at;
+            let mut tick_interval = Duration::from_millis(250);
+            let mut paused = false;
+            let (event_tx, _event_rx) = mpsc::channel();
+            let stopped = wait_until_due(
+                &mut runtime,
+                &mut due_at,
+                &mut tick_interval,
+                &mut paused,
+                &event_tx,
+                &control_rx,
+            );
             finished_tx.send(stopped).unwrap();
         });
 
@@ -572,6 +823,150 @@ mod tests {
         control_tx.send(RuntimeWorkerControl::Stop).unwrap();
         assert!(finished_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn pause_is_deferred_until_a_backpressured_publication_is_enqueued() {
+        let mut runtime = test_runtime();
+        let (updates, receiver) = mpsc::sync_channel(1);
+        updates.send(1_u8).unwrap();
+        let (control_tx, control_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let sender = thread::spawn(move || {
+            let result = send_lossless(Some(&mut runtime), &updates, &control_rx, 2_u8);
+            finished_tx.send(result).unwrap();
+        });
+
+        control_tx.send(RuntimeWorkerControl::Pause).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(receiver.recv().unwrap(), 1);
+        let deferred = finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(deferred[0], RuntimeWorkerControl::Pause));
+        assert_eq!(receiver.recv().unwrap(), 2);
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn asynchronous_pause_holds_an_exact_tick_until_resume() {
+        let mut worker = RuntimeWorker::spawn(test_runtime(), Duration::from_millis(5), 4).unwrap();
+        worker.request_pause().unwrap();
+
+        let started = Instant::now();
+        let paused_tick = loop {
+            let _ = worker.drain_render_state();
+            if let Some(RuntimeWorkerControlEvent::Paused { tick, frame }) =
+                worker.poll_control_event()
+            {
+                assert_eq!(tick, frame);
+                break tick;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        };
+        thread::sleep(Duration::from_millis(30));
+        let _ = worker.drain_render_state();
+        assert_eq!(worker.latest_snapshot().tick, paused_tick);
+        let paused_interval = Duration::from_millis(2);
+        worker.request_tick_interval(paused_interval).unwrap();
+        let interval_started = Instant::now();
+        loop {
+            if matches!(
+                worker.poll_control_event(),
+                Some(RuntimeWorkerControlEvent::TickIntervalChanged { interval, .. })
+                    if interval == paused_interval
+            ) {
+                break;
+            }
+            assert!(interval_started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        let checkpoint = worker.checkpoint_state().unwrap();
+        assert_eq!(checkpoint.tick, paused_tick);
+        thread::sleep(Duration::from_millis(15));
+        let _ = worker.drain_render_state();
+        assert_eq!(worker.latest_snapshot().tick, paused_tick);
+
+        worker.request_resume().unwrap();
+        let resumed_started = Instant::now();
+        loop {
+            let _ = worker.drain_render_state();
+            if worker.latest_snapshot().tick > paused_tick {
+                break;
+            }
+            assert!(resumed_started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn live_interval_rejects_zero_and_acknowledges_at_a_boundary() {
+        let mut worker =
+            RuntimeWorker::spawn(test_runtime(), Duration::from_millis(100), 4).unwrap();
+        assert_eq!(
+            worker.request_tick_interval(Duration::ZERO),
+            Err(RuntimeWorkerControlError::ZeroTickInterval)
+        );
+        let interval = Duration::from_millis(7);
+        worker.request_tick_interval(interval).unwrap();
+        let started = Instant::now();
+        loop {
+            let _ = worker.drain_render_state();
+            if let Some(RuntimeWorkerControlEvent::TickIntervalChanged {
+                interval: acknowledged,
+                tick,
+                frame,
+            }) = worker.poll_control_event()
+            {
+                assert_eq!(acknowledged, interval);
+                assert_eq!(tick, frame);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn terminal_worker_explicitly_rejects_live_controls() {
+        let mut worker =
+            RuntimeWorker::spawn_with_limit(test_runtime(), Duration::from_millis(1), 4, Some(1))
+                .unwrap();
+        let started = Instant::now();
+        loop {
+            let _ = worker.drain_render_state();
+            if matches!(
+                worker.poll_status(),
+                Some(RuntimeWorkerStatus::Completed { steps: 1 })
+            ) {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        worker.request_pause().unwrap();
+        let rejected_started = Instant::now();
+        loop {
+            if let Some(RuntimeWorkerControlEvent::Unavailable { tick, frame }) =
+                worker.poll_control_event()
+            {
+                assert_eq!(tick, 1);
+                assert_eq!(frame, 1);
+                break;
+            }
+            assert!(rejected_started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        worker.stop_and_join().unwrap();
     }
 
     #[test]

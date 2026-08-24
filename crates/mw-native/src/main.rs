@@ -40,12 +40,16 @@ mod runtime_worker;
 mod unit_renderer;
 
 use observer::ObserverHudModel;
-use observer_hud::{ObserverHudRenderer, panel_contains};
+use observer_hud::{
+    HudHit, ObserverHudRenderer, ObserverHudUpload, PlaybackAction, PlaybackPresentation,
+    hud_hit_test, hud_layout,
+};
 use options::{AppOptions, help_text, parse_app_options};
-use runtime_worker::{RuntimeWorker, RuntimeWorkerStatus};
+use runtime_worker::{RuntimeWorker, RuntimeWorkerControlEvent, RuntimeWorkerStatus};
 use unit_renderer::{UnitRenderer, geographic_to_world};
 
 const ROW_ALIGNMENT: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+const PLAYBACK_SPEEDS: [u8; 3] = [1, 2, 3];
 const DEMO_CAMERA_ZOOM_MULTIPLIER: f32 = 70.0;
 
 #[repr(C)]
@@ -118,6 +122,10 @@ struct App {
     observer_hud_visible: bool,
     observer_hud_dirty: bool,
     selected_country_id: Option<u16>,
+    playback_paused: bool,
+    playback_speed_index: usize,
+    playback_hovered: Option<PlaybackAction>,
+    playback_pressed: Option<PlaybackAction>,
     territory_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
     fps_epoch: Instant,
     fps: f64,
@@ -163,6 +171,10 @@ impl App {
             observer_hud_visible: true,
             observer_hud_dirty: true,
             selected_country_id: None,
+            playback_paused: false,
+            playback_speed_index: 0,
+            playback_hovered: None,
+            playback_pressed: None,
             territory_updates: VecDeque::new(),
             fps_epoch: Instant::now(),
             fps: 0.0,
@@ -521,8 +533,12 @@ impl App {
             &device,
             &queue,
             size,
-            &observer_model.lines,
-            self.observer_hud_accent(),
+            ObserverHudUpload {
+                lines: &observer_model.lines,
+                accent: self.observer_hud_accent(),
+                playback: self.playback_presentation(),
+                show_observer: self.observer_hud_visible,
+            },
         );
         self.observer_hud_dirty = false;
         log::info!(
@@ -564,6 +580,7 @@ impl App {
                 worker.latest_snapshot().tick
             );
             self.runtime_worker = Some(worker);
+            self.observer_hud_dirty = true;
         }
         Ok(())
     }
@@ -678,6 +695,10 @@ impl App {
         while let Some(status) = worker.poll_status() {
             statuses.push(status);
         }
+        let mut control_events = Vec::new();
+        while let Some(event) = worker.poll_control_event() {
+            control_events.push(event);
+        }
         if !statuses.is_empty() {
             // Every successful terminal/completion status is sent after its final
             // atomic publication. A second drain closes the cross-channel race
@@ -715,18 +736,55 @@ impl App {
             self.snapshot_dirty = true;
             self.observer_hud_dirty = true;
         }
+        for event in control_events {
+            match event {
+                RuntimeWorkerControlEvent::Paused { tick, frame } => {
+                    log::debug!("runtime paused at tick {tick}, frame {frame}");
+                }
+                RuntimeWorkerControlEvent::Resumed { tick, frame } => {
+                    log::debug!("runtime resumed at tick {tick}, frame {frame}");
+                }
+                RuntimeWorkerControlEvent::TickIntervalChanged {
+                    interval,
+                    tick,
+                    frame,
+                } => {
+                    log::debug!(
+                        "runtime tick interval changed to {interval:?} at tick {tick}, frame {frame}"
+                    );
+                }
+                RuntimeWorkerControlEvent::Unavailable { tick, frame } => {
+                    self.runtime_terminal = true;
+                    self.playback_hovered = None;
+                    self.playback_pressed = None;
+                    self.observer_hud_dirty = true;
+                    log::debug!(
+                        "runtime rejected playback control after terminal tick {tick}, frame {frame}"
+                    );
+                }
+            }
+        }
         for status in statuses {
             match status {
                 RuntimeWorkerStatus::Stopped => {
                     self.runtime_terminal = true;
+                    self.playback_hovered = None;
+                    self.playback_pressed = None;
+                    self.observer_hud_dirty = true;
                     log::info!("native runtime worker stopped");
                 }
                 RuntimeWorkerStatus::Terminal(state) => {
                     self.runtime_terminal = true;
+                    self.playback_hovered = None;
+                    self.playback_pressed = None;
+                    self.observer_hud_dirty = true;
                     log::warn!("native runtime reached terminal state: {state:?}");
                 }
                 RuntimeWorkerStatus::Completed { steps } => {
                     self.runtime_terminal = true;
+                    self.playback_hovered = None;
+                    self.playback_pressed = None;
+                    self.observer_hud_dirty = true;
                     log::info!("native runtime completed its {steps}-step limit");
                 }
                 RuntimeWorkerStatus::Failed(error) => {
@@ -811,6 +869,72 @@ impl App {
             .unwrap_or([0.15, 0.72, 0.95, 1.0])
     }
 
+    fn playback_active(&self) -> bool {
+        self.latest_snapshot.is_some() && !self.runtime_terminal
+    }
+
+    fn playback_speed(&self) -> u8 {
+        PLAYBACK_SPEEDS[self.playback_speed_index.min(PLAYBACK_SPEEDS.len() - 1)]
+    }
+
+    fn playback_presentation(&self) -> Option<PlaybackPresentation> {
+        self.playback_active().then(|| PlaybackPresentation {
+            paused: self.playback_paused,
+            speed: self.playback_speed(),
+            unit_count: self
+                .latest_snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.frame_snapshot.units.len()),
+            hovered: self.playback_hovered,
+            pressed: self.playback_pressed,
+        })
+    }
+
+    fn current_hud_hit(&self, point: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> HudHit {
+        let line_count = self.observer_hud_model().lines.len();
+        let layout = hud_layout(
+            size,
+            line_count,
+            self.playback_active(),
+            self.observer_hud_visible,
+        );
+        hud_hit_test(point, layout)
+    }
+
+    fn apply_playback_action(&mut self, action: PlaybackAction) -> Result<()> {
+        if !self.playback_active() {
+            return Ok(());
+        }
+        match action {
+            PlaybackAction::TogglePause => {
+                let paused = !self.playback_paused;
+                let worker = self
+                    .runtime_worker
+                    .as_ref()
+                    .context("playback control requested without an active runtime worker")?;
+                if paused {
+                    worker.request_pause()?;
+                } else {
+                    worker.request_resume()?;
+                }
+                self.playback_paused = paused;
+            }
+            PlaybackAction::SpeedDown | PlaybackAction::CycleSpeed | PlaybackAction::SpeedUp => {
+                let speed_index = playback_speed_index(self.playback_speed_index, action);
+                let speed = PLAYBACK_SPEEDS[speed_index];
+                let interval = self.runtime_tick_interval.div_f64(f64::from(speed));
+                let worker = self
+                    .runtime_worker
+                    .as_ref()
+                    .context("playback control requested without an active runtime worker")?;
+                worker.request_tick_interval(interval)?;
+                self.playback_speed_index = speed_index;
+            }
+        }
+        self.observer_hud_dirty = true;
+        Ok(())
+    }
+
     fn render(&mut self) -> Result<()> {
         self.drain_runtime_worker()?;
         let Some(window) = &self.window else {
@@ -820,8 +944,13 @@ impl App {
         let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
         let observer_hud_visible = self.observer_hud_visible;
-        let observer_upload = (observer_hud_visible && self.observer_hud_dirty)
-            .then(|| (self.observer_hud_model(), self.observer_hud_accent()));
+        let observer_upload = self.observer_hud_dirty.then(|| {
+            (
+                self.observer_hud_model(),
+                self.observer_hud_accent(),
+                self.playback_presentation(),
+            )
+        });
         let Some(gpu) = &mut self.gpu else {
             return Ok(());
         };
@@ -842,9 +971,18 @@ impl App {
             );
             self.snapshot_dirty = false;
         }
-        if let Some((model, accent)) = observer_upload {
-            gpu.observer_hud
-                .upload(&gpu.device, &gpu.queue, size, &model.lines, accent);
+        if let Some((model, accent, playback)) = observer_upload {
+            gpu.observer_hud.upload(
+                &gpu.device,
+                &gpu.queue,
+                size,
+                ObserverHudUpload {
+                    lines: &model.lines,
+                    accent,
+                    playback,
+                    show_observer: observer_hud_visible,
+                },
+            );
             self.observer_hud_dirty = false;
         }
         let rendered_unit_count = gpu.unit_renderer.instance_count();
@@ -902,9 +1040,7 @@ impl App {
             pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.draw(0..3, 0..1);
             gpu.unit_renderer.draw(&mut pass);
-            if observer_hud_visible {
-                gpu.observer_hud.draw(&mut pass);
-            }
+            gpu.observer_hud.draw(&mut pass);
         }
         gpu.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
@@ -980,7 +1116,9 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                     PhysicalKey::Code(KeyCode::KeyR) => {
@@ -989,9 +1127,20 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyH) => {
                         self.observer_hud_visible = !self.observer_hud_visible;
-                        self.observer_hud_dirty = self.observer_hud_visible;
+                        self.observer_hud_dirty = true;
                         self.dragging = false;
                         self.drag_origin = None;
+                        self.playback_pressed = None;
+                        window.request_redraw();
+                    }
+                    PhysicalKey::Code(KeyCode::Space) => {
+                        if let Err(error) = self.apply_playback_action(PlaybackAction::TogglePause)
+                        {
+                            let message = format!("playback control failed: {error:#}");
+                            log::error!("{message}");
+                            self.fatal_error = Some(message);
+                            event_loop.exit();
+                        }
                         window.request_redraw();
                     }
                     PhysicalKey::Code(KeyCode::KeyS) if self.save_checkpoint_path.is_some() => {
@@ -1016,6 +1165,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
+                let hovered = match self.current_hud_hit(position, window.inner_size()) {
+                    HudHit::Playback(action) => Some(action),
+                    HudHit::Panel | HudHit::Outside => None,
+                };
+                if hovered != self.playback_hovered {
+                    self.playback_hovered = hovered;
+                    self.observer_hud_dirty = true;
+                    window.request_redraw();
+                }
                 if self.dragging {
                     self.center[0] -= (position.x - self.last_drag.x) as f32 / self.zoom;
                     self.center[1] -= (position.y - self.last_drag.y) as f32 / self.zoom;
@@ -1029,17 +1187,47 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if state == ElementState::Pressed {
-                    let over_hud = self.observer_hud_visible && {
-                        let line_count = self.observer_hud_model().lines.len();
-                        panel_contains(self.cursor, window.inner_size(), line_count)
-                    };
-                    self.dragging = !over_hud;
-                    self.drag_origin = (!over_hud).then_some(self.cursor);
-                    if self.dragging {
-                        self.last_drag = self.cursor;
+                    match self.current_hud_hit(self.cursor, window.inner_size()) {
+                        HudHit::Playback(action) => {
+                            self.playback_pressed = Some(action);
+                            self.observer_hud_dirty = true;
+                            self.dragging = false;
+                            self.drag_origin = None;
+                            window.request_redraw();
+                        }
+                        HudHit::Panel => {
+                            self.playback_pressed = None;
+                            self.dragging = false;
+                            self.drag_origin = None;
+                        }
+                        HudHit::Outside => {
+                            self.playback_pressed = None;
+                            self.dragging = true;
+                            self.drag_origin = Some(self.cursor);
+                            self.last_drag = self.cursor;
+                        }
                     }
                 } else {
                     self.dragging = false;
+                    let released_action =
+                        match self.current_hud_hit(self.cursor, window.inner_size()) {
+                            HudHit::Playback(action) => Some(action),
+                            HudHit::Panel | HudHit::Outside => None,
+                        };
+                    let pressed_action = self.playback_pressed.take();
+                    if let Some(action) = pressed_action {
+                        self.observer_hud_dirty = true;
+                        if Some(action) == released_action
+                            && let Err(error) = self.apply_playback_action(action)
+                        {
+                            let message = format!("playback control failed: {error:#}");
+                            log::error!("{message}");
+                            self.fatal_error = Some(message);
+                            event_loop.exit();
+                        }
+                        window.request_redraw();
+                        return;
+                    }
                     let clicked = self.drag_origin.take().is_some_and(|origin| {
                         let dx = self.cursor.x - origin.x;
                         let dy = self.cursor.y - origin.y;
@@ -1057,6 +1245,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.current_hud_hit(self.cursor, window.inner_size()) != HudHit::Outside {
+                    return;
+                }
                 let amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32 / 80.0).clamp(-4.0, 4.0),
@@ -1096,6 +1287,16 @@ impl ApplicationHandler for App {
             self.fatal_error = Some(message);
         }
         self.stop_runtime_worker();
+    }
+}
+
+fn playback_speed_index(current: usize, action: PlaybackAction) -> usize {
+    let current = current.min(PLAYBACK_SPEEDS.len() - 1);
+    match action {
+        PlaybackAction::TogglePause => current,
+        PlaybackAction::SpeedDown => current.saturating_sub(1),
+        PlaybackAction::CycleSpeed => (current + 1) % PLAYBACK_SPEEDS.len(),
+        PlaybackAction::SpeedUp => (current + 1).min(PLAYBACK_SPEEDS.len() - 1),
     }
 }
 
@@ -1836,6 +2037,22 @@ mod tests {
     fn camera_fit_preserves_two_to_one_world_aspect() {
         assert_eq!(reset_zoom(PhysicalSize::new(1_280, 720)), 640.0);
         assert_eq!(reset_zoom(PhysicalSize::new(2_000, 600)), 600.0);
+    }
+
+    #[test]
+    fn playback_speed_controls_match_browser_clamping_and_cycle() {
+        assert_eq!(
+            playback_speed_index(0, PlaybackAction::SpeedDown),
+            0,
+            "the browser left arrow clamps at 1x"
+        );
+        assert_eq!(playback_speed_index(0, PlaybackAction::SpeedUp), 1);
+        assert_eq!(playback_speed_index(1, PlaybackAction::SpeedUp), 2);
+        assert_eq!(playback_speed_index(2, PlaybackAction::SpeedUp), 2);
+        assert_eq!(playback_speed_index(0, PlaybackAction::CycleSpeed), 1);
+        assert_eq!(playback_speed_index(1, PlaybackAction::CycleSpeed), 2);
+        assert_eq!(playback_speed_index(2, PlaybackAction::CycleSpeed), 0);
+        assert_eq!(playback_speed_index(2, PlaybackAction::TogglePause), 2);
     }
 
     #[test]

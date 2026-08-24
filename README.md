@@ -35,6 +35,8 @@ reference while systems move into the renderer-independent `mw-core` crate.
 - a dependency-free native sandbox observer HUD over immutable runtime
   publications, with renderer-local country selection and live territory,
   economy, forces, logistics, air-power, operation, and casualty summaries
+- browser-matched sandbox playback controls in the top status bar: orange
+  pause/green resume, clamped speed arrows, and a cycling 1x/2x/3x readout
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
 - versioned browser-to-native checkpoints: loadable legacy v1-v10 state plus
@@ -203,13 +205,18 @@ Native viewer controls:
 - mouse wheel: cursor-anchored zoom
 - left click: select a country for the live observer panel and print its
   geographic cell
+- click `⏸/▶`, `‹`, `1x/2x/3x`, or `›`: pause/resume and change live speed
+- `Space`: pause or resume
 - `H`: hide or show the observer panel
 - `R`: reset camera
 - `S`: save immediately when `--save-checkpoint PATH` is configured
 - `Esc`: quit
 
 The panel is intentionally read-only sandbox/observer UI. It does not issue
-unit orders or expose Commander Mode controls.
+unit orders or expose Commander Mode controls. Playback starts running at 1x,
+matching the browser sandbox. The `--tick-ms` value is the native 1x cadence;
+2x and 3x divide that interval while remaining bounded by actual simulation
+throughput.
 
 Native-only startup accepts repeated `--side` selectors (country ID or unique
 case-insensitive name) and uses deterministic all-Army bootstrap forces. Use
