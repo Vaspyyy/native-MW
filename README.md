@@ -37,10 +37,12 @@ reference while systems move into the renderer-independent `mw-core` crate.
   economy, forces, logistics, air-power, operation, and casualty summaries
 - browser-matched sandbox playback controls in the top status bar: orange
   pause/green resume, clamped speed arrows, and a cycling 1x/2x/3x readout
+- browser-style immutable world overlays for live airfields and wings, active
+  land battles, and the selected side's task-force routes and hostile contacts
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
-- versioned browser-to-native checkpoints: loadable legacy v1-v10 state plus
-  strict native v11 continuation with exact influence work, side dynamics,
+- versioned browser-to-native checkpoints: loadable v1-v11 state with strict
+  native continuation of influence work, side dynamics,
   observer-scoped operational AI, naval planning/execution, air missions, and
   per-unit operational-feedback history, replay-safe gameplay RNG, and
   side-level recruitable personnel, aircraft and armor reserves, controlled
@@ -203,8 +205,8 @@ Native viewer controls:
 
 - drag left mouse: pan
 - mouse wheel: cursor-anchored zoom
-- left click: select a country for the live observer panel and print its
-  geographic cell
+- left click: select a country for the live observer panel, reveal its side's
+  operation routes and contacts, and print its geographic cell
 - click `⏸/▶`, `‹`, `1x/2x/3x`, or `›`: pause/resume and change live speed
 - `Space`: pause or resume
 - `H`: hide or show the observer panel

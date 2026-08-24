@@ -83,6 +83,9 @@ browser runtime's shared mutable `main.js` structure.
     issue commands to the simulation.
 24. Mirror the browser sandbox's top status bar and `pause / down / speed / up`
     playback strip with exact 1x/2x/3x selection semantics.
+25. Project immutable airfields, active wings, combat clusters, and the selected
+    side's operational routes and hostile contacts into browser-style native
+    map overlays without adding a command path back into the worker.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -226,7 +229,7 @@ ms/tick, meeting a 33.33 ms 30 Hz median budget. The conservative p95 remains
 131.183 ms per three-tick sample, or about 43.7 ms/tick, so 30 Hz is not yet a
 tail-latency guarantee and the runtime still misses a 16.67 ms 60 Hz budget.
 
-The browser/native handoff has seven strict versions with explicit semantic
+The browser/native handoff has eleven strict versions with explicit semantic
 boundaries:
 
 - `native-runtime-checkpoint-v1` retains `postStartWar` as its only
@@ -521,8 +524,10 @@ The world map is a regular geographic grid. Ownership IDs are uploaded as an
 integer GPU texture and converted to colors in WGSL. Borders are detected from
 neighboring ownership IDs in the shader. After initial upload, territory
 changes are transferred as bounded FIFO dirty tiles. Units are rendered from
-reference-counted immutable frame snapshots; later passes can use the same
-publication model for cities, frontlines, labels, and effects.
+reference-counted immutable frame snapshots. The same committed publication
+feeds airfield and wing markers, combat clusters, and renderer-local selected-side
+operation routes and contacts; no overlay reads mutable worker state. Later
+passes can use the same publication model for cities, frontlines, and labels.
 
 ## Migration order
 
@@ -593,7 +598,9 @@ publication model for cities, frontlines, labels, and effects.
 24. Add the browser sandbox's top status bar and exact four-button playback
     strip, including tick-boundary pause/resume and live 1x/2x/3x cadence.
     **Complete.**
-25. Native gameplay UI/editor/community parity remains later work after the
+25. Add browser-style immutable air, battle, operational-route, and contact
+    overlays driven by the selected observer country. **Complete.**
+26. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

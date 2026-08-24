@@ -38,6 +38,7 @@ mod observer_hud;
 mod options;
 mod runtime_worker;
 mod unit_renderer;
+mod world_overlay;
 
 use observer::ObserverHudModel;
 use observer_hud::{
@@ -47,10 +48,12 @@ use observer_hud::{
 use options::{AppOptions, help_text, parse_app_options};
 use runtime_worker::{RuntimeWorker, RuntimeWorkerControlEvent, RuntimeWorkerStatus};
 use unit_renderer::{UnitRenderer, geographic_to_world};
+use world_overlay::WorldOverlayRenderer;
 
 const ROW_ALIGNMENT: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
 const PLAYBACK_SPEEDS: [u8; 3] = [1, 2, 3];
 const DEMO_CAMERA_ZOOM_MULTIPLIER: f32 = 70.0;
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -72,6 +75,7 @@ struct GpuState {
     view_buffer: wgpu::Buffer,
     ownership_texture: wgpu::Texture,
     unit_renderer: UnitRenderer,
+    world_overlay: WorldOverlayRenderer,
     observer_hud: ObserverHudRenderer,
 }
 
@@ -112,6 +116,7 @@ struct App {
     frame_count: u64,
     presented_frames: u64,
     smoke_frames: Option<u64>,
+    smoke_started_at: Option<Instant>,
     runtime_worker: Option<RuntimeWorker>,
     runtime_center: Option<[f32; 2]>,
     runtime_zoom: Option<f32>,
@@ -119,6 +124,7 @@ struct App {
     runtime_terminal: bool,
     latest_snapshot: Option<Arc<RuntimeSnapshot>>,
     snapshot_dirty: bool,
+    world_overlay_dirty: bool,
     observer_hud_visible: bool,
     observer_hud_dirty: bool,
     selected_country_id: Option<u16>,
@@ -161,6 +167,7 @@ impl App {
             frame_count: 0,
             presented_frames: 0,
             smoke_frames: options.smoke_frames,
+            smoke_started_at: options.smoke_frames.map(|_| Instant::now()),
             runtime_worker: None,
             runtime_center: None,
             runtime_zoom: None,
@@ -168,6 +175,7 @@ impl App {
             runtime_terminal: false,
             latest_snapshot: None,
             snapshot_dirty: false,
+            world_overlay_dirty: false,
             observer_hud_visible: true,
             observer_hud_dirty: true,
             selected_country_id: None,
@@ -334,6 +342,7 @@ impl App {
             }
             self.latest_snapshot = Some(Arc::clone(&published));
             self.snapshot_dirty = true;
+            self.world_overlay_dirty = true;
             self.observer_hud_dirty = true;
             log::info!(
                 "initialized {} at tick {} with {} rendered units",
@@ -527,6 +536,11 @@ impl App {
         if let Some(snapshot) = &self.latest_snapshot {
             unit_renderer.upload(&device, &queue, &snapshot.frame_snapshot, &self.palette);
         }
+        let mut world_overlay = WorldOverlayRenderer::new(&device, &view_buffer, format);
+        if let Some(snapshot) = &self.latest_snapshot {
+            world_overlay.upload(&device, &queue, snapshot, self.selected_runtime_side());
+        }
+        self.world_overlay_dirty = false;
         let mut observer_hud = ObserverHudRenderer::new(&device, format);
         let observer_model = self.observer_hud_model();
         observer_hud.upload(
@@ -542,8 +556,10 @@ impl App {
         );
         self.observer_hud_dirty = false;
         log::info!(
-            "unit overlay initialized with {} instances",
-            unit_renderer.instance_count()
+            "world overlays initialized with {} units, {} markers, and {} route segments",
+            unit_renderer.instance_count(),
+            world_overlay.marker_count(),
+            world_overlay.segment_count()
         );
 
         self.gpu = Some(GpuState {
@@ -556,6 +572,7 @@ impl App {
             view_buffer,
             ownership_texture,
             unit_renderer,
+            world_overlay,
             observer_hud,
         });
         self.window = Some(window);
@@ -734,6 +751,7 @@ impl App {
             );
             self.latest_snapshot = Some(snapshot);
             self.snapshot_dirty = true;
+            self.world_overlay_dirty = true;
             self.observer_hud_dirty = true;
         }
         for event in control_events {
@@ -869,6 +887,25 @@ impl App {
             .unwrap_or([0.15, 0.72, 0.95, 1.0])
     }
 
+    fn selected_runtime_side(&self) -> Option<usize> {
+        let country_id = self.selected_country_id?;
+        let snapshot = self.latest_snapshot.as_ref()?;
+        snapshot
+            .territory_snapshot
+            .countries
+            .iter()
+            .find(|country| country.country_id == country_id)
+            .and_then(|country| usize::try_from(country.side_index).ok())
+            .or_else(|| {
+                snapshot
+                    .frame_snapshot
+                    .units
+                    .iter()
+                    .find(|unit| unit.sovereign == u64::from(country_id))
+                    .map(|unit| usize::from(unit.side))
+            })
+    }
+
     fn playback_active(&self) -> bool {
         self.latest_snapshot.is_some() && !self.runtime_terminal
     }
@@ -935,6 +972,20 @@ impl App {
         Ok(())
     }
 
+    fn smoke_runtime_ready(&self) -> bool {
+        self.runtime_initial_tick.is_none()
+            || self.runtime_terminal
+            || self
+                .latest_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| Some(snapshot.tick) > self.runtime_initial_tick)
+    }
+
+    fn smoke_timed_out(&self) -> bool {
+        self.smoke_started_at
+            .is_some_and(|started| started.elapsed() >= SMOKE_TIMEOUT)
+    }
+
     fn render(&mut self) -> Result<()> {
         self.drain_runtime_worker()?;
         let Some(window) = &self.window else {
@@ -944,6 +995,11 @@ impl App {
         let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
         let observer_hud_visible = self.observer_hud_visible;
+        let world_overlay_upload = self.world_overlay_dirty.then(|| {
+            self.latest_snapshot
+                .as_ref()
+                .map(|snapshot| (Arc::clone(snapshot), self.selected_runtime_side()))
+        });
         let observer_upload = self.observer_hud_dirty.then(|| {
             (
                 self.observer_hud_model(),
@@ -971,6 +1027,11 @@ impl App {
             );
             self.snapshot_dirty = false;
         }
+        if let Some(Some((snapshot, selected_side))) = world_overlay_upload {
+            gpu.world_overlay
+                .upload(&gpu.device, &gpu.queue, &snapshot, selected_side);
+        }
+        self.world_overlay_dirty = false;
         if let Some((model, accent, playback)) = observer_upload {
             gpu.observer_hud.upload(
                 &gpu.device,
@@ -1040,6 +1101,7 @@ impl App {
             pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.draw(0..3, 0..1);
             gpu.unit_renderer.draw(&mut pass);
+            gpu.world_overlay.draw(&mut pass);
             gpu.observer_hud.draw(&mut pass);
         }
         gpu.queue.submit(Some(encoder.finish()));
@@ -1236,6 +1298,7 @@ impl ApplicationHandler for App {
                     if clicked && let Some((id, lat, lng)) = self.country_at_cursor() {
                         self.selected_country_id = (id != 0).then_some(id);
                         self.observer_hud_dirty = true;
+                        self.world_overlay_dirty = true;
                         println!(
                             "country={id} name={:?} lat={lat:.4} lng={lng:.4}",
                             self.country_name(id)
@@ -1263,18 +1326,48 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                if let Some(target) = self.smoke_frames {
-                    let runtime_ready = self.runtime_initial_tick.is_none()
-                        || self.runtime_terminal
-                        || self.latest_snapshot.as_ref().is_some_and(|snapshot| {
-                            Some(snapshot.tick) > self.runtime_initial_tick
-                        });
-                    if self.presented_frames >= target && runtime_ready {
-                        event_loop.exit();
-                    }
+                if let Some(target) = self.smoke_frames
+                    && self.presented_frames >= target
+                    && self.smoke_runtime_ready()
+                {
+                    event_loop.exit();
                 }
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(target) = self.smoke_frames {
+            // An occluded Wayland surface may coalesce compositor-driven redraw
+            // callbacks after the first present. Exercise the requested GPU
+            // frames directly at the event-loop boundary so `--smoke` remains
+            // a bounded renderer test even when its window cannot be focused.
+            let result = if self.presented_frames < target {
+                self.render()
+            } else {
+                self.drain_runtime_worker()
+            };
+            if let Err(error) = result {
+                let message = format!("smoke rendering failed: {error:#}");
+                log::error!("{message}");
+                self.fatal_error = Some(message);
+                event_loop.exit();
+            } else if self.presented_frames >= target && self.smoke_runtime_ready() {
+                event_loop.exit();
+            } else if self.smoke_timed_out() {
+                let message = format!(
+                    "smoke rendering timed out after {:.1}s with {}/{} frames presented",
+                    SMOKE_TIMEOUT.as_secs_f64(),
+                    self.presented_frames,
+                    target
+                );
+                log::error!("{message}");
+                self.fatal_error = Some(message);
+                event_loop.exit();
+            }
+        } else if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
