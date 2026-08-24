@@ -27,7 +27,7 @@ use crate::{
     runtime_worker::{RuntimeWorker, RuntimeWorkerStatus},
 };
 
-const HEADLESS_SCHEMA: &str = "mw-native-headless-v4";
+const HEADLESS_SCHEMA: &str = "mw-native-headless-v5";
 const RESUMABLE_CHECKPOINT_BOUNDARIES: [&str; 2] = ["postStartWar", "midWar"];
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MIN_WATCHDOG: Duration = Duration::from_secs(30);
@@ -278,6 +278,15 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
                     "removedUnits": completion.final_snapshot.counters.missiles.removed_units,
                     "personnelLoss": completion.final_snapshot.counters.missiles.personnel_loss,
                     "equipmentLoss": completion.final_snapshot.counters.missiles.equipment_loss,
+                },
+                "territorialCleanup": {
+                    "occupancySamples": completion.final_snapshot.counters.territorial_cleanup.occupancy_samples,
+                    "occupancyReassignments": completion.final_snapshot.counters.territorial_cleanup.occupancy_reassignments,
+                    "integritySamples": completion.final_snapshot.counters.territorial_cleanup.integrity_samples,
+                    "hostilePocketDecays": completion.final_snapshot.counters.territorial_cleanup.hostile_pocket_decays,
+                    "isolatedSelfDecays": completion.final_snapshot.counters.territorial_cleanup.isolated_self_decays,
+                    "controllerChanges": completion.final_snapshot.counters.territorial_cleanup.controller_changes,
+                    "creditChanges": completion.final_snapshot.counters.territorial_cleanup.credit_changes,
                 },
                 "reinforcementCounters": {
                     "recruitedUnits": completion.final_snapshot.counters.reinforcement.recruited_units,

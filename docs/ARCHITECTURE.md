@@ -465,6 +465,23 @@ updated with browser-compatible Float32 rounding, hostile decay, reclaim rules,
 primary occupier credit, and controller hysteresis. Mutations mark census and
 render tiles instead of forcing a whole-map rescan or texture upload.
 
+On dynamic-influence ticks, territorial cleanup follows the browser's phased
+cadence and uses the shared gameplay RNG. Occupancy smoothing draws 5,000 cells
+at offset 83 of every 120 ticks, evaluates all sampled 3x3 allied majorities
+against the pre-application primary-occupier map, then applies its frozen changes; ties
+resolve in ascending numeric country-ID order. Territorial integrity runs at
+offset 67 of every 200 ticks with
+`max(1000, floor(5000 / max(1, activeSides / 2)))` samples. Its samples mutate
+sequentially, applying Float32 0.8 enemy-pocket or 0.75 isolated-friendly-
+protrusion decay before normal occupation synchronization. Cleanup additions
+extend the sparse influence transaction, so rollback restores maps, dirty
+state, frontier work, and the staged RNG cursor. Credit changes use the ordinary
+census and render notifications; controller changes also enqueue priority
+frontier work. Immutable step
+counters expose the phase work. Checkpoint v12 already contains the required
+RNG, territory, and frontier continuation state, so no checkpoint schema bump
+is needed. Legacy v1/v2 influence behavior remains unchanged.
+
 Country-to-side resolution uses a dense table covering the complete `u16` ID
 space, and city membership uses a dense cell mask. Influence application
 deduplicates touched, controller-changed, and credit-changed cells with
@@ -646,7 +663,11 @@ then the observer HUD.
 27. Match browser sandbox unit presentation with immutable visual-state
     publication, offline national flags, procedural armor/ships, exact
     zoom-density rules, and status/formation adornments. **Complete.**
-28. Native gameplay UI/editor/community parity remains later work after the
+28. Apply browser-cadence territorial occupancy smoothing and integrity decay
+    through the transactional influence path, preserving exact shared-RNG and
+    checkpoint continuation. **Complete for dynamic-influence runtime ticks;
+    legacy v1/v2 behavior remains unchanged.**
+29. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

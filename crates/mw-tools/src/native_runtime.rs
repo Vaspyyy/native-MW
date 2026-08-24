@@ -5690,6 +5690,15 @@ fn counters_json(snapshot: &RuntimeSnapshot) -> Value {
             "changedControllerCells": counters.influence.changed_controller_cells,
             "changedCreditCells": counters.influence.changed_credit_cells,
         },
+        "territorialCleanup": {
+            "occupancySamples": counters.territorial_cleanup.occupancy_samples,
+            "occupancyReassignments": counters.territorial_cleanup.occupancy_reassignments,
+            "integritySamples": counters.territorial_cleanup.integrity_samples,
+            "hostilePocketDecays": counters.territorial_cleanup.hostile_pocket_decays,
+            "isolatedSelfDecays": counters.territorial_cleanup.isolated_self_decays,
+            "controllerChanges": counters.territorial_cleanup.controller_changes,
+            "creditChanges": counters.territorial_cleanup.credit_changes,
+        },
         "census": {
             "processedItems": counters.census.processed_items,
             "committed": counters.census.committed,

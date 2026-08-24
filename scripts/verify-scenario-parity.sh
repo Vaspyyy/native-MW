@@ -122,7 +122,7 @@ fi
 
 if ! jq -e '
 	.schema == "native-runtime-checkpoint-v1"
-	and .runtimeSchema == "native-runtime-v4"
+	and .runtimeSchema == "native-runtime-v5"
 	and .checkpointBoundary.kind == "baselineReplay"
 	and .checkpointBoundary.resumable == false
 	and .requestedSteps == 3
@@ -293,6 +293,31 @@ jq -e '
 printf 'legacy native v10 load and deterministic v11 material upgrade gate ok\n'
 diff -u <(jq -S 'del(.steps)' "$save_tmp/resumed.json") <(jq -S 'del(.steps)' "$save_tmp/full.json")
 printf 'native v12 missile save/reload checkpoint gate ok: Germany+France/Poland+Belgium 20+20 == 40\n'
+
+"$naval_bin" --side Germany,France --side Poland,Belgium --headless --ticks 66 --tick-ms 1 \
+	--save-checkpoint "$save_tmp/territorial-cleanup-part.json" "$modern_path" >/dev/null
+"$naval_bin" --runtime-checkpoint "$save_tmp/territorial-cleanup-part.json" --headless --ticks 1 \
+	--tick-ms 1 --save-checkpoint "$save_tmp/territorial-cleanup-tick67.json" "$modern_path" --json \
+	>"$save_tmp/territorial-cleanup-tick67-report.json"
+jq -e '
+	.schema == "mw-native-headless-v5"
+	and .territorialCleanup.integritySamples == 5000
+	and .territorialCleanup.occupancySamples == 0
+' "$save_tmp/territorial-cleanup-tick67-report.json" >/dev/null
+"$naval_bin" --runtime-checkpoint "$save_tmp/territorial-cleanup-tick67.json" --headless --ticks 16 \
+	--tick-ms 1 --save-checkpoint "$save_tmp/territorial-cleanup-split.json" "$modern_path" --json \
+	>"$save_tmp/territorial-cleanup-tick83-report.json"
+jq -e '
+	.schema == "mw-native-headless-v5"
+	and .territorialCleanup.occupancySamples == 5000
+	and .territorialCleanup.integritySamples == 0
+' "$save_tmp/territorial-cleanup-tick83-report.json" >/dev/null
+"$naval_bin" --side Germany,France --side Poland,Belgium --headless --ticks 83 --tick-ms 1 \
+	--save-checkpoint "$save_tmp/territorial-cleanup-full.json" "$modern_path" >/dev/null
+diff -u \
+	<(jq -S 'del(.steps)' "$save_tmp/territorial-cleanup-split.json") \
+	<(jq -S 'del(.steps)' "$save_tmp/territorial-cleanup-full.json")
+printf 'native territorial cleanup cadence gate ok: integrity tick 67, occupancy tick 83, and 66+1+16 == 83\n'
 
 "$naval_bin" --side "United Kingdom" --side Iceland --headless --ticks 1000 --tick-ms 1 \
 	--save-checkpoint "$save_tmp/naval-part.json" "$modern_path" >/dev/null

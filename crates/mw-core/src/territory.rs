@@ -248,6 +248,21 @@ pub struct InfluenceApplyResult {
     pub changed_credit_cells: Vec<usize>,
 }
 
+/// Exact work performed by the browser-compatible territorial cleanup phases.
+///
+/// The input samples are intentionally supplied by the runtime so RNG ownership
+/// stays outside this deterministic map kernel.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerritorialCleanupResult {
+    pub occupancy_samples: usize,
+    pub occupancy_reassignments: usize,
+    pub integrity_samples: usize,
+    pub hostile_pocket_decays: usize,
+    pub isolated_self_decays: usize,
+    pub controller_change_count: usize,
+    pub credit_change_count: usize,
+}
+
 #[derive(Clone, Debug)]
 struct InfluenceCellUndo {
     cell: usize,
@@ -1098,6 +1113,179 @@ impl TerritoryControl {
         Ok(transaction)
     }
 
+    /// Apply the browser's occupancy smoothing and territorial-integrity
+    /// passes to an existing staged influence transaction. All sample indices
+    /// are validated before any map mutation, preserving the runtime's wider
+    /// atomic step contract.
+    pub(crate) fn apply_territorial_cleanup_staged(
+        &mut self,
+        transaction: &mut InfluenceTransaction,
+        occupancy_samples: &[usize],
+        integrity_samples: &[usize],
+    ) -> Result<TerritorialCleanupResult, TerritoryError> {
+        for &cell in occupancy_samples.iter().chain(integrity_samples) {
+            if cell >= self.total_cells() {
+                return Err(TerritoryError::InvalidCell(cell));
+            }
+        }
+
+        // `apply_*_staged` clears this scratch mask before returning its
+        // transaction. Rehydrate it from the sparse undo record so a cleanup
+        // mutation of an already-influenced cell retains the true pre-step
+        // value rather than appending a later rollback snapshot.
+        for undo in &transaction.cells {
+            self.influence_undo_mask[undo.cell] = true;
+        }
+
+        let mut result = TerritorialCleanupResult {
+            occupancy_samples: occupancy_samples.len(),
+            integrity_samples: integrity_samples.len(),
+            ..Default::default()
+        };
+
+        // Browser smoothing decides every sample against the pre-application
+        // credit map, then applies the scheduled writes in sample order.
+        let mut scheduled = Vec::new();
+        for &cell in occupancy_samples {
+            if self.maps.land[cell] != 2 || self.maps.primary_occupier[cell] == 0 {
+                continue;
+            }
+            let my_id = self.maps.primary_occupier[cell];
+            let Some(my_side) = mapped_side(&self.country_side_index, my_id) else {
+                continue;
+            };
+            let x = cell % self.width;
+            let y = cell / self.width;
+            let mut neighbor_ids = [0_u16; 9];
+            let mut neighbor_counts = [0_u8; 9];
+            let mut unique_neighbors = 0;
+            for ny in y.saturating_sub(1)..=(y + 1).min(self.height - 1) {
+                for nx in x.saturating_sub(1)..=(x + 1).min(self.width - 1) {
+                    let neighbor = self.maps.primary_occupier[ny * self.width + nx];
+                    if neighbor > 0
+                        && mapped_side(&self.country_side_index, neighbor) == Some(my_side)
+                    {
+                        if let Some(slot) = neighbor_ids[..unique_neighbors]
+                            .iter()
+                            .position(|&id| id == neighbor)
+                        {
+                            neighbor_counts[slot] += 1;
+                        } else {
+                            neighbor_ids[unique_neighbors] = neighbor;
+                            neighbor_counts[unique_neighbors] = 1;
+                            unique_neighbors += 1;
+                        }
+                    }
+                }
+            }
+            // JavaScript Object.keys visits integer country IDs in ascending
+            // order; selecting the lowest ID on equal counts is equivalent to
+            // that order followed by the browser's strict `>` comparison.
+            let (mut winner, mut best_count) = (my_id, 0_u8);
+            for slot in 0..unique_neighbors {
+                let (id, count) = (neighbor_ids[slot], neighbor_counts[slot]);
+                if count > best_count || (count == best_count && id < winner) {
+                    winner = id;
+                    best_count = count;
+                }
+            }
+            if best_count >= 5 && winner != my_id {
+                scheduled.push((cell, winner));
+            }
+        }
+        for (cell, winner) in scheduled {
+            self.capture_influence_undo(cell, transaction);
+            let old_credit = self.maps.primary_occupier[cell];
+            self.maps.primary_occupier[cell] = winner;
+            self.mark_census_region(cell, true);
+            self.mark_render_cell(cell);
+            if old_credit != winner {
+                result.credit_change_count += 1;
+            }
+            result.occupancy_reassignments += 1;
+        }
+
+        // Integrity samples are deliberately sequential: each later sample
+        // observes all preceding Float32 writes and controller synchronization.
+        for &cell in integrity_samples {
+            if self.maps.land[cell] != 2 {
+                continue;
+            }
+            let dominant = self.maps.dominant_side[cell];
+            if dominant < 0 {
+                continue;
+            }
+            let owner = self.maps.world_control[cell];
+            let Some(owner_side) = mapped_side(&self.country_side_index, owner) else {
+                continue;
+            };
+            let x = cell % self.width;
+            let y = cell / self.width;
+            let mut sovereign_neighbors = 0;
+            let mut hostile_neighbors = 0;
+            for ny in y.saturating_sub(1)..=(y + 1).min(self.height - 1) {
+                for nx in x.saturating_sub(1)..=(x + 1).min(self.width - 1) {
+                    if nx == x && ny == y {
+                        continue;
+                    }
+                    let neighbor = ny * self.width + nx;
+                    if self.maps.world_control[neighbor] == owner {
+                        sovereign_neighbors += 1;
+                    }
+                    let neighbor_dominant = self.maps.dominant_side[neighbor];
+                    if neighbor_dominant >= 0
+                        && self.sides_hostile(owner_side, neighbor_dominant as usize)
+                    {
+                        hostile_neighbors += 1;
+                    }
+                }
+            }
+
+            let hostile_pocket =
+                self.sides_hostile(owner_side, dominant as usize) && sovereign_neighbors >= 6;
+            let isolated_self = dominant as usize == owner_side && hostile_neighbors >= 7;
+            if !hostile_pocket && !isolated_self {
+                continue;
+            }
+            self.capture_influence_undo(cell, transaction);
+            let old_controller = self.maps.dominant_side[cell];
+            let old_city_controlled = self.published_city_controlled(cell);
+            if hostile_pocket {
+                for side in 0..self.max_sides {
+                    let value = f64::from(self.maps.side_influence[side][cell]);
+                    write_f32(&mut self.maps.side_influence[side][cell], value * 0.8);
+                }
+                result.hostile_pocket_decays += 1;
+                self.sync_occupation(cell);
+            }
+            if isolated_self {
+                let value = f64::from(self.maps.side_influence[dominant as usize][cell]);
+                write_f32(
+                    &mut self.maps.side_influence[dominant as usize][cell],
+                    value * 0.75,
+                );
+                result.isolated_self_decays += 1;
+                self.sync_occupation(cell);
+            }
+            let controller_changed = old_controller != self.maps.dominant_side[cell];
+            let city_controlled_changed =
+                old_city_controlled != self.published_city_controlled(cell);
+            if controller_changed {
+                self.mark_census_region(cell, true);
+                self.mark_render_cell(cell);
+                result.controller_change_count += 1;
+                self.enqueue_cleanup_priority(cell);
+            } else if city_controlled_changed {
+                self.mark_render_cell(cell);
+            }
+        }
+
+        for undo in &transaction.cells {
+            self.influence_undo_mask[undo.cell] = false;
+        }
+        Ok(result)
+    }
+
     /// Apply one browser-compatible influence phase as an atomic staged mutation: pending
     /// frontier diffusion runs first, followed by the already-selected formation sources.
     pub fn apply_influence_runtime(
@@ -1206,6 +1394,14 @@ impl TerritoryControl {
         self.render_dirty = transaction.render_dirty;
         self.mutation_sequence = transaction.mutation_sequence;
         self.influence_runtime = transaction.influence_runtime;
+    }
+
+    fn enqueue_cleanup_priority(&mut self, cell: usize) {
+        if let Some(frontier) = &mut self.influence_runtime {
+            frontier
+                .enqueue_cell(cell, self.width, self.height, true)
+                .expect("cleanup cell is in the validated territory grid");
+        }
     }
 
     fn diffuse_influence_cell(
@@ -2759,6 +2955,132 @@ mod tests {
         assert_eq!(staged_result, clean_result);
         assert_eq!(staged.checkpoint_maps(), clean.checkpoint_maps());
         assert_eq!(staged.census_status(), clean.census_status());
+    }
+
+    #[test]
+    fn staged_cleanup_smooths_from_a_frozen_credit_map_with_numeric_tie_order() {
+        let mut c = config(3, 3, 2, 1);
+        // Country IDs 1, 3 and 4 are all side 0. The center's nine-cell
+        // sample has five 1s, three 3s, and the isolated 4 itself.
+        c.maps.primary_occupier = vec![1, 3, 1, 3, 4, 1, 1, 3, 1];
+        let mut t = TerritoryControl::new(c).unwrap();
+        t.enable_influence_runtime();
+        let mut transaction = t.apply_influence_sources_staged(&[]).unwrap();
+        let result = t
+            .apply_territorial_cleanup_staged(&mut transaction, &[4, 4], &[])
+            .unwrap();
+        // Both duplicate samples schedule from the original ID 4. Applying
+        // after each sample instead would make the second observe ID 1.
+        assert_eq!(result.occupancy_reassignments, 2);
+        assert_eq!(result.credit_change_count, 1);
+        assert_eq!(t.primary_occupier()[4], 1);
+        let frontier = t.influence_runtime_state().unwrap();
+        assert!(frontier.regular_queue.is_empty());
+        assert!(frontier.priority_queue.is_empty());
+
+        // Four-to-four is deliberately not a majority. Iteration is numeric
+        // ascending and strict, so ID 1 wins the tie but cannot schedule a flip.
+        t.maps.primary_occupier = vec![1, 3, 1, 3, 4, 3, 1, 3, 1];
+        let mut transaction = t.apply_influence_sources_staged(&[]).unwrap();
+        let result = t
+            .apply_territorial_cleanup_staged(&mut transaction, &[4], &[])
+            .unwrap();
+        assert_eq!(result.occupancy_reassignments, 0);
+        assert_eq!(t.primary_occupier()[4], 4);
+    }
+
+    #[test]
+    fn staged_cleanup_integrity_uses_directed_hostility_and_f32_decay() {
+        let mut c = config(3, 3, 2, 1);
+        c.maps.world_control.fill(1);
+        c.maps.dominant_side[4] = 1;
+        c.maps.side_influence[0][4] = 0.5;
+        c.maps.side_influence[1][4] = 1.0;
+        // Hostility is directed: side 1 disliking side 0 is not enough for
+        // owner-side 0 to identify an enemy occupation.
+        c.hostility_matrix = vec![0, 0, 1, 0];
+        let mut t = TerritoryControl::new(c).unwrap();
+        let mut transaction = t.apply_influence_sources_staged(&[]).unwrap();
+        let result = t
+            .apply_territorial_cleanup_staged(&mut transaction, &[], &[4])
+            .unwrap();
+        assert_eq!(result.hostile_pocket_decays, 0);
+        assert_eq!(t.side_influence(1).unwrap()[4], 1.0);
+
+        t.hostility_matrix[1] = 1;
+        let mut transaction = t.apply_influence_sources_staged(&[]).unwrap();
+        let result = t
+            .apply_territorial_cleanup_staged(&mut transaction, &[], &[4])
+            .unwrap();
+        assert_eq!(result.hostile_pocket_decays, 1);
+        assert_eq!(t.side_influence(0).unwrap()[4], 0.4_f32);
+        assert_eq!(t.side_influence(1).unwrap()[4], 0.8_f32);
+    }
+
+    #[test]
+    fn staged_cleanup_integrity_samples_are_sequential() {
+        let mut c = config(3, 3, 2, 1);
+        c.maps.world_control.fill(1);
+        c.maps.dominant_side[4] = 1;
+        c.maps.side_influence[1][4] = 1.0;
+        let mut t = TerritoryControl::new(c).unwrap();
+        let mut transaction = t.apply_influence_sources_staged(&[]).unwrap();
+        let result = t
+            .apply_territorial_cleanup_staged(&mut transaction, &[], &[4, 4])
+            .unwrap();
+        assert_eq!(result.hostile_pocket_decays, 2);
+        assert_eq!(t.side_influence(1).unwrap()[4], 0.64_f32);
+    }
+
+    #[test]
+    fn staged_cleanup_isolated_self_decay_can_flip_and_queue_controller() {
+        let mut c = config(3, 3, 2, 1);
+        c.maps.world_control.fill(1);
+        c.maps.dominant_side.fill(1);
+        c.maps.dominant_side[4] = 0;
+        c.maps.side_influence[0][4] = 1.0;
+        c.maps.side_influence[1][4] = 0.91;
+        c.maps.occupation[4] = 1.0;
+        let mut t = TerritoryControl::new(c).unwrap();
+        t.enable_influence_runtime();
+        let mut transaction = t.apply_influence_sources_staged(&[]).unwrap();
+
+        let result = t
+            .apply_territorial_cleanup_staged(&mut transaction, &[], &[4])
+            .unwrap();
+
+        assert_eq!(result.hostile_pocket_decays, 0);
+        assert_eq!(result.isolated_self_decays, 1);
+        assert_eq!(result.controller_change_count, 1);
+        assert_eq!(t.side_influence(0).unwrap()[4], 0.75_f32);
+        assert_eq!(t.dominant_side()[4], 1);
+        assert_eq!(t.occupation()[4], -0.91_f32);
+        assert!(
+            !t.influence_runtime_state()
+                .unwrap()
+                .priority_queue
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn staged_cleanup_rollback_keeps_pre_influence_undo_for_repeated_cell() {
+        let mut c = config(3, 3, 2, 1);
+        c.maps.world_control.fill(1);
+        c.maps.primary_occupier = vec![1, 3, 1, 3, 4, 1, 1, 3, 1];
+        c.maps.dominant_side[4] = 1;
+        c.maps.side_influence[1][4] = 1.0;
+        let before = c.maps.clone();
+        let mut t = TerritoryControl::new(c).unwrap();
+        let mut source = source(0, 1, -89.0, -179.0);
+        source.radius = 0.5;
+        source.delta = 0.2;
+        let mut transaction = t.apply_influence_sources_staged(&[source]).unwrap();
+        t.apply_territorial_cleanup_staged(&mut transaction, &[4], &[4, 4])
+            .unwrap();
+        assert_ne!(t.checkpoint_maps(), before);
+        t.rollback_influence_transaction(transaction);
+        assert_eq!(t.checkpoint_maps(), before);
     }
 
     #[test]

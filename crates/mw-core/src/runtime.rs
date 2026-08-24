@@ -84,16 +84,23 @@ use crate::{
     tactical::SideKey,
     territory::{
         CensusStepResult, InfluenceApplyResult, InfluenceSource, InfluenceTransaction,
-        TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryError,
-        TerritoryRenderUpdate, TerritorySnapshot,
+        TerritorialCleanupResult, TerritoryCommittedState, TerritoryConfig, TerritoryControl,
+        TerritoryError, TerritoryRenderUpdate, TerritorySnapshot,
     },
     world::WorldGridView,
 };
 
-pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v4";
+pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v5";
 pub const DEFAULT_FRONT_REFRESH_TICKS: u64 = 30;
 pub const DEFAULT_CENSUS_BUDGET: usize = 16_384;
 pub const DEFAULT_CENSUS_FLUSH_CHUNK: usize = 65_536;
+const OCCUPANCY_SMOOTH_INTERVAL: u64 = 120;
+const OCCUPANCY_SMOOTH_OFFSET: u64 = 83;
+const OCCUPANCY_SMOOTH_SAMPLES: usize = 5_000;
+const TERRITORIAL_INTEGRITY_INTERVAL: u64 = 200;
+const TERRITORIAL_INTEGRITY_OFFSET: u64 = 67;
+const TERRITORIAL_INTEGRITY_BASE_SAMPLES: usize = 5_000;
+const TERRITORIAL_INTEGRITY_MIN_SAMPLES: usize = 1_000;
 const AIRCREW_PER_AIRCRAFT: u64 = 1;
 const AIRFIELD_CONTROLLER_PHASE: u64 = 47;
 const EARLY_RECRUIT_TICKS: u64 = 1_800;
@@ -327,6 +334,17 @@ pub struct RuntimeMissileCounters {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeTerritorialCleanupCounters {
+    pub occupancy_samples: usize,
+    pub occupancy_reassignments: usize,
+    pub integrity_samples: usize,
+    pub hostile_pocket_decays: usize,
+    pub isolated_self_decays: usize,
+    pub controller_changes: usize,
+    pub credit_changes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeStepCounters {
     pub front_refreshed: bool,
     pub front_segments: usize,
@@ -340,6 +358,7 @@ pub struct RuntimeStepCounters {
     pub operational_execution: OperationalExecutionCounters,
     pub attrition: RuntimeAttritionCounters,
     pub influence: RuntimeInfluenceCounters,
+    pub territorial_cleanup: RuntimeTerritorialCleanupCounters,
     pub census: RuntimeCensusCounters,
     pub strategic: Option<StrategicCounters>,
     pub strategic_derivation: Option<StrategicDerivationCounters>,
@@ -462,6 +481,20 @@ fn influence_counters(sources: usize, result: &InfluenceApplyResult) -> RuntimeI
         touched_influence_cells: result.touched_influence_cells.len(),
         changed_controller_cells: result.changed_controller_cells.len(),
         changed_credit_cells: result.changed_credit_cells.len(),
+    }
+}
+
+fn territorial_cleanup_counters(
+    result: &TerritorialCleanupResult,
+) -> RuntimeTerritorialCleanupCounters {
+    RuntimeTerritorialCleanupCounters {
+        occupancy_samples: result.occupancy_samples,
+        occupancy_reassignments: result.occupancy_reassignments,
+        integrity_samples: result.integrity_samples,
+        hostile_pocket_decays: result.hostile_pocket_decays,
+        isolated_self_decays: result.isolated_self_decays,
+        controller_changes: result.controller_change_count,
+        credit_changes: result.credit_change_count,
     }
 }
 
@@ -1426,6 +1459,45 @@ fn browser_influence_budgets(nonempty_side_count: usize) -> (usize, usize) {
     (max_applications, diffusion_budget)
 }
 
+fn simulation_phase_due(tick: u64, interval: u64, offset: u64) -> bool {
+    debug_assert!(interval > 0);
+    let offset = offset % interval;
+    tick >= offset && (tick - offset).is_multiple_of(interval)
+}
+
+fn browser_territorial_cleanup_samples(
+    tick: u64,
+    total_cells: usize,
+    nonempty_side_count: usize,
+    gameplay_rng: &mut GameplayRng,
+) -> (Vec<usize>, Vec<usize>) {
+    debug_assert!(total_cells > 0);
+    let occupancy_count = usize::from(simulation_phase_due(
+        tick,
+        OCCUPANCY_SMOOTH_INTERVAL,
+        OCCUPANCY_SMOOTH_OFFSET,
+    )) * OCCUPANCY_SMOOTH_SAMPLES;
+    let integrity_count = if simulation_phase_due(
+        tick,
+        TERRITORIAL_INTEGRITY_INTERVAL,
+        TERRITORIAL_INTEGRITY_OFFSET,
+    ) {
+        let optimization_factor = (nonempty_side_count as f64 / 2.0).max(1.0);
+        ((TERRITORIAL_INTEGRITY_BASE_SAMPLES as f64 / optimization_factor).floor() as usize)
+            .max(TERRITORIAL_INTEGRITY_MIN_SAMPLES)
+    } else {
+        0
+    };
+    let mut draw_samples = |count: usize| {
+        (0..count)
+            .map(|_| (gameplay_rng.next_f64() * total_cells as f64).floor() as usize)
+            .collect::<Vec<_>>()
+    };
+    let occupancy = draw_samples(occupancy_count);
+    let integrity = draw_samples(integrity_count);
+    (occupancy, integrity)
+}
+
 fn browser_influence_sources(
     units: &[SimulationUnit],
     policies: &BTreeMap<u64, RuntimeUnitPolicy>,
@@ -1746,6 +1818,7 @@ struct StagedInfluenceTick {
     schedule: Option<InfluenceSchedule>,
     diffusion_budget: usize,
     diffusion: DiffusionQueueResult,
+    territorial_cleanup: TerritorialCleanupResult,
 }
 
 struct StagedCommandPolicies {
@@ -4072,7 +4145,7 @@ impl NativeRuntime {
                     None,
                 )
             };
-            let (transaction, diffusion_budget, diffusion) = if dynamic_influence {
+            let (mut transaction, diffusion_budget, diffusion) = if dynamic_influence {
                 let (_, diffusion_budget) = browser_influence_budgets(influence_sides.len());
                 let (transaction, diffusion) = self.territory.apply_influence_runtime_staged(
                     &sources,
@@ -4087,12 +4160,34 @@ impl NativeRuntime {
                     DiffusionQueueResult::default(),
                 )
             };
+            let territorial_cleanup = if dynamic_influence {
+                let (occupancy_samples, integrity_samples) = browser_territorial_cleanup_samples(
+                    next_tick,
+                    self.territory.land().len(),
+                    influence_sides.len(),
+                    &mut staged_gameplay_rng,
+                );
+                match self.territory.apply_territorial_cleanup_staged(
+                    &mut transaction,
+                    &occupancy_samples,
+                    &integrity_samples,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.territory.rollback_influence_transaction(transaction);
+                        return Err(RuntimeError::Territory(error));
+                    }
+                }
+            } else {
+                TerritorialCleanupResult::default()
+            };
             staged_influence = Some(StagedInfluenceTick {
                 transaction,
                 source_count: sources.len(),
                 schedule,
                 diffusion_budget,
                 diffusion,
+                territorial_cleanup,
             });
             match self.stage_battlefield_tick(
                 next_tick,
@@ -4130,17 +4225,35 @@ impl NativeRuntime {
                 influence_sides.len(),
             )?;
             let (_, diffusion_budget) = browser_influence_budgets(influence_sides.len());
-            let (transaction, diffusion) = self.territory.apply_influence_runtime_staged(
+            let (mut transaction, diffusion) = self.territory.apply_influence_runtime_staged(
                 &sources,
                 &influence_sides,
                 diffusion_budget,
             )?;
+            let (occupancy_samples, integrity_samples) = browser_territorial_cleanup_samples(
+                next_tick,
+                self.territory.land().len(),
+                influence_sides.len(),
+                &mut staged_gameplay_rng,
+            );
+            let territorial_cleanup = match self.territory.apply_territorial_cleanup_staged(
+                &mut transaction,
+                &occupancy_samples,
+                &integrity_samples,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.territory.rollback_influence_transaction(transaction);
+                    return Err(RuntimeError::Territory(error));
+                }
+            };
             staged_influence = Some(StagedInfluenceTick {
                 transaction,
                 source_count: sources.len(),
                 schedule: Some(schedule),
                 diffusion_budget,
                 diffusion,
+                territorial_cleanup,
             });
             None
         } else {
@@ -4907,6 +5020,7 @@ impl NativeRuntime {
             influence_schedule,
             influence_diffusion_budget,
             influence_diffusion,
+            territorial_cleanup,
         ) = if let Some(staged) = staged_influence.take() {
             (
                 staged.transaction.result().clone(),
@@ -4914,6 +5028,7 @@ impl NativeRuntime {
                 staged.schedule,
                 staged.diffusion_budget,
                 staged.diffusion,
+                staged.territorial_cleanup,
             )
         } else {
             let sources =
@@ -4941,6 +5056,7 @@ impl NativeRuntime {
                 None,
                 0,
                 DiffusionQueueResult::default(),
+                TerritorialCleanupResult::default(),
             )
         };
 
@@ -5463,6 +5579,7 @@ impl NativeRuntime {
                 }),
             attrition: attrition_counters,
             influence: influence_counters,
+            territorial_cleanup: territorial_cleanup_counters(&territorial_cleanup),
             census,
             strategic: strategic_counters,
             strategic_derivation: derivation_counters,
@@ -6534,17 +6651,114 @@ mod tests {
         .unwrap()
     }
 
-    fn runtime_checkpoint(state: NativeRuntimeCheckpointState) -> RuntimeCheckpoint {
+    fn dynamic_influence_fixture(tick: u64) -> NativeRuntime {
+        let mut runtime = fixture(tick, false);
+        for policy in runtime.unit_policies.values_mut() {
+            policy
+                .influence
+                .as_mut()
+                .expect("fixture policies stamp influence")
+                .browser_temporal_seed = Some(policy.unit_id as f64);
+        }
+        runtime.territory.enable_influence_runtime();
+        runtime
+    }
+
+    #[test]
+    fn territorial_cleanup_sampling_matches_browser_phases_budgets_and_rng_draws() {
+        let mut rng = GameplayRng::new(17);
+        let initial = rng.state();
+        let (occupancy, integrity) = browser_territorial_cleanup_samples(66, 8, 2, &mut rng);
+        assert!(occupancy.is_empty());
+        assert!(integrity.is_empty());
+        assert_eq!(rng.state(), initial);
+
+        let (occupancy, integrity) = browser_territorial_cleanup_samples(67, 8, 2, &mut rng);
+        assert!(occupancy.is_empty());
+        assert_eq!(integrity.len(), TERRITORIAL_INTEGRITY_BASE_SAMPLES);
+        assert!(integrity.iter().all(|&cell| cell < 8));
+
+        let state_after_integrity = rng.state();
+        let (occupancy, integrity) = browser_territorial_cleanup_samples(83, 8, 2, &mut rng);
+        assert_eq!(occupancy.len(), OCCUPANCY_SMOOTH_SAMPLES);
+        assert!(integrity.is_empty());
+        assert!(occupancy.iter().all(|&cell| cell < 8));
+
+        let mut expected = GameplayRng::restore(state_after_integrity);
+        for _ in 0..OCCUPANCY_SMOOTH_SAMPLES {
+            expected.next_u32();
+        }
+        assert_eq!(rng.state(), expected.state());
+
+        let (_, optimized) = browser_territorial_cleanup_samples(267, 8, 20, &mut rng);
+        assert_eq!(optimized.len(), TERRITORIAL_INTEGRITY_MIN_SAMPLES);
+        assert!(simulation_phase_due(203, 120, 83));
+        assert!(!simulation_phase_due(202, 120, 83));
+        assert!(simulation_phase_due(267, 200, 67));
+    }
+
+    #[test]
+    fn territorial_cleanup_phase_resumes_exactly_across_checkpoint() {
+        let mut uninterrupted = dynamic_influence_fixture(65);
+        uninterrupted.step().unwrap();
+        let split = uninterrupted.checkpoint_state().unwrap();
+        let mut restored =
+            NativeRuntime::new(split.runtime_config, runtime_checkpoint(split)).unwrap();
+
+        let expected = uninterrupted.step().unwrap();
+        let actual = restored.step().unwrap();
+
+        assert_eq!(expected.tick, 67);
+        assert_eq!(actual.as_ref(), expected.as_ref());
+        assert_eq!(actual.counters.territorial_cleanup.occupancy_samples, 0);
+        assert_eq!(
+            actual.counters.territorial_cleanup.integrity_samples,
+            TERRITORIAL_INTEGRITY_BASE_SAMPLES
+        );
+        assert_eq!(
+            restored.territory.checkpoint_maps(),
+            uninterrupted.territory.checkpoint_maps()
+        );
+        assert_eq!(
+            restored.territory.influence_runtime_state(),
+            uninterrupted.territory.influence_runtime_state()
+        );
+    }
+
+    #[test]
+    fn failed_tick_rolls_back_due_cleanup_influence_rng_and_publication() {
+        let mut runtime = dynamic_influence_fixture(66);
+        let maps_before = runtime.territory.checkpoint_maps();
+        let influence_before = runtime.territory.influence_runtime_state();
+        let rng_before = runtime.gameplay_rng.state();
+        let publication_before = runtime.latest_snapshot();
+        runtime.config.front.max_grid_cells = 0;
+
+        assert!(matches!(runtime.step(), Err(RuntimeError::Front(_))));
+        assert_eq!(runtime.territory.checkpoint_maps(), maps_before);
+        assert_eq!(
+            runtime.territory.influence_runtime_state(),
+            influence_before
+        );
+        assert_eq!(runtime.gameplay_rng.state(), rng_before);
+        assert!(Arc::ptr_eq(&runtime.latest_snapshot(), &publication_before));
+    }
+
+    fn runtime_checkpoint(mut state: NativeRuntimeCheckpointState) -> RuntimeCheckpoint {
+        let mut territory =
+            TerritoryControl::restore(state.territory_config, state.territory_committed_state)
+                .unwrap();
+        if let Some(influence_runtime) = state.influence_runtime.take() {
+            territory
+                .restore_influence_runtime(influence_runtime)
+                .unwrap();
+        }
         RuntimeCheckpoint {
             tick: state.tick,
             frame: state.frame,
             war_grace_end: state.war_grace_end,
             simulation: Simulation::new(state.simulation_config, state.units).unwrap(),
-            territory: TerritoryControl::restore(
-                state.territory_config,
-                state.territory_committed_state,
-            )
-            .unwrap(),
+            territory,
             strategic: StrategicSimulation::restore(
                 state.strategic_cycle,
                 state.economies,

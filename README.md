@@ -15,7 +15,9 @@ reference while systems move into the renderer-independent `mw-core` crate.
 - production derivation from MWSC countries, current control, cities, and GDP
 - browser-compatible three-cohort influence scheduling, priority/regular
   frontier FIFOs, in-place Float32 diffusion, controller attribution,
-  dirty-tile rendering, and incremental census publication
+  dirty-tile rendering, incremental census publication, and browser-cadence
+  territorial cleanup (occupancy smoothing plus isolated-pocket/protrusion
+  decay)
 - atomic economy, occupation, resistance, capitulation, desertion, and treaty cycles
 - in-process desertion, capitulation transfer, occupation seeding, and clean
   terminal conflict-resolution consequences
@@ -144,6 +146,19 @@ radial damage within 0.5 degrees; explosions last 30 frames; and missile state
 is published immutably to observers. V12 continuation is exact. Older v1-v11
 checkpoints remain loadable without missile state; this does not claim broader
 full parity.
+
+Dynamic-influence runtime ticks also run the browser's territorial cleanup
+phases without adding a checkpoint schema: occupancy smoothing samples 5,000
+cells at tick offset 83 of each 120-tick period, freezes its decisions before
+applying them, and uses ascending numeric country ID to break equal counts.
+Territorial-integrity cleanup samples at tick offset 67 of each 200-tick period
+with `max(1000, floor(5000 / max(1, activeSides / 2)))` cells. It applies
+sequential Float32 influence decay to enemy pockets and isolated friendly
+protrusions. Both phases consume the shared gameplay RNG exactly, extend the
+same sparse rollback transaction as influence, and report immutable per-tick
+counters. Checkpoint v12 already persists the RNG cursor, live maps, and
+frontier state needed for exact continuation. Legacy v1/v2 influence behavior
+is intentionally unchanged.
 
 The browser exports v1 by default for compatibility. After a war has advanced,
 request the current v6 handoff explicitly from its console:

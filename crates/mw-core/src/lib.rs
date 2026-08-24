@@ -115,7 +115,8 @@ pub use runtime::{
     NativeRuntimeCheckpointState, RuntimeAirCounters, RuntimeAttritionCounters,
     RuntimeCensusCounters, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeError,
     RuntimeInfluenceCounters, RuntimeMissileCounters, RuntimeSnapshot, RuntimeState,
-    RuntimeStepCounters, RuntimeUnitPolicy, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
+    RuntimeStepCounters, RuntimeTerritorialCleanupCounters, RuntimeUnitPolicy, UnitAiPolicy,
+    UnitCommandPolicy, UnitInfluencePolicy,
 };
 pub use scenario::{
     DecodedScenario, GridSpec, ScenarioError, decode_mwsc, decode_mwsc_gzip, decode_mwsc_gzip_file,
