@@ -1609,6 +1609,9 @@ fn unit_deploying(policy: &RuntimeUnitPolicy, tick: u64) -> bool {
 pub struct RuntimeCheckpoint {
     pub tick: u64,
     pub frame: u64,
+    /// Operational execution timestamps are browser-frame coordinates when
+    /// true and legacy logical-tick coordinates when false.
+    pub operational_timers_use_frame: bool,
     pub war_grace_end: u64,
     pub simulation: Simulation,
     pub territory: TerritoryControl,
@@ -1654,6 +1657,7 @@ pub struct RuntimeCheckpoint {
 pub struct NativeRuntimeCheckpointState {
     pub tick: u64,
     pub frame: u64,
+    pub operational_timers_use_frame: bool,
     pub war_grace_end: u64,
     pub runtime_config: RuntimeConfig,
     pub simulation_config: SimulationConfig,
@@ -1691,6 +1695,7 @@ pub struct NativeRuntime {
     config: RuntimeConfig,
     tick: u64,
     frame: u64,
+    operational_timers_use_frame: bool,
     war_grace_end: u64,
     simulation: Simulation,
     territory: TerritoryControl,
@@ -3206,7 +3211,12 @@ impl NativeRuntime {
                     })
                 })
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
-            execution.validate_units(checkpoint.territory.max_sides(), &units, checkpoint.tick)?;
+            let operational_time = if checkpoint.operational_timers_use_frame {
+                checkpoint.frame
+            } else {
+                checkpoint.tick
+            };
+            execution.validate_units(checkpoint.territory.max_sides(), &units, operational_time)?;
         }
         if checkpoint.naval_planning.is_some()
             && (checkpoint.operations.is_none()
@@ -3361,6 +3371,7 @@ impl NativeRuntime {
             config,
             tick: checkpoint.tick,
             frame: checkpoint.frame,
+            operational_timers_use_frame: checkpoint.operational_timers_use_frame,
             war_grace_end: checkpoint.war_grace_end,
             simulation: checkpoint.simulation,
             territory: checkpoint.territory,
@@ -3422,6 +3433,28 @@ impl NativeRuntime {
         self.frame
     }
 
+    pub const fn operational_timers_use_frame(&self) -> bool {
+        self.operational_timers_use_frame
+    }
+
+    /// Upgrade legacy logical-tick operational lifecycle timestamps to the
+    /// browser frame coordinate before multi-subtick playback starts.
+    pub fn enable_browser_frame_timers(&mut self) {
+        if self.operational_timers_use_frame {
+            return;
+        }
+        if let Some(execution) = &mut self.operational_execution {
+            execution.rebase_timer_coordinates(self.tick, self.frame);
+        }
+        self.operational_timers_use_frame = true;
+        let mut latest = (*self.latest).clone();
+        latest.operational_execution_snapshot = self
+            .operational_execution
+            .as_ref()
+            .map(|execution| Arc::new(execution.clone()));
+        self.latest = Arc::new(latest);
+    }
+
     pub fn pending_render_updates(&self) -> usize {
         self.render_updates.len()
     }
@@ -3467,6 +3500,7 @@ impl NativeRuntime {
         Ok(NativeRuntimeCheckpointState {
             tick: self.tick,
             frame: self.frame,
+            operational_timers_use_frame: self.operational_timers_use_frame,
             war_grace_end: self.war_grace_end,
             runtime_config: self.config,
             simulation_config: self.simulation.config(),
@@ -4037,8 +4071,104 @@ impl NativeRuntime {
         })
     }
 
-    /// Advance one owned tick and frame. Publication is the final operation.
+    /// Advance one logical tick inside one browser frame.
+    ///
+    /// This compatibility entry point retains the historical one-tick call
+    /// contract while correcting the browser clock boundary: the tick observes
+    /// the current frame, then the published frame advances once.
     pub fn step(&mut self) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
+        self.advance_frame(1, true)
+    }
+
+    /// Advance one browser presentation frame with zero or more logical
+    /// subticks. Every subtick observes the same pre-increment frame value and
+    /// only the final immutable publication exposes the incremented frame.
+    ///
+    /// A zero-subtick frame is the browser's paused-RAF behavior.
+    /// Subticks commit individually, matching JavaScript execution: if a later
+    /// subtick errors, earlier ones remain committed but no frame-boundary
+    /// publication is returned. Worker callers therefore treat such an error
+    /// as fatal instead of retrying the partially executed frame.
+    pub fn advance_browser_frame(
+        &mut self,
+        logical_subticks: u8,
+    ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
+        self.advance_frame(logical_subticks, false)
+    }
+
+    /// Advance one hidden-tab background interval. Unlike the foreground RAF,
+    /// the browser increments its frame after breaking out of a terminal
+    /// subtick, so this retains that final boundary.
+    pub fn advance_browser_background_frame(
+        &mut self,
+        logical_subticks: u8,
+    ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
+        self.advance_frame(logical_subticks, true)
+    }
+
+    fn advance_frame(
+        &mut self,
+        logical_subticks: u8,
+        publish_terminal_frame: bool,
+    ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
+        match self.state {
+            RuntimeState::Running => {}
+            RuntimeState::AwaitingStrategicEffects { cycle, tick, .. } => {
+                return Err(RuntimeError::AwaitingStrategicEffects { cycle, tick });
+            }
+            RuntimeState::ConflictResolved { cycle, tick, .. } => {
+                return Err(RuntimeError::ConflictResolved { cycle, tick });
+            }
+            RuntimeState::Poisoned => return Err(RuntimeError::Poisoned),
+        }
+        let frame_for_tick = self.frame;
+        let published_frame = frame_for_tick
+            .checked_add(1)
+            .ok_or(RuntimeError::ClockOverflow)?;
+        self.tick
+            .checked_add(u64::from(logical_subticks))
+            .ok_or(RuntimeError::ClockOverflow)?;
+
+        let mut published = self.latest.clone();
+        for _ in 0..logical_subticks {
+            published = self.step_logical_tick(frame_for_tick)?;
+            if !matches!(self.state, RuntimeState::Running) {
+                break;
+            }
+        }
+
+        // Logical subticks commit independently like the browser simulation,
+        // but renderer state crosses the worker boundary only once per frame.
+        // Coalescing the territory dirtiness here prevents an intermediate
+        // high-speed subtick from becoming a separately observable delta.
+        let queued_before = self.render_updates.len();
+        if let Some(update) = self.territory.drain_render_update() {
+            self.render_updates.push_back(update);
+        }
+
+        // Browser updateLoop returns immediately when a tick resolves the war,
+        // before incrementing simFrameCount. The one-step compatibility API
+        // retains its historical tick/frame lockstep at that final boundary.
+        let published_frame = if !publish_terminal_frame
+            && matches!(self.state, RuntimeState::ConflictResolved { .. })
+        {
+            frame_for_tick
+        } else {
+            published_frame
+        };
+        self.frame = published_frame;
+        let mut boundary = (*published).clone();
+        boundary.frame = published_frame;
+        boundary.counters.render_updates_enqueued = self.render_updates.len() - queued_before;
+        boundary.pending_render_updates = self.render_updates.len();
+        self.latest = Arc::new(boundary);
+        Ok(self.latest.clone())
+    }
+
+    fn step_logical_tick(
+        &mut self,
+        frame_for_tick: u64,
+    ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
         match self.state {
             RuntimeState::Running => {}
             RuntimeState::AwaitingStrategicEffects { cycle, tick, .. } => {
@@ -4054,10 +4184,11 @@ impl NativeRuntime {
             .tick
             .checked_add(1)
             .ok_or(RuntimeError::ClockOverflow)?;
-        let next_frame = self
-            .frame
-            .checked_add(1)
-            .ok_or(RuntimeError::ClockOverflow)?;
+        let operational_time = if self.operational_timers_use_frame {
+            frame_for_tick
+        } else {
+            next_tick
+        };
         let mut staged_operations = self.operations.clone();
         if let Some(operations) = &mut staged_operations {
             operations.pre_tick(next_tick);
@@ -4109,7 +4240,7 @@ impl NativeRuntime {
         });
         let pre_influence_battlefield = self.stage_battlefield_tick(
             next_tick,
-            next_frame,
+            frame_for_tick,
             &self.territory,
             &hostile_controlled_land,
             staged_side_dynamics.as_ref(),
@@ -4196,7 +4327,7 @@ impl NativeRuntime {
             });
             match self.stage_battlefield_tick(
                 next_tick,
-                next_frame,
+                frame_for_tick,
                 &self.territory,
                 &hostile_controlled_land,
                 staged_side_dynamics.as_ref(),
@@ -4559,6 +4690,7 @@ impl NativeRuntime {
                 let originated = rollback_try!(planner.advance(
                     NavalPlanningInput {
                         tick: next_tick,
+                        execution_tick: operational_time,
                         units: &units,
                         operations: staged_operations.as_ref(),
                         execution,
@@ -4584,7 +4716,7 @@ impl NativeRuntime {
                 &self.diplomacy.hostility,
                 self.territory.max_sides(),
             ));
-            let outcome = rollback_try!(execution.advance(next_tick, &units, &threats));
+            let outcome = rollback_try!(execution.advance(operational_time, &units, &threats));
             Some(outcome)
         } else {
             None
@@ -4885,7 +5017,7 @@ impl NativeRuntime {
         inactive_unit_ids.sort_unstable();
         let simulation_result = self.simulation.step(TickInput {
             tick: next_tick,
-            frame: next_frame,
+            frame: frame_for_tick,
             war_grace_end: self.war_grace_end,
             world: simulation_world,
             hostility: HostilityMatrix::new(
@@ -4941,7 +5073,7 @@ impl NativeRuntime {
                 if !damages.is_empty() {
                     frame_snapshot.units = self
                         .simulation
-                        .initial_snapshot(next_tick, next_frame)
+                        .initial_snapshot(next_tick, frame_for_tick)
                         .units;
                 }
                 (Some(outcome), damages)
@@ -5156,7 +5288,7 @@ impl NativeRuntime {
                 .active_sides
                 .retain(|side| active_sides.contains(side));
             if let Some(simulation) = effects.simulation {
-                let consequence_snapshot = simulation.initial_snapshot(next_tick, next_frame);
+                let consequence_snapshot = simulation.initial_snapshot(next_tick, frame_for_tick);
                 let mut removed_ids = frame_snapshot.removed_ids.to_vec();
                 removed_ids.extend(effects.removed_ids);
                 removed_ids.sort_unstable();
@@ -5297,9 +5429,11 @@ impl NativeRuntime {
                 .map(|unit| (unit.unit_id, *unit))
                 .collect::<BTreeMap<_, _>>();
             execution.retain_live_units(&committed_by_id);
-            if let Err(error) =
-                execution.validate(self.territory.max_sides(), &committed_by_id, next_tick)
-            {
+            if let Err(error) = execution.validate(
+                self.territory.max_sides(),
+                &committed_by_id,
+                operational_time,
+            ) {
                 self.state = RuntimeState::Poisoned;
                 return Err(RuntimeError::OperationalExecution(error));
             }
@@ -5385,7 +5519,7 @@ impl NativeRuntime {
             if let Some(reinforcement) = &mut staged_reinforcement {
                 stage_recruitment(
                     next_tick,
-                    next_frame,
+                    frame_for_tick,
                     staged_material_simulation
                         .as_ref()
                         .unwrap_or(&self.simulation),
@@ -5418,7 +5552,7 @@ impl NativeRuntime {
             self.simulation = simulation;
             frame_snapshot.units = self
                 .simulation
-                .initial_snapshot(next_tick, next_frame)
+                .initial_snapshot(next_tick, frame_for_tick)
                 .units;
         }
         if !staged_recruitment.units.is_empty() {
@@ -5426,7 +5560,7 @@ impl NativeRuntime {
                 .insert_units_atomic(staged_recruitment.units.clone())?;
             frame_snapshot.units = self
                 .simulation
-                .initial_snapshot(next_tick, next_frame)
+                .initial_snapshot(next_tick, frame_for_tick)
                 .units;
         }
         reinforcement_counters.recruited_units = staged_recruitment.counters.recruited_units;
@@ -5538,13 +5672,8 @@ impl NativeRuntime {
         self.gameplay_rng = staged_gameplay_rng;
         self.personnel_reserves = staged_personnel_reserves;
         self.tick = next_tick;
-        self.frame = next_frame;
         self.state = next_state;
 
-        let queued_before = self.render_updates.len();
-        if let Some(update) = self.territory.drain_render_update() {
-            self.render_updates.push_back(update);
-        }
         let segments = if strategic_fronts_invalidated {
             0
         } else {
@@ -5588,7 +5717,7 @@ impl NativeRuntime {
             census,
             strategic: strategic_counters,
             strategic_derivation: derivation_counters,
-            render_updates_enqueued: self.render_updates.len() - queued_before,
+            render_updates_enqueued: 0,
         };
         let published = Arc::new(RuntimeSnapshot {
             schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
@@ -6622,6 +6751,7 @@ mod tests {
             RuntimeCheckpoint {
                 tick,
                 frame: tick,
+                operational_timers_use_frame: false,
                 war_grace_end: u64::MAX,
                 simulation,
                 territory,
@@ -6667,6 +6797,39 @@ mod tests {
         }
         runtime.territory.enable_influence_runtime();
         runtime
+    }
+
+    #[test]
+    fn browser_frame_batches_share_preincrement_frame_and_publish_once() {
+        let mut runtime = fixture(0, false);
+        let queued_before = runtime.pending_render_updates();
+        let published = runtime.advance_browser_frame(2).unwrap();
+
+        assert_eq!(published.tick, 2);
+        assert_eq!(published.frame, 1);
+        assert_eq!(published.frame_snapshot.tick, 2);
+        assert_eq!(published.frame_snapshot.frame, 0);
+        assert_eq!(runtime.tick(), 2);
+        assert_eq!(runtime.frame(), 1);
+        assert_eq!(runtime.pending_render_updates(), queued_before + 1);
+        assert_eq!(published.counters.render_updates_enqueued, 1);
+
+        let next = runtime.step().unwrap();
+        assert_eq!((next.tick, next.frame), (3, 2));
+        assert_eq!(next.frame_snapshot.frame, 1);
+    }
+
+    #[test]
+    fn paused_browser_frame_advances_only_the_frame_clock() {
+        let mut runtime = fixture(7, false);
+        let before = runtime.latest_snapshot();
+        let published = runtime.advance_browser_frame(0).unwrap();
+
+        assert_eq!(published.tick, before.tick);
+        assert_eq!(published.frame, before.frame + 1);
+        assert_eq!(published.frame_snapshot, before.frame_snapshot);
+        let checkpoint = runtime.checkpoint_state().unwrap();
+        assert_eq!((checkpoint.tick, checkpoint.frame), (7, 8));
     }
 
     #[test]
@@ -6761,6 +6924,7 @@ mod tests {
         RuntimeCheckpoint {
             tick: state.tick,
             frame: state.frame,
+            operational_timers_use_frame: state.operational_timers_use_frame,
             war_grace_end: state.war_grace_end,
             simulation: Simulation::new(state.simulation_config, state.units).unwrap(),
             territory,
@@ -8276,7 +8440,7 @@ mod tests {
     }
 
     #[test]
-    fn live_influence_uses_precombat_state_then_excludes_the_next_tick() {
+    fn live_influence_preserves_browser_frame_zero_sentinel_then_excludes() {
         let mut base = fixture(0, false);
         base.war_grace_end = 0;
         base.simulation.units[0].combat.lng = 0.0;
@@ -8289,7 +8453,12 @@ mod tests {
         assert_eq!(first.counters.influence.sources, 2);
 
         let second = runtime.step().unwrap();
-        assert_eq!(second.counters.influence.sources, 0);
+        // Browser guards the timestamp with JavaScript truthiness. A combat at
+        // frame zero therefore remains the sentinel until frame one records
+        // the next engagement.
+        assert_eq!(second.counters.influence.sources, 2);
+        let third = runtime.step().unwrap();
+        assert_eq!(third.counters.influence.sources, 0);
     }
 
     #[test]
@@ -9018,14 +9187,48 @@ mod tests {
         let mut runtime = fixture(PAY_CYCLE_TICKS - 1, false);
         runtime.diplomacy.active_sides = vec![0];
 
+        let frame_before = runtime.frame();
         let terminal = runtime.step().unwrap();
         let RuntimeState::ConflictResolved { resolution, .. } = terminal.state else {
             panic!("expected resolved conflict");
         };
         assert!(resolution.stop_simulation);
+        assert_eq!(terminal.frame, frame_before + 1);
         assert!(matches!(
             runtime.step(),
             Err(RuntimeError::ConflictResolved { .. })
         ));
+    }
+
+    #[test]
+    fn browser_conflict_resolution_returns_before_incrementing_frame() {
+        let mut runtime = fixture(PAY_CYCLE_TICKS - 1, false);
+        runtime.diplomacy.active_sides = vec![0];
+
+        let frame_before = runtime.frame();
+        let terminal = runtime.advance_browser_frame(1).unwrap();
+        assert!(matches!(
+            terminal.state,
+            RuntimeState::ConflictResolved { .. }
+        ));
+        assert_eq!(terminal.frame, frame_before);
+        assert_eq!(terminal.frame_snapshot.frame, frame_before);
+        assert_eq!(runtime.frame(), frame_before);
+    }
+
+    #[test]
+    fn browser_background_conflict_resolution_increments_frame_after_break() {
+        let mut runtime = fixture(PAY_CYCLE_TICKS - 1, false);
+        runtime.diplomacy.active_sides = vec![0];
+
+        let frame_before = runtime.frame();
+        let terminal = runtime.advance_browser_background_frame(3).unwrap();
+        assert!(matches!(
+            terminal.state,
+            RuntimeState::ConflictResolved { .. }
+        ));
+        assert_eq!(terminal.frame, frame_before + 1);
+        assert_eq!(terminal.frame_snapshot.frame, frame_before);
+        assert_eq!(runtime.frame(), frame_before + 1);
     }
 }

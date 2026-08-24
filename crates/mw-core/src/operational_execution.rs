@@ -294,6 +294,34 @@ impl OperationalExecutionState {
         }
     }
 
+    /// Rebase persisted lifecycle timestamps while preserving their elapsed
+    /// age at a checkpoint boundary. This upgrades legacy native logical-tick
+    /// timers into browser-frame timers before batched playback begins.
+    pub fn rebase_timer_coordinates(&mut self, source_now: u64, target_now: u64) {
+        // Zero is also the browser's falsy "not yet recorded" sentinel and
+        // must remain zero instead of becoming a synthetic historical time.
+        let rebase = |value: u64| {
+            if value == 0 {
+                0
+            } else {
+                target_now.saturating_sub(source_now.saturating_sub(value))
+            }
+        };
+        for operation in &mut self.naval_operations {
+            operation.started_tick = rebase(operation.started_tick);
+            operation.phase_started_tick = rebase(operation.phase_started_tick);
+            operation.last_progress_tick = rebase(operation.last_progress_tick);
+            for member in &mut operation.members {
+                member.assigned_tick = rebase(member.assigned_tick);
+            }
+        }
+        for reaction in &mut self.defender_reactions {
+            reaction.started_tick = rebase(reaction.started_tick);
+            reaction.last_progress_tick = rebase(reaction.last_progress_tick);
+            reaction.landing_defeated_tick = reaction.landing_defeated_tick.map(rebase);
+        }
+    }
+
     pub fn snapshot(&self) -> Self {
         self.clone()
     }
@@ -2069,5 +2097,80 @@ mod tests {
         assert_eq!(counters.defender_member_references_pruned, 1);
         assert_eq!(state.naval_operations[0].members[0].unit_id, 2);
         assert_eq!(state.defender_reactions[0].last_progress_tick, 0);
+    }
+
+    #[test]
+    fn timer_rebase_preserves_elapsed_ages_in_both_coordinate_systems() {
+        let mut naval = operation(NavalOperationKind::Invasion, &[1]);
+        naval.started_tick = 90;
+        naval.phase_started_tick = 95;
+        naval.last_progress_tick = 98;
+        naval.members[0].assigned_tick = 91;
+        naval.members.push(NavalMember {
+            unit_id: 3,
+            role: "RESERVE".to_owned(),
+            assigned_tick: 0,
+        });
+        let mut state = state_with(naval);
+        state.defender_reactions.push(DefenderReaction {
+            id: "reaction-1-1".to_owned(),
+            sequence: 1,
+            threat_signature: "threat-1".to_owned(),
+            side: 1,
+            enemy_side: 0,
+            kind: DefenderReactionKind::Landing,
+            target: point(0.0, 0.0),
+            unit_ids: vec![2],
+            max_units: 1,
+            started_tick: 80,
+            last_progress_tick: 99,
+            best_distance_squared: None,
+            landing_defeated_tick: Some(85),
+        });
+        state.next_reaction_sequence = 2;
+
+        state.rebase_timer_coordinates(100, 40);
+        let operation = &state.naval_operations[0];
+        assert_eq!(
+            (
+                operation.started_tick,
+                operation.phase_started_tick,
+                operation.last_progress_tick,
+                operation.members[0].assigned_tick,
+            ),
+            (30, 35, 38, 31)
+        );
+        assert_eq!(operation.members[1].assigned_tick, 0);
+        let reaction = &state.defender_reactions[0];
+        assert_eq!(
+            (
+                reaction.started_tick,
+                reaction.last_progress_tick,
+                reaction.landing_defeated_tick,
+            ),
+            (20, 39, Some(25))
+        );
+
+        state.rebase_timer_coordinates(40, 100);
+        let operation = &state.naval_operations[0];
+        assert_eq!(
+            (
+                operation.started_tick,
+                operation.phase_started_tick,
+                operation.last_progress_tick,
+                operation.members[0].assigned_tick,
+            ),
+            (90, 95, 98, 91)
+        );
+        assert_eq!(operation.members[1].assigned_tick, 0);
+        let reaction = &state.defender_reactions[0];
+        assert_eq!(
+            (
+                reaction.started_tick,
+                reaction.last_progress_tick,
+                reaction.landing_defeated_tick,
+            ),
+            (80, 99, Some(85))
+        );
     }
 }

@@ -734,6 +734,10 @@ pub fn bootstrap_native_war(
         RuntimeCheckpoint {
             tick: 0,
             frame: 0,
+            // The bootstrap is scheduler-neutral. Windowed browser playback
+            // upgrades this before its first frame; exact-step headless runs
+            // retain the legacy tick coordinate for split-save compatibility.
+            operational_timers_use_frame: false,
             war_grace_end: config.war_grace_end,
             simulation,
             territory,

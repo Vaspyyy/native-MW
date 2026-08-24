@@ -84,7 +84,10 @@ pub struct NavalTopology {
 
 #[derive(Clone, Copy)]
 pub struct NavalPlanningInput<'a> {
+    /// Logical simulation tick used for reassessment cadence.
     pub tick: u64,
+    /// Browser-frame time used by operational execution lifecycle timers.
+    pub execution_tick: u64,
     pub units: &'a [ExecutionUnitInput],
     pub operations: Option<&'a OperationalRuntimeState>,
     pub execution: &'a OperationalExecutionState,
@@ -467,7 +470,7 @@ impl NavalPlanningState {
             let sequence = self.take_sequence()?;
             return Ok(Some(build_operation(
                 sequence,
-                input.tick,
+                input.execution_tick,
                 NavalOperationKind::Invasion,
                 side,
                 Some(target.side),
@@ -569,7 +572,7 @@ impl NavalPlanningState {
         let sequence = self.take_sequence()?;
         Ok(Some(build_operation(
             sequence,
-            input.tick,
+            input.execution_tick,
             NavalOperationKind::Supply,
             side,
             None,
@@ -657,7 +660,7 @@ impl NavalPlanningState {
         let sequence = self.take_sequence()?;
         Ok(Some(build_operation(
             sequence,
-            input.tick,
+            input.execution_tick,
             NavalOperationKind::FastTransport,
             side,
             None,
@@ -1217,6 +1220,7 @@ mod tests {
             .advance(
                 NavalPlanningInput {
                     tick: 150,
+                    execution_tick: 42,
                     units: &units,
                     operations: None,
                     execution: &execution,
@@ -1235,6 +1239,15 @@ mod tests {
         assert_eq!(operation.kind, NavalOperationKind::Invasion);
         assert_eq!(operation.phase, NavalOperationPhase::Gathering);
         assert_eq!(operation.members.len(), 5);
+        assert_eq!(operation.started_tick, 42);
+        assert_eq!(operation.phase_started_tick, 42);
+        assert_eq!(operation.last_progress_tick, 42);
+        assert!(
+            operation
+                .members
+                .iter()
+                .all(|member| member.assigned_tick == 42)
+        );
         assert!(!operation.route.is_empty());
         assert!(
             operation
@@ -1248,6 +1261,7 @@ mod tests {
             .advance(
                 NavalPlanningInput {
                     tick: 450,
+                    execution_tick: 450,
                     units: &units,
                     operations: None,
                     execution: &execution,
@@ -1283,6 +1297,7 @@ mod tests {
         let mut resumed_workspace = NavalRouteWorkspace::default();
         let input = NavalPlanningInput {
             tick: 150,
+            execution_tick: 150,
             units: &units,
             operations: None,
             execution: &execution,
@@ -1382,6 +1397,7 @@ mod tests {
             .advance(
                 NavalPlanningInput {
                     tick: 150,
+                    execution_tick: 150,
                     units: &units,
                     operations: Some(&operations),
                     execution: &execution,

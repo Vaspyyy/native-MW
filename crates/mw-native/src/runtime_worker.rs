@@ -15,8 +15,8 @@ use std::{
 };
 
 use mw_core::{
-    NativeRuntime, NativeRuntimeCheckpointState, RuntimeSnapshot, RuntimeState,
-    TerritoryRenderUpdate,
+    BROWSER_MAX_SPEED, BROWSER_MIN_SPEED, BrowserClockMode, BrowserClockState, NativeRuntime,
+    NativeRuntimeCheckpointState, RuntimeSnapshot, RuntimeState, TerritoryRenderUpdate,
 };
 
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -42,6 +42,7 @@ pub enum RuntimeWorkerError {
     ZeroTickInterval,
     ZeroUpdateQueueCapacity,
     ZeroStepLimit,
+    InvalidBrowserClock,
     Spawn(std::io::Error),
 }
 
@@ -55,6 +56,9 @@ impl std::fmt::Display for RuntimeWorkerError {
                 formatter.write_str("runtime worker update queue capacity must be nonzero")
             }
             Self::ZeroStepLimit => formatter.write_str("runtime worker step limit must be nonzero"),
+            Self::InvalidBrowserClock => {
+                formatter.write_str("runtime worker browser clock is invalid")
+            }
             Self::Spawn(error) => write!(formatter, "failed to spawn runtime worker: {error}"),
         }
     }
@@ -74,9 +78,22 @@ impl std::error::Error for RuntimeWorkerCheckpointError {}
 enum RuntimeWorkerControl {
     Stop,
     Checkpoint(Sender<Result<NativeRuntimeCheckpointState, RuntimeWorkerCheckpointError>>),
+    CheckpointWithClock(Sender<Result<RuntimeWorkerCheckpoint, RuntimeWorkerCheckpointError>>),
     Pause,
     Resume,
+    #[allow(dead_code)]
     SetTickInterval(Duration),
+    SetPlaybackSpeed(u8),
+    SetClockSchedule {
+        mode: BrowserClockMode,
+        interval: Duration,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeWorkerCheckpoint {
+    pub runtime: NativeRuntimeCheckpointState,
+    pub browser_clock: Option<BrowserClockState>,
 }
 
 /// Nonterminal acknowledgement emitted after a live control takes effect at a published runtime
@@ -97,6 +114,17 @@ pub enum RuntimeWorkerControlEvent {
         tick: u64,
         frame: u64,
     },
+    PlaybackSpeedChanged {
+        speed: u8,
+        tick: u64,
+        frame: u64,
+    },
+    ClockScheduleChanged {
+        mode: BrowserClockMode,
+        interval: Duration,
+        tick: u64,
+        frame: u64,
+    },
     /// The worker has entered terminal/checkpoint-service mode and rejected a live control.
     Unavailable {
         tick: u64,
@@ -107,6 +135,7 @@ pub enum RuntimeWorkerControlEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeWorkerControlError {
     ZeroTickInterval,
+    InvalidPlaybackSpeed,
     Stopped,
 }
 
@@ -120,6 +149,9 @@ impl std::fmt::Display for RuntimeWorkerControlError {
         match self {
             Self::ZeroTickInterval => {
                 formatter.write_str("runtime worker tick interval must be nonzero")
+            }
+            Self::InvalidPlaybackSpeed => {
+                formatter.write_str("runtime worker playback speed must be between 1x and 3x")
             }
             Self::Stopped => formatter.write_str("runtime worker stopped"),
         }
@@ -153,11 +185,23 @@ pub struct RuntimeWorker {
     join: Option<JoinHandle<()>>,
 }
 
+enum WorkerSchedule {
+    LogicalSteps {
+        tick_interval: Duration,
+        max_steps: Option<u64>,
+    },
+    BrowserFrames {
+        frame_interval: Duration,
+        clock: BrowserClockState,
+    },
+}
+
 impl RuntimeWorker {
     /// Starts a named thread which exclusively owns `runtime`.
     ///
     /// `update_queue_capacity` must be nonzero.  It is intentionally bounded: territory changes
     /// are lossless and ordered, so slowing simulation is safer than consuming unlimited memory.
+    #[allow(dead_code)]
     pub fn spawn(
         runtime: NativeRuntime,
         tick_interval: Duration,
@@ -183,6 +227,50 @@ impl RuntimeWorker {
         if max_steps == Some(0) {
             return Err(RuntimeWorkerError::ZeroStepLimit);
         }
+        Self::spawn_scheduled(
+            runtime,
+            update_queue_capacity,
+            WorkerSchedule::LogicalSteps {
+                tick_interval,
+                max_steps,
+            },
+        )
+    }
+
+    /// Starts browser-equivalent foreground/background frame orchestration.
+    /// The interval is one browser presentation frame; speed controls determine
+    /// how many logical subticks share that frame.
+    pub fn spawn_browser(
+        mut runtime: NativeRuntime,
+        frame_interval: Duration,
+        update_queue_capacity: usize,
+        clock: BrowserClockState,
+    ) -> Result<Self, RuntimeWorkerError> {
+        if frame_interval.is_zero() {
+            return Err(RuntimeWorkerError::ZeroTickInterval);
+        }
+        if update_queue_capacity == 0 {
+            return Err(RuntimeWorkerError::ZeroUpdateQueueCapacity);
+        }
+        clock
+            .validate()
+            .map_err(|_| RuntimeWorkerError::InvalidBrowserClock)?;
+        runtime.enable_browser_frame_timers();
+        Self::spawn_scheduled(
+            runtime,
+            update_queue_capacity,
+            WorkerSchedule::BrowserFrames {
+                frame_interval,
+                clock,
+            },
+        )
+    }
+
+    fn spawn_scheduled(
+        runtime: NativeRuntime,
+        update_queue_capacity: usize,
+        schedule: WorkerSchedule,
+    ) -> Result<Self, RuntimeWorkerError> {
         let latest = Arc::new(Mutex::new(runtime.latest_snapshot()));
         let worker_latest = Arc::clone(&latest);
         let (message_tx, messages) = mpsc::sync_channel(update_queue_capacity);
@@ -193,18 +281,36 @@ impl RuntimeWorker {
             .name("mw-native-runtime".to_owned())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_worker(
-                        runtime,
-                        tick_interval,
-                        worker_latest,
-                        message_tx,
-                        RuntimeWorkerEventSenders {
-                            status: status_tx.clone(),
-                            control: control_event_tx,
-                        },
-                        control_rx,
-                        max_steps,
-                    );
+                    let events = RuntimeWorkerEventSenders {
+                        status: status_tx.clone(),
+                        control: control_event_tx,
+                    };
+                    match schedule {
+                        WorkerSchedule::LogicalSteps {
+                            tick_interval,
+                            max_steps,
+                        } => run_worker(
+                            runtime,
+                            tick_interval,
+                            worker_latest,
+                            message_tx,
+                            events,
+                            control_rx,
+                            max_steps,
+                        ),
+                        WorkerSchedule::BrowserFrames {
+                            frame_interval,
+                            clock,
+                        } => run_browser_worker(
+                            runtime,
+                            frame_interval,
+                            clock,
+                            worker_latest,
+                            message_tx,
+                            events,
+                            control_rx,
+                        ),
+                    }
                 }));
                 if let Err(payload) = result {
                     let _ = status_tx.send(RuntimeWorkerStatus::Panicked(panic_message(payload)));
@@ -259,6 +365,7 @@ impl RuntimeWorker {
 
     /// Changes the live tick interval without blocking the caller. The new interval starts when
     /// the worker applies the command at a published boundary.
+    #[allow(dead_code)]
     pub fn request_tick_interval(
         &self,
         interval: Duration,
@@ -267,6 +374,24 @@ impl RuntimeWorker {
             return Err(RuntimeWorkerControlError::ZeroTickInterval);
         }
         self.send_control(RuntimeWorkerControl::SetTickInterval(interval))
+    }
+
+    pub fn request_playback_speed(&self, speed: u8) -> Result<(), RuntimeWorkerControlError> {
+        if !(BROWSER_MIN_SPEED..=BROWSER_MAX_SPEED).contains(&speed) {
+            return Err(RuntimeWorkerControlError::InvalidPlaybackSpeed);
+        }
+        self.send_control(RuntimeWorkerControl::SetPlaybackSpeed(speed))
+    }
+
+    pub fn request_clock_schedule(
+        &self,
+        mode: BrowserClockMode,
+        interval: Duration,
+    ) -> Result<(), RuntimeWorkerControlError> {
+        if interval.is_zero() {
+            return Err(RuntimeWorkerControlError::ZeroTickInterval);
+        }
+        self.send_control(RuntimeWorkerControl::SetClockSchedule { mode, interval })
     }
 
     /// Receives one nonterminal live-control acknowledgement without blocking.
@@ -291,6 +416,18 @@ impl RuntimeWorker {
         let (reply, result) = mpsc::channel();
         self.control
             .send(RuntimeWorkerControl::Checkpoint(reply))
+            .map_err(|_| RuntimeWorkerCheckpointError("runtime worker stopped".to_owned()))?;
+        result
+            .recv()
+            .map_err(|_| RuntimeWorkerCheckpointError("runtime worker stopped".to_owned()))?
+    }
+
+    pub fn checkpoint_with_clock(
+        &self,
+    ) -> Result<RuntimeWorkerCheckpoint, RuntimeWorkerCheckpointError> {
+        let (reply, result) = mpsc::channel();
+        self.control
+            .send(RuntimeWorkerControl::CheckpointWithClock(reply))
             .map_err(|_| RuntimeWorkerCheckpointError("runtime worker stopped".to_owned()))?;
         result
             .recv()
@@ -339,7 +476,7 @@ fn run_worker(
         let _ = events
             .status
             .send(RuntimeWorkerStatus::Terminal(runtime.state()));
-        serve_terminal(&mut runtime, &control, &events.control);
+        serve_terminal(&mut runtime, None, &control, &events.control);
         return;
     }
 
@@ -410,14 +547,137 @@ fn run_worker(
             let _ = events.status.send(RuntimeWorkerStatus::Completed {
                 steps: completed_steps,
             });
-            serve_terminal(&mut runtime, &control, &events.control);
+            serve_terminal(&mut runtime, None, &control, &events.control);
             return;
         }
         if is_terminal_state(snapshot.state) {
             let _ = events
                 .status
                 .send(RuntimeWorkerStatus::Terminal(snapshot.state));
-            serve_terminal(&mut runtime, &control, &events.control);
+            serve_terminal(&mut runtime, None, &control, &events.control);
+            return;
+        }
+    }
+}
+
+fn run_browser_worker(
+    mut runtime: NativeRuntime,
+    frame_interval: Duration,
+    mut clock: BrowserClockState,
+    latest: Arc<Mutex<Arc<RuntimeSnapshot>>>,
+    messages: SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
+    events: RuntimeWorkerEventSenders,
+    control: Receiver<RuntimeWorkerControl>,
+) {
+    let initial_controls = match forward_initial_state_with_clock(
+        &mut runtime,
+        &messages,
+        &latest,
+        &control,
+        Some(clock),
+    ) {
+        Some(controls) => controls,
+        None => {
+            let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+            return;
+        }
+    };
+    if is_terminal_state(runtime.state()) {
+        let _ = events
+            .status
+            .send(RuntimeWorkerStatus::Terminal(runtime.state()));
+        serve_terminal(&mut runtime, Some(clock), &control, &events.control);
+        return;
+    }
+
+    let mut frame_interval = frame_interval;
+    let mut due_at = Instant::now();
+    for request in initial_controls {
+        if apply_browser_control(
+            request,
+            &mut runtime,
+            &mut due_at,
+            &mut frame_interval,
+            &mut clock,
+            &events.control,
+        ) {
+            let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+            return;
+        }
+    }
+
+    loop {
+        if wait_until_browser_due(
+            &mut runtime,
+            &mut due_at,
+            &mut frame_interval,
+            &mut clock,
+            &events.control,
+            &control,
+        ) {
+            let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+            return;
+        }
+
+        // The foreground RAF still owns a frame while paused. The browser's
+        // hidden-tab interval instead returns before simFrameCount advances.
+        if clock.paused && clock.mode == BrowserClockMode::Background {
+            due_at = next_due(due_at, frame_interval, Instant::now());
+            continue;
+        }
+
+        let mut staged_clock = clock;
+        let logical_subticks = staged_clock.admit_frame();
+        let advanced = match staged_clock.mode {
+            BrowserClockMode::Foreground => runtime.advance_browser_frame(logical_subticks),
+            BrowserClockMode::Background => {
+                runtime.advance_browser_background_frame(logical_subticks)
+            }
+        };
+        let snapshot = match advanced {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = events
+                    .status
+                    .send(RuntimeWorkerStatus::Failed(error.to_string()));
+                return;
+            }
+        };
+        clock = staged_clock;
+        let deferred = match forward_browser_frame(
+            &mut runtime,
+            snapshot.clone(),
+            &messages,
+            &latest,
+            &control,
+            clock,
+        ) {
+            Some(deferred) => deferred,
+            None => {
+                let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+                return;
+            }
+        };
+        due_at = next_due(due_at, frame_interval, Instant::now());
+        for request in deferred {
+            if apply_browser_control(
+                request,
+                &mut runtime,
+                &mut due_at,
+                &mut frame_interval,
+                &mut clock,
+                &events.control,
+            ) {
+                let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+                return;
+            }
+        }
+        if is_terminal_state(snapshot.state) {
+            clock.frame_accumulator = 0.0;
+            let _ = events
+                .status
+                .send(RuntimeWorkerStatus::Terminal(snapshot.state));
+            serve_terminal(&mut runtime, Some(clock), &control, &events.control);
             return;
         }
     }
@@ -425,6 +685,7 @@ fn run_worker(
 
 fn serve_terminal(
     runtime: &mut NativeRuntime,
+    browser_clock: Option<BrowserClockState>,
     control: &Receiver<RuntimeWorkerControl>,
     control_events: &Sender<RuntimeWorkerControlEvent>,
 ) {
@@ -438,9 +699,22 @@ fn serve_terminal(
                         .map_err(|error| RuntimeWorkerCheckpointError(error.to_string())),
                 );
             }
+            RuntimeWorkerControl::CheckpointWithClock(reply) => {
+                let _ = reply.send(
+                    runtime
+                        .checkpoint_state()
+                        .map(|runtime| RuntimeWorkerCheckpoint {
+                            runtime,
+                            browser_clock,
+                        })
+                        .map_err(|error| RuntimeWorkerCheckpointError(error.to_string())),
+                );
+            }
             RuntimeWorkerControl::Pause
             | RuntimeWorkerControl::Resume
-            | RuntimeWorkerControl::SetTickInterval(_) => {
+            | RuntimeWorkerControl::SetTickInterval(_)
+            | RuntimeWorkerControl::SetPlaybackSpeed(_)
+            | RuntimeWorkerControl::SetClockSchedule { .. } => {
                 let snapshot = runtime.latest_snapshot();
                 let _ = control_events.send(RuntimeWorkerControlEvent::Unavailable {
                     tick: snapshot.tick,
@@ -557,6 +831,18 @@ fn apply_live_control(
             );
             false
         }
+        RuntimeWorkerControl::CheckpointWithClock(reply) => {
+            let _ = reply.send(
+                runtime
+                    .checkpoint_state()
+                    .map(|runtime| RuntimeWorkerCheckpoint {
+                        runtime,
+                        browser_clock: None,
+                    })
+                    .map_err(|error| RuntimeWorkerCheckpointError(error.to_string())),
+            );
+            false
+        }
         RuntimeWorkerControl::Pause => {
             *paused = true;
             let _ = events.send(RuntimeWorkerControlEvent::Paused {
@@ -587,6 +873,147 @@ fn apply_live_control(
             });
             false
         }
+        RuntimeWorkerControl::SetPlaybackSpeed(_)
+        | RuntimeWorkerControl::SetClockSchedule { .. } => {
+            let _ = events.send(RuntimeWorkerControlEvent::Unavailable {
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
+    }
+}
+
+fn wait_until_browser_due(
+    runtime: &mut NativeRuntime,
+    due_at: &mut Instant,
+    frame_interval: &mut Duration,
+    clock: &mut BrowserClockState,
+    control_events: &Sender<RuntimeWorkerControlEvent>,
+    control: &Receiver<RuntimeWorkerControl>,
+) -> bool {
+    loop {
+        let remaining = due_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            match control.try_recv() {
+                Ok(request) => {
+                    if apply_browser_control(
+                        request,
+                        runtime,
+                        due_at,
+                        frame_interval,
+                        clock,
+                        control_events,
+                    ) {
+                        return true;
+                    }
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => return true,
+                Err(TryRecvError::Empty) => return false,
+            }
+        }
+        match control.recv_timeout(remaining) {
+            Ok(request) => {
+                if apply_browser_control(
+                    request,
+                    runtime,
+                    due_at,
+                    frame_interval,
+                    clock,
+                    control_events,
+                ) {
+                    return true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+            Err(mpsc::RecvTimeoutError::Timeout) => return false,
+        }
+    }
+}
+
+fn apply_browser_control(
+    request: RuntimeWorkerControl,
+    runtime: &mut NativeRuntime,
+    due_at: &mut Instant,
+    frame_interval: &mut Duration,
+    clock: &mut BrowserClockState,
+    events: &Sender<RuntimeWorkerControlEvent>,
+) -> bool {
+    let snapshot = runtime.latest_snapshot();
+    match request {
+        RuntimeWorkerControl::Stop => true,
+        RuntimeWorkerControl::Checkpoint(reply) => {
+            let _ = reply.send(
+                runtime
+                    .checkpoint_state()
+                    .map_err(|error| RuntimeWorkerCheckpointError(error.to_string())),
+            );
+            false
+        }
+        RuntimeWorkerControl::CheckpointWithClock(reply) => {
+            let _ = reply.send(
+                runtime
+                    .checkpoint_state()
+                    .map(|runtime| RuntimeWorkerCheckpoint {
+                        runtime,
+                        browser_clock: Some(*clock),
+                    })
+                    .map_err(|error| RuntimeWorkerCheckpointError(error.to_string())),
+            );
+            false
+        }
+        RuntimeWorkerControl::Pause => {
+            clock.paused = true;
+            let _ = events.send(RuntimeWorkerControlEvent::Paused {
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
+        RuntimeWorkerControl::Resume => {
+            clock.paused = false;
+            let _ = events.send(RuntimeWorkerControlEvent::Resumed {
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
+        RuntimeWorkerControl::SetTickInterval(interval) => {
+            debug_assert!(!interval.is_zero());
+            *frame_interval = interval;
+            *due_at = Instant::now() + interval;
+            let _ = events.send(RuntimeWorkerControlEvent::TickIntervalChanged {
+                interval,
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
+        RuntimeWorkerControl::SetPlaybackSpeed(speed) => {
+            debug_assert!((BROWSER_MIN_SPEED..=BROWSER_MAX_SPEED).contains(&speed));
+            clock
+                .set_speed(speed)
+                .expect("validated browser playback speed");
+            let _ = events.send(RuntimeWorkerControlEvent::PlaybackSpeedChanged {
+                speed,
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
+        RuntimeWorkerControl::SetClockSchedule { mode, interval } => {
+            clock.mode = mode;
+            *frame_interval = interval;
+            *due_at = Instant::now() + interval;
+            let _ = events.send(RuntimeWorkerControlEvent::ClockScheduleChanged {
+                mode,
+                interval,
+                tick: snapshot.tick,
+                frame: snapshot.frame,
+            });
+            false
+        }
     }
 }
 
@@ -597,8 +1024,18 @@ fn forward_initial_state(
     latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
     control: &Receiver<RuntimeWorkerControl>,
 ) -> Option<Vec<RuntimeWorkerControl>> {
+    forward_initial_state_with_clock(runtime, messages, latest, control, None)
+}
+
+fn forward_initial_state_with_clock(
+    runtime: &mut NativeRuntime,
+    messages: &SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
+    latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
+    control: &Receiver<RuntimeWorkerControl>,
+    browser_clock: Option<BrowserClockState>,
+) -> Option<Vec<RuntimeWorkerControl>> {
     let snapshot = runtime.latest_snapshot();
-    forward_tick(runtime, snapshot, messages, latest, control)
+    forward_publication(runtime, snapshot, messages, latest, control, browser_clock)
 }
 
 fn forward_tick(
@@ -608,12 +1045,42 @@ fn forward_tick(
     latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
     control: &Receiver<RuntimeWorkerControl>,
 ) -> Option<Vec<RuntimeWorkerControl>> {
+    forward_publication(runtime, snapshot, messages, latest, control, None)
+}
+
+fn forward_browser_frame(
+    runtime: &mut NativeRuntime,
+    snapshot: Arc<RuntimeSnapshot>,
+    messages: &SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
+    latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
+    control: &Receiver<RuntimeWorkerControl>,
+    browser_clock: BrowserClockState,
+) -> Option<Vec<RuntimeWorkerControl>> {
+    forward_publication(
+        runtime,
+        snapshot,
+        messages,
+        latest,
+        control,
+        Some(browser_clock),
+    )
+}
+
+fn forward_publication(
+    runtime: &mut NativeRuntime,
+    snapshot: Arc<RuntimeSnapshot>,
+    messages: &SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
+    latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
+    control: &Receiver<RuntimeWorkerControl>,
+    browser_clock: Option<BrowserClockState>,
+) -> Option<Vec<RuntimeWorkerControl>> {
     let mut territory_updates = Vec::new();
     while let Some(update) = runtime.pop_render_update() {
         territory_updates.push(update);
     }
     let deferred = send_lossless(
         Some(runtime),
+        browser_clock,
         messages,
         control,
         Publication {
@@ -641,6 +1108,7 @@ fn drain_publications<T, S>(receiver: &Receiver<Publication<T, S>>) -> (Vec<T>, 
 /// channel cancellable; `SyncSender::send` alone could otherwise block teardown indefinitely.
 fn send_lossless<T>(
     mut runtime: Option<&mut NativeRuntime>,
+    browser_clock: Option<BrowserClockState>,
     updates: &SyncSender<T>,
     control: &Receiver<RuntimeWorkerControl>,
     mut value: T,
@@ -670,9 +1138,30 @@ fn send_lossless<T>(
                         );
                         let _ = reply.send(result);
                     }
+                    Ok(RuntimeWorkerControl::CheckpointWithClock(reply)) => {
+                        let result = runtime.as_deref_mut().map_or_else(
+                            || {
+                                Err(RuntimeWorkerCheckpointError(
+                                    "runtime unavailable".to_owned(),
+                                ))
+                            },
+                            |runtime| {
+                                runtime
+                                    .checkpoint_state()
+                                    .map(|runtime| RuntimeWorkerCheckpoint {
+                                        runtime,
+                                        browser_clock,
+                                    })
+                                    .map_err(|e| RuntimeWorkerCheckpointError(e.to_string()))
+                            },
+                        );
+                        let _ = reply.send(result);
+                    }
                     Ok(request @ RuntimeWorkerControl::Pause)
                     | Ok(request @ RuntimeWorkerControl::Resume)
-                    | Ok(request @ RuntimeWorkerControl::SetTickInterval(_)) => {
+                    | Ok(request @ RuntimeWorkerControl::SetTickInterval(_))
+                    | Ok(request @ RuntimeWorkerControl::SetPlaybackSpeed(_))
+                    | Ok(request @ RuntimeWorkerControl::SetClockSchedule { .. }) => {
                         deferred.push(request);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -696,18 +1185,21 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mw_checkpoint::native_runtime::{
+        NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA, write_runtime_checkpoint_state_v13,
+    };
     use mw_core::{
         ConflictResolutionKind, ConflictResolutionPlan, DecodedScenario, GridSpec,
         NativeWarBootstrapConfig, ProductionConfig, bootstrap_native_war,
     };
 
-    fn test_runtime() -> NativeRuntime {
+    fn test_decoded_scenario() -> DecodedScenario {
         let grid = GridSpec {
             grid_res: 90.0,
             width: 4,
             height: 2,
         };
-        let decoded = DecodedScenario {
+        DecodedScenario {
             metadata: serde_json::json!({
                 "metadata": [
                     {"id": 7, "name": "Seven", "gdp": 100, "population": 1_000_000},
@@ -722,7 +1214,11 @@ mod tests {
             land: vec![1, 1, 0, 0, 1, 1, 0, 0],
             biome: vec![0; 8],
             province: vec![0; 8],
-        };
+        }
+    }
+
+    fn test_runtime() -> NativeRuntime {
+        let decoded = test_decoded_scenario();
         bootstrap_native_war(
             &decoded,
             &NativeWarBootstrapConfig {
@@ -733,6 +1229,44 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn browser_checkpoint_v13_writer_carries_exact_clock_boundary() {
+        let baseline = test_decoded_scenario();
+        let mut runtime = test_runtime();
+        runtime.enable_browser_frame_timers();
+        runtime.advance_browser_frame(2).unwrap();
+        let state = runtime.checkpoint_state().unwrap();
+        let clock = BrowserClockState::new(3, 1.0, BrowserClockMode::Foreground, true).unwrap();
+        let temp = std::env::temp_dir();
+        let suffix = std::process::id();
+        let scenario_path = temp.join(format!("mw-v13-scenario-{suffix}.bin"));
+        let output = temp.join(format!("mw-v13-checkpoint-{suffix}.json"));
+        std::fs::write(&scenario_path, b"synthetic native v13 baseline").unwrap();
+
+        let report = write_runtime_checkpoint_state_v13(
+            &scenario_path,
+            &baseline,
+            &state,
+            clock,
+            &output,
+            1,
+        )
+        .unwrap();
+        assert_eq!(report.schema, NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA);
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(wire["schema"], NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA);
+        assert_eq!(wire["runtimeClock"]["simTick"], state.tick);
+        assert_eq!(wire["runtimeClock"]["frame"], state.frame);
+        assert_eq!(wire["runtimeClock"]["simSpeed"], 3);
+        assert_eq!(wire["runtimeClock"]["frameAccumulator"], 1.0);
+        assert_eq!(wire["runtimeClock"]["mode"], "FOREGROUND");
+        assert_eq!(wire["runtimeClock"]["paused"], true);
+
+        let _ = std::fs::remove_file(output);
+        let _ = std::fs::remove_file(scenario_path);
     }
 
     #[test]
@@ -747,7 +1281,7 @@ mod tests {
         updates.send(1_u8).unwrap();
         let (control_tx, control_rx) = mpsc::channel();
         let started = Instant::now();
-        let handle = thread::spawn(move || send_lossless(None, &updates, &control_rx, 2_u8));
+        let handle = thread::spawn(move || send_lossless(None, None, &updates, &control_rx, 2_u8));
         control_tx.send(RuntimeWorkerControl::Stop).unwrap();
         assert!(handle.join().unwrap().is_none());
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -758,7 +1292,7 @@ mod tests {
         let (updates, receiver) = mpsc::sync_channel(1);
         let (_control_tx, control_rx) = mpsc::channel();
         updates.send(1_u8).unwrap();
-        let sender = thread::spawn(move || send_lossless(None, &updates, &control_rx, 2_u8));
+        let sender = thread::spawn(move || send_lossless(None, None, &updates, &control_rx, 2_u8));
         assert_eq!(receiver.recv().unwrap(), 1);
         assert!(sender.join().unwrap().is_some());
         assert_eq!(receiver.recv().unwrap(), 2);
@@ -771,8 +1305,9 @@ mod tests {
         updates.send(1_u8).unwrap();
         let (control_tx, control_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
-        let worker =
-            thread::spawn(move || send_lossless(Some(&mut runtime), &updates, &control_rx, 2_u8));
+        let worker = thread::spawn(move || {
+            send_lossless(Some(&mut runtime), None, &updates, &control_rx, 2_u8)
+        });
         control_tx
             .send(RuntimeWorkerControl::Checkpoint(reply_tx))
             .unwrap();
@@ -833,7 +1368,7 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
         let sender = thread::spawn(move || {
-            let result = send_lossless(Some(&mut runtime), &updates, &control_rx, 2_u8);
+            let result = send_lossless(Some(&mut runtime), None, &updates, &control_rx, 2_u8);
             finished_tx.send(result).unwrap();
         });
 
@@ -903,6 +1438,153 @@ mod tests {
             assert!(resumed_started.elapsed() < Duration::from_secs(1));
             thread::sleep(Duration::from_millis(1));
         }
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn browser_worker_batches_three_x_as_two_ticks_per_frame() {
+        let clock = BrowserClockState::new(3, 0.0, BrowserClockMode::Foreground, false).unwrap();
+        let mut worker =
+            RuntimeWorker::spawn_browser(test_runtime(), Duration::from_millis(2), 8, clock)
+                .unwrap();
+
+        let started = Instant::now();
+        let snapshot = loop {
+            let _ = worker.drain_render_state();
+            let snapshot = worker.latest_snapshot();
+            if snapshot.frame >= 3 {
+                break snapshot;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(snapshot.tick, snapshot.frame * 2);
+        assert_eq!(snapshot.frame_snapshot.frame + 1, snapshot.frame);
+        let checkpoint = worker.checkpoint_with_clock().unwrap();
+        assert_eq!(checkpoint.runtime.tick, checkpoint.runtime.frame * 2);
+        assert_eq!(
+            checkpoint.browser_clock,
+            Some(BrowserClockState::new(3, 1.0, BrowserClockMode::Foreground, false).unwrap())
+        );
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn paused_browser_worker_advances_frames_without_ticks_and_resumes_cleanly() {
+        let clock = BrowserClockState::new(3, 1.0, BrowserClockMode::Foreground, true).unwrap();
+        let mut worker =
+            RuntimeWorker::spawn_browser(test_runtime(), Duration::from_millis(2), 8, clock)
+                .unwrap();
+
+        let started = Instant::now();
+        loop {
+            let _ = worker.drain_render_state();
+            let snapshot = worker.latest_snapshot();
+            if snapshot.frame >= 3 {
+                assert_eq!(snapshot.tick, 0);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        worker.request_playback_speed(2).unwrap();
+        worker.request_resume().unwrap();
+        let resumed = Instant::now();
+        loop {
+            let _ = worker.drain_render_state();
+            if worker.latest_snapshot().tick >= 2 {
+                break;
+            }
+            assert!(resumed.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        let checkpoint = worker.checkpoint_with_clock().unwrap();
+        let clock = checkpoint.browser_clock.unwrap();
+        assert_eq!(clock.sim_speed, 2);
+        assert_eq!(clock.frame_accumulator, 0.0);
+        assert!(!clock.paused);
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn background_browser_worker_drains_all_three_subticks() {
+        let clock = BrowserClockState::new(3, 0.0, BrowserClockMode::Background, false).unwrap();
+        let mut worker =
+            RuntimeWorker::spawn_browser(test_runtime(), Duration::from_millis(2), 8, clock)
+                .unwrap();
+        let started = Instant::now();
+        let snapshot = loop {
+            let _ = worker.drain_render_state();
+            let snapshot = worker.latest_snapshot();
+            if snapshot.frame >= 2 {
+                break snapshot;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(snapshot.tick, snapshot.frame * 3);
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn paused_background_browser_worker_does_not_advance_frame() {
+        let clock = BrowserClockState::new(3, 1.0, BrowserClockMode::Background, true).unwrap();
+        let mut worker =
+            RuntimeWorker::spawn_browser(test_runtime(), Duration::from_millis(2), 8, clock)
+                .unwrap();
+        let _ = worker.drain_render_state();
+        thread::sleep(Duration::from_millis(20));
+        let _ = worker.drain_render_state();
+
+        let snapshot = worker.latest_snapshot();
+        assert_eq!((snapshot.tick, snapshot.frame), (0, 0));
+        let checkpoint = worker.checkpoint_with_clock().unwrap();
+        assert_eq!(
+            checkpoint.browser_clock,
+            Some(BrowserClockState::new(3, 1.0, BrowserClockMode::Background, true).unwrap())
+        );
+        worker.stop_and_join().unwrap();
+    }
+
+    #[test]
+    fn browser_clock_mode_and_interval_change_at_one_boundary() {
+        let mut worker = RuntimeWorker::spawn_browser(
+            test_runtime(),
+            Duration::from_millis(20),
+            8,
+            BrowserClockState::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            worker.request_clock_schedule(BrowserClockMode::Background, Duration::ZERO),
+            Err(RuntimeWorkerControlError::ZeroTickInterval)
+        );
+        let interval = Duration::from_millis(7);
+        worker
+            .request_clock_schedule(BrowserClockMode::Background, interval)
+            .unwrap();
+        let started = Instant::now();
+        loop {
+            let _ = worker.drain_render_state();
+            if let Some(RuntimeWorkerControlEvent::ClockScheduleChanged {
+                mode,
+                interval: acknowledged,
+                ..
+            }) = worker.poll_control_event()
+            {
+                assert_eq!(mode, BrowserClockMode::Background);
+                assert_eq!(acknowledged, interval);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(1));
+        }
+        let checkpoint = worker.checkpoint_with_clock().unwrap();
+        assert_eq!(
+            checkpoint.browser_clock.unwrap().mode,
+            BrowserClockMode::Background
+        );
         worker.stop_and_join().unwrap();
     }
 

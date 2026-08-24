@@ -401,7 +401,7 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or native v2-v12 `midWar`
+Run an exact browser-exported v1 `postStartWar` or native v2-v13 `midWar`
 checkpoint in the production viewer, or validate steps without a window:
 
 ```bash
@@ -449,7 +449,8 @@ wings, including ordered per-country air-operations funding coverage. V7 retains
 v6 and adds the exact per-side naval reassessment
 clocks plus next native operation sequence. Coastal topology and reusable BFS
 scratch are derived from immutable land and remain outside the serialized
-contract. New native wars save v12. V8 adds required nullable per-unit supply
+contract. Windowed native wars save v13 and exact-step headless wars save v12.
+V8 adds required nullable per-unit supply
 collapse markers for exact operational-feedback continuation; v9 adds the
 Mulberry32 gameplay cursor and complete side-level recruitable reserves; v10
 adds persistent aircraft logistics and monotonic unit/wing allocators. Legacy runtimes
@@ -457,7 +458,7 @@ choose the newest schema their owned continuation
 state supports. Checkpoint encoding/decoding and restore remain outside the timed
 benchmark region.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v12
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v13
 `midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
@@ -489,17 +490,19 @@ after each economy cycle, buys and distributes fighter/strike replacements,
 and consumes the personnel reserve plus country treasury for RNG-stable land
 recruitment. New formations enter the immutable end-of-tick unit snapshot and
 remain deployment-inactive for 30 ticks.
-Native frames advance once per logical runtime step, so frame-window mechanics
-after handoff follow native cadence rather than a browser speed mode that
-batches several ticks into one RAF frame. Old saves without the block retain
-their frozen resolved inputs.
+Windowed native playback uses the browser frame scheduler: foreground 1x/2x
+admit one/two logical subticks, foreground 3x caps at two with residual one,
+and background 3x drains all three on a 100 ms cadence. Admitted subticks share
+the pre-increment frame and publish one coalesced immutable boundary. V13 saves
+the scheduler exactly; v1-v12 loads synthesize the default clock and preserve
+elapsed naval/defender execution ages when entering browser playback.
 
 Browser v2-v6 handoffs carry the exact Float32 terrain plane. Standalone stock
 MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
 stress fixture and therefore do not measure the live resolver or the new
 influence/side-dynamics schedulers; they are not a claim of complete
-browser-tick parity. A v2-v12 restore rebuilds private territory summaries;
+browser-tick parity. A v2-v13 restore rebuilds private territory summaries;
 partial census work and
 render queues are not serialized. V3 separately preserves pending frontier
 work. Map-only viewing and the small scenario-derived `--demo-units` runtime
@@ -649,4 +652,14 @@ native sandbox wars seed browser-style silos; autonomous launches use the exact
 shared RNG, trails rise and fall through 40 points, hostile radial damage is
 limited to 0.5 degrees, explosions last 30 frames, and observer publication is
 immutable. No separate missile benchmark is claimed here; older v1-v11 saves
-remain loadable without missile state, and native new wars save v12.
+remain loadable without missile state, and exact-step headless new wars save v12.
+
+### Native checkpoint v13 browser-clock contract
+
+V13 retains complete v12 continuation and adds a strict `runtimeClock` block:
+top-level tick/frame agreement, 1x/2x/3x speed, residual accumulator,
+foreground/background mode, and pause state. Operational execution timestamps
+remain in browser-frame coordinates. Windowed native wars save v13; headless
+`--ticks` remains the legacy exact-logical-step path and saves v12. This
+orchestration slice has no separate performance claim; the kernel timings above
+remain the relevant cost measurements.

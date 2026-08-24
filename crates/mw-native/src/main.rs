@@ -12,15 +12,16 @@ use mw_checkpoint::native_runtime::{
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
     write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
     write_runtime_checkpoint_state_v10, write_runtime_checkpoint_state_v11,
-    write_runtime_checkpoint_state_v12,
+    write_runtime_checkpoint_state_v12, write_runtime_checkpoint_state_v13,
 };
 use mw_core::{
-    CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
-    NativeWarBootstrapConfig, ProductionCity, ProductionConfig, RuntimeCheckpoint, RuntimeConfig,
-    RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy, ScenarioProduction,
-    Simulation, SimulationConfig, SimulationUnit, StrategicSimulation, TerritoryCity,
-    TerritoryConfig, TerritoryControl, TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels,
-    UnitKind, bootstrap_native_war, decode_mwsc_gzip_file, derive_scenario_production,
+    BrowserClockMode, BrowserClockState, CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot,
+    GridSpec, NativeRuntime, NativeWarBootstrapConfig, ProductionCity, ProductionConfig,
+    RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState,
+    RuntimeUnitPolicy, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
+    StrategicSimulation, TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps,
+    TerritoryRenderUpdate, TerritoryTilePixels, UnitKind, bootstrap_native_war,
+    decode_mwsc_gzip_file, derive_scenario_production,
 };
 use serde_json::Value;
 use wgpu::util::DeviceExt;
@@ -273,6 +274,7 @@ impl App {
             runtime_label,
             checkpoint_baseline,
             mut map_material,
+            browser_clock,
         ) = if let Some(checkpoint_path) = checkpoint_path.as_ref() {
             let loaded = load_runtime_checkpoint(&self.scenario_path, checkpoint_path)
                 .with_context(|| {
@@ -296,6 +298,7 @@ impl App {
                 .save_checkpoint_path
                 .is_some()
                 .then_some(loaded.baseline);
+            let browser_clock = loaded.browser_clock.unwrap_or_default();
             (
                 loaded.decoded,
                 Some(loaded.runtime),
@@ -303,6 +306,7 @@ impl App {
                 Some(label),
                 baseline,
                 map_material,
+                browser_clock,
             )
         } else {
             let target = GridSpec::world(0.15).context("invalid 0.15 degree target grid")?;
@@ -330,6 +334,7 @@ impl App {
                     Some(format!("native new war ({unit_count} units)")),
                     baseline,
                     map_material,
+                    BrowserClockState::default(),
                 )
             } else if self.demo_units_requested {
                 let border = find_demo_border(
@@ -350,11 +355,25 @@ impl App {
                     Some("scenario-derived demo".to_owned()),
                     baseline,
                     map_material,
+                    BrowserClockState::default(),
                 )
             } else {
-                (decoded, None, None, None, None, map_material)
+                (
+                    decoded,
+                    None,
+                    None,
+                    None,
+                    None,
+                    map_material,
+                    BrowserClockState::default(),
+                )
             }
         };
+        self.playback_speed_index = PLAYBACK_SPEEDS
+            .iter()
+            .position(|&speed| speed == browser_clock.sim_speed)
+            .expect("validated browser clock speed");
+        self.playback_paused = browser_clock.paused;
         if let Some(runtime) = pending_runtime.as_ref() {
             map_material.set_sovereign_sides(runtime.country_to_side());
         }
@@ -895,10 +914,11 @@ impl App {
                     Some(limit),
                 )?
             } else {
-                RuntimeWorker::spawn(
+                RuntimeWorker::spawn_browser(
                     runtime,
                     self.runtime_tick_interval,
                     self.runtime_queue_capacity,
+                    browser_clock,
                 )?
             };
             log::debug!(
@@ -1006,36 +1026,48 @@ impl App {
             );
             return Ok(());
         }
-        let state = worker.checkpoint_state().map_err(|error| {
+        let checkpoint = worker.checkpoint_with_clock().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.strategic_missiles.is_some()
+        let state = &checkpoint.runtime;
+        let complete_v12 = state.strategic_missiles.is_some()
             && state.material_logistics.is_some()
             && state.reinforcement.is_some()
-            && state.naval_planning.is_some()
-        {
-            write_runtime_checkpoint_state_v12
-        } else if state.material_logistics.is_some()
-            && state.reinforcement.is_some()
-            && state.naval_planning.is_some()
-        {
-            write_runtime_checkpoint_state_v11
-        } else if state.reinforcement.is_some() && state.naval_planning.is_some() {
-            write_runtime_checkpoint_state_v10
-        } else if state.naval_planning.is_some() {
-            write_runtime_checkpoint_state_v9
-        } else if state.operational_execution.is_some() && state.air_power.is_some() {
-            write_runtime_checkpoint_state_v6
-        } else if state.operations.is_some() {
-            write_runtime_checkpoint_state_v5
-        } else if state.side_dynamics.is_some() {
-            write_runtime_checkpoint_state_v4
-        } else if state.influence_runtime.is_some() {
-            write_runtime_checkpoint_state_v3
+            && state.naval_planning.is_some();
+        let report = if complete_v12 && let Some(clock) = checkpoint.browser_clock {
+            write_runtime_checkpoint_state_v13(
+                &self.scenario_path,
+                baseline,
+                state,
+                clock,
+                output,
+                1,
+            )?
         } else {
-            write_runtime_checkpoint_state_v2
+            let writer = if complete_v12 {
+                write_runtime_checkpoint_state_v12
+            } else if state.material_logistics.is_some()
+                && state.reinforcement.is_some()
+                && state.naval_planning.is_some()
+            {
+                write_runtime_checkpoint_state_v11
+            } else if state.reinforcement.is_some() && state.naval_planning.is_some() {
+                write_runtime_checkpoint_state_v10
+            } else if state.naval_planning.is_some() {
+                write_runtime_checkpoint_state_v9
+            } else if state.operational_execution.is_some() && state.air_power.is_some() {
+                write_runtime_checkpoint_state_v6
+            } else if state.operations.is_some() {
+                write_runtime_checkpoint_state_v5
+            } else if state.side_dynamics.is_some() {
+                write_runtime_checkpoint_state_v4
+            } else if state.influence_runtime.is_some() {
+                write_runtime_checkpoint_state_v3
+            } else {
+                write_runtime_checkpoint_state_v2
+            };
+            writer(&self.scenario_path, baseline, state, output, 1)?
         };
-        let report = writer(&self.scenario_path, baseline, &state, output, 1)?;
         log::info!(
             "saved {} bytes of {} to {} at tick {}",
             report.bytes,
@@ -1116,6 +1148,21 @@ impl App {
                 } => {
                     log::debug!(
                         "runtime tick interval changed to {interval:?} at tick {tick}, frame {frame}"
+                    );
+                }
+                RuntimeWorkerControlEvent::PlaybackSpeedChanged { speed, tick, frame } => {
+                    log::debug!(
+                        "runtime playback speed changed to {speed}x at tick {tick}, frame {frame}"
+                    );
+                }
+                RuntimeWorkerControlEvent::ClockScheduleChanged {
+                    mode,
+                    interval,
+                    tick,
+                    frame,
+                } => {
+                    log::debug!(
+                        "runtime browser clock changed to {mode:?} at {interval:?} at tick {tick}, frame {frame}"
                     );
                 }
                 RuntimeWorkerControlEvent::Unavailable { tick, frame } => {
@@ -1327,12 +1374,11 @@ impl App {
             PlaybackAction::SpeedDown | PlaybackAction::CycleSpeed | PlaybackAction::SpeedUp => {
                 let speed_index = playback_speed_index(self.playback_speed_index, action);
                 let speed = PLAYBACK_SPEEDS[speed_index];
-                let interval = self.runtime_tick_interval.div_f64(f64::from(speed));
                 let worker = self
                     .runtime_worker
                     .as_ref()
                     .context("playback control requested without an active runtime worker")?;
-                worker.request_tick_interval(interval)?;
+                worker.request_playback_speed(speed)?;
                 self.playback_speed_index = speed_index;
             }
         }
@@ -1595,6 +1641,28 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                if self.smoke_frames.is_none()
+                    && let Some(worker) = self.runtime_worker.as_ref()
+                {
+                    let mode = if focused {
+                        BrowserClockMode::Foreground
+                    } else {
+                        BrowserClockMode::Background
+                    };
+                    let interval = if focused {
+                        self.runtime_tick_interval
+                    } else {
+                        Duration::from_millis(100)
+                    };
+                    if let Err(error) = worker.request_clock_schedule(mode, interval) {
+                        let message = format!("playback visibility control failed: {error}");
+                        log::error!("{message}");
+                        self.fatal_error = Some(message);
+                        event_loop.exit();
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
@@ -2177,6 +2245,7 @@ fn create_demo_runtime(
         RuntimeCheckpoint {
             tick: 0,
             frame: 0,
+            operational_timers_use_frame: false,
             war_grace_end: 0,
             simulation,
             territory,

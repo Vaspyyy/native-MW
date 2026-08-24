@@ -46,7 +46,7 @@ reference while systems move into the renderer-independent `mw-core` crate.
   immutable territory and unit publications
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
-- versioned browser-to-native checkpoints: loadable v1-v12 state with strict
+- versioned browser-to-native checkpoints: loadable v1-v13 state with strict
   native continuation of influence work, side dynamics,
   observer-scoped operational AI, naval planning/execution, air missions, and
   per-unit operational-feedback history, replay-safe gameplay RNG, and
@@ -95,7 +95,7 @@ cargo run --release -p mw-tools -- native-runtime-fixture ../modern-wars/assets/
 cargo run --release -p mw-native -- ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz
 ```
 
-`native-runtime-fixture` accepts twelve versioned checkpoint
+`native-runtime-fixture` accepts thirteen versioned checkpoint
 boundaries. Checkpoint v1 retains `postStartWar`, which is
 production-resumable only at tick, frame, and strategic cycle zero, and the
 synthetic non-resumable `baselineReplay` fixture/benchmark boundary.
@@ -146,6 +146,12 @@ radial damage within 0.5 degrees; explosions last 30 frames; and missile state
 is published immutably to observers. V12 continuation is exact. Older v1-v11
 checkpoints remain loadable without missile state; this does not claim broader
 full parity.
+Checkpoint v13 retains the complete v12 state and adds a strict `runtimeClock`
+block. It resumes the browser's foreground/background scheduler, 1x/2x/3x
+speed, residual frame accumulator, and paused state exactly. Naval-operation
+and defender-reaction lifecycle timers remain in browser-frame coordinates;
+v1-v12 loads preserve their elapsed ages while upgrading to windowed browser
+playback.
 
 Dynamic-influence runtime ticks also run the browser's territorial cleanup
 phases without adding a checkpoint schema: occupancy smoothing samples 5,000
@@ -211,7 +217,7 @@ cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" "$scenari
 cargo run --release -p mw-native -- --runtime-checkpoint "$checkpoint" --headless --ticks 5 --json "$scenario"
 ```
 
-Both production paths accept exact-state v1 `postStartWar` and v2-v12 `midWar`
+Both production paths accept exact-state v1 `postStartWar` and v2-v13 `midWar`
 checkpoints. V1/v2 remain loadable under their legacy influence behavior; v3
 restores the strict `influenceRuntime` state, v4 enables live side dynamics, v5
 restores operational AI, v6 enables naval/defender/air execution, and native v7
@@ -257,15 +263,19 @@ in geographic latitude/longitude.
 
 The panel is intentionally read-only sandbox/observer UI. It does not issue
 unit orders or expose Commander Mode controls. Playback starts running at 1x,
-matching the browser sandbox. The `--tick-ms` value is the native 1x cadence;
-2x and 3x divide that interval while remaining bounded by actual simulation
-throughput.
+matching the browser sandbox. The `--tick-ms` value is the native presentation
+frame cadence. Foreground 1x admits one logical tick per frame, 2x admits two,
+and 3x uses the browser's two-tick cap with a residual accumulator. An
+unfocused window switches to the browser-style 100 ms background cadence and
+drains all three 3x subticks. Foreground pause retains RAF frame advancement;
+a paused background interval advances neither clock.
 
 Native-only startup accepts repeated `--side` selectors (country ID or unique
 case-insensitive name) and uses deterministic all-Army bootstrap forces. Use
 `--save-checkpoint PATH` for exact-step headless saves; windowed mode also
 supports `S` and save-on-exit when a path is configured. New native-war saves
-use v12; legacy runtimes select the newest schema supported by their owned state.
+use v13 in windowed browser-clock mode; exact-step headless saves use v12, and
+legacy runtimes select the newest schema supported by their owned state.
 All retain frontline objectives, assignment priors, and the refresh phase; v3+
 retain frontier queues, v4+ retain momentum/phase/posture/personnel, v5 adds
 operational AI, v6 adds naval/defender/air execution, v7 adds native naval
@@ -275,7 +285,7 @@ adds live aircraft logistics plus formation allocators. Stock MWSC bootstrap
 uses the explicit flat-terrain fallback described above. This path does not yet cover every
 browser AI/combat resolver or non-land force system.
 
-Checkpoints v2-v12 are resumable-running-state formats. If a requested headless
+Checkpoints v2-v13 are resumable-running-state formats. If a requested headless
 or windowed save reaches `ConflictResolved`, the runtime finishes cleanly and
 reports that the save was skipped instead of writing a terminal file that the
 loader could not resume.
@@ -288,9 +298,10 @@ cargo run --release -p mw-native -- --runtime-checkpoint /tmp/mw-v12.json --head
 `mw-native --demo-units`, production checkpoint viewing, native headless
 validation, and the `mw-tools` runners all exercise the shared `NativeRuntime`.
 Runtime modes give exclusive mutable ownership to the named
-`mw-native-runtime` simulation thread. Each completed tick enters one bounded,
-lossless FIFO publication containing its immutable snapshot and all associated
-territory deltas. Renderer drains may collapse intermediate snapshots to the
+`mw-native-runtime` simulation thread. Each completed browser frame—or logical
+step in headless compatibility mode—enters one bounded, lossless FIFO
+publication containing its immutable snapshot and all associated territory
+deltas. Renderer drains may collapse intermediate snapshots to the
 newest snapshot only after receiving complete publications; every territory
 delta remains ordered and is applied. Shutdown explicitly requests stop and
 joins the worker, and initialization, worker, render, panic, and headless
@@ -378,12 +389,11 @@ map. Conflict resolution publishes a final immutable result and enters a clean
 terminal state instead of requiring an external acknowledge-and-continue
 step.
 
-This remains a bounded simulation port. Mid-war v2-v12 do not serialize a
+This remains a bounded simulation port. Mid-war v2-v13 do not serialize a
 partial census or render queues; v3+ preserve pending influence frontier work,
 and v4+ preserve side dynamics. The surrender path does not yet include
 the browser's
-releasables, province-border smoothing, equipment-reserve or aircraft-reserve
-cleanup, or treaty/UI presentation. The live battlefield resolver now applies
+releasables, province-border smoothing, or treaty/UI presentation. The live battlefield resolver now applies
 browser-parity attrition as one validated batch after staged influence and
 before AI and combat: sea units take the naval attrition rule, supply collapse
 and encirclement add their
@@ -435,10 +445,12 @@ cleanup plus aircraft evacuation/loss are included. V10 remains loadable; this
 does not claim full UI parity.
 
 Remaining bounded omissions include the full gameplay UI and broader browser
-presentation parity. Native `frame` advances once per runtime
-step; a browser speed mode may execute several logical ticks in one RAF frame,
-so frame-window mechanics after handoff follow deterministic native cadence. These contracts are not a claim
-of exact full-browser tick parity.
+presentation parity. Windowed sandbox playback now advances `frame` once per
+browser presentation boundary while all admitted logical subticks observe its
+pre-increment value. Grace, active-combat, long-war, naval-operation, and
+defender-reaction frame windows therefore retain browser cadence across speed
+changes and v13 continuation. These contracts are not a claim of exact
+full-browser tick parity outside the migrated sandbox systems.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the migration boundary.
 Measured Rust-versus-JavaScript results are recorded in

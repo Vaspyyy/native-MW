@@ -7,6 +7,7 @@ pub mod ai;
 pub mod air;
 pub mod battlefield;
 pub mod bootstrap;
+pub mod clock;
 pub mod combat;
 pub mod command;
 pub mod diffusion;
@@ -50,6 +51,11 @@ pub use battlefield::{
     armor_speed_multiplier, cohesion_group, resolve_battlefield_tick, resolve_local_tactics,
 };
 pub use bootstrap::{NativeWarBootstrapConfig, NativeWarBootstrapError, bootstrap_native_war};
+
+pub use clock::{
+    BROWSER_CLOCK_SCHEMA_VERSION, BROWSER_MAX_SPEED, BROWSER_MIN_SPEED, BrowserClockError,
+    BrowserClockMode, BrowserClockState,
+};
 
 pub use combat::{
     COMBAT_SCHEMA_VERSION, CombatConfig, CombatContext, CombatError, CombatEvent, CombatLayer,

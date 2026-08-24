@@ -35,7 +35,7 @@ browser runtime's shared mutable `main.js` structure.
 8. Derive production country/city/economy inputs and production front layouts
    from an MWSC scenario, then connect the migrated kernels under one native
    tick owner.
-9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v12 `midWar`
+9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v13 `midWar`
    checkpoints into `mw-native`, run their simulation on a dedicated worker,
    and present immutable runtime publications without blocking rendering on a
    tick.
@@ -115,7 +115,7 @@ Normal `mw-native` startup remains map-only. The opt-in `--demo-units` mode
 finds a real adjacent-country land border in the decoded scenario and
 constructs a small explicit runtime. `--runtime-checkpoint PATH` instead loads
 the shared strict checkpoint adapter and requires either an exact-geography v1
-`postStartWar` handoff or an exact-live-state v2-v12 `midWar` handoff. The viewer
+`postStartWar` handoff or an exact-live-state v2-v13 `midWar` handoff. The viewer
 rejects `baselineReplay`; that boundary remains limited to deterministic
 fixtures and benchmarks. `--headless --ticks N` runs the same checkpoint and
 worker for up to `N` successful steps without constructing a window or GPU
@@ -214,9 +214,9 @@ also immutable and leave the runtime through a FIFO queue, so a later dirty
 tile cannot overtake an earlier one.
 
 In `mw-native`, the named `mw-native-runtime` thread has exclusive mutable
-ownership of `NativeRuntime`. Each initial state or completed tick is sent as
-one atomic publication containing its immutable snapshot and every territory
-render delta produced before that snapshot. The publication channel is bounded
+ownership of `NativeRuntime`. Each initial state or completed browser frame is
+sent as one atomic publication containing its immutable final snapshot and the
+coalesced territory render delta produced by all admitted logical subticks. The publication channel is bounded
 and lossless: a full FIFO backpressures simulation instead of dropping or
 reordering territory work. A renderer drain applies every delta in FIFO order
 and may retain only the newest snapshot among the complete publications it
@@ -224,12 +224,14 @@ received. The separate latest-snapshot mailbox is newest-wins telemetry; it is
 not used to splice a snapshot onto unrelated delta state.
 
 Windowed playback controls are asynchronous worker requests. Pause, resume,
-and tick-interval changes take effect only at a published runtime boundary; a
-control received while a completed tick is backpressured is deferred until
+speed, foreground/background mode, and frame-interval changes take effect only
+at a published runtime boundary; a control received while a completed frame is backpressured is deferred until
 that publication is enqueued and installed as the latest snapshot. While
-paused, the worker performs no steps but continues serving checkpoint and stop
-requests. Resume schedules one immediate tick and never catches up wall time
-spent paused. Headless exact-step execution does not send these controls.
+foreground-paused, the worker admits zero logical ticks but continues advancing
+RAF-equivalent frames; a paused background interval advances neither clock.
+Both continue serving checkpoint and stop requests. Resume continues from the
+next frame without catching up wall time spent paused. Headless exact-step
+execution retains the one-logical-step API and does not send these controls.
 
 Application teardown sends an explicit stop request and joins the worker. A
 blocked full-FIFO publication remains cancellable, and initialization, worker,
@@ -355,7 +357,9 @@ missile continuation: browser-style silos seed default modern native sandbox
 wars, autonomous launches use the exact shared RNG, trails rise and fall through
 40 points, hostile radial damage is limited to 0.5 degrees, explosions last 30
 frames, and observer publication is immutable. Older v1-v11 checkpoints remain
-loadable without missile state; native new wars save v12.
+loadable without missile state. Checkpoint v13 retains complete v12 state and
+adds exact browser-clock continuation for windowed native wars; headless
+exact-step new wars continue to save v12.
 
 The browser keeps v1 as the default export. V2 through v6 are explicit and act as
 quiescent save barriers: they synchronously flush census work, then refuse the
@@ -437,12 +441,19 @@ retain their frozen phase/policy behavior.
 Remaining omissions are full gameplay/UI parity and broader browser presentation
 parity; equipment-reserve evolution is covered by v11 material logistics.
 
-The native runtime advances `frame` once per successful logical step. The
-browser can run multiple logical subticks before advancing its RAF-owned
-`simFrameCount`, depending on speed and background cadence. A handoff preserves
-the captured numeric frame, but subsequent grace, active-combat, and long-war
-frame windows follow deterministic native cadence rather than reproducing a
-different browser scheduling cadence.
+Windowed native playback now uses the browser's two-clock boundary. Foreground
+1x and 2x admit one and two logical subticks per presentation frame;
+foreground 3x admits at most two and retains the browser's residual of one;
+background 3x drains three subticks on its 100 ms cadence. Every admitted
+subtick observes the same pre-increment `frame`, territory dirtiness is
+coalesced, and only the final immutable snapshot crosses the worker boundary.
+Logical subticks retain their existing per-tick transaction boundary; if a
+later subtick errors, earlier browser-style mutations remain committed but the
+worker publishes no partial frame and terminates the run.
+Paused foreground frames admit no logical ticks but still advance `frame`;
+paused background intervals advance neither clock. Grace,
+active-combat, long-war, naval-operation, and defender-reaction windows thus
+continue in browser-frame coordinates.
 
 Browser v2-v6 exports carry the exact terrain plane used by this resolver. The
 standalone stock MWSC format has no `mountainData`; native-only bootstrap
@@ -541,10 +552,15 @@ The consequence port is intentionally bounded. It does not yet reproduce
 browser releasables, province-border smoothing, or treaty/UI presentation.
 Checkpoint v11 covers material reserve and aircraft cleanup. Browser-authored legacy v2 checkpoints
 omit the optional native planner block and therefore start a fresh deterministic
-front planning boundary. Native-authored v2-v12 saves include current objectives,
+front planning boundary. Native-authored v2-v13 saves include current objectives,
 assignment priors, layout priors, and the last refresh tick. New native-war
-saves use v12; legacy runtimes select the newest schema supported by their owned
-continuation state.
+saves use v13 in the windowed sandbox and v12 in exact-step headless mode;
+legacy runtimes select the newest schema supported by their owned continuation
+state. V13 retains complete v12 state plus the strict browser clock, including
+speed, residual accumulator, foreground/background mode, pause state, and
+top-level tick/frame coordinates. V1-v12 remain loadable; windowed startup
+rebases legacy naval/defender execution timestamps while preserving elapsed
+ages, and legacy-format writers convert them back before serialization.
 
 The native writer accepts only the canonical runtime, simulation, territory
 tile, city, protection, and contiguous-side configuration that the strict
@@ -604,7 +620,7 @@ then the observer HUD.
    `NativeRuntime`.**
 8. Derive production scenario inputs and front objectives, then connect AI,
    simulation, territory, and strategic kernels under one runtime owner.
-   **Complete for the bounded v1-v12 checkpoint contracts and runtime.**
+   **Complete for the bounded v1-v13 checkpoint contracts and runtime.**
 9. Load production checkpoints in `mw-native`. **Complete for strict,
    exact-geography `postStartWar` and exact-live-state `midWar` viewer/headless
    operation; `baselineReplay` is deliberately rejected.**
@@ -672,7 +688,11 @@ then the observer HUD.
     Leaflet's default center and zoom range, fractional debounced wheel curve,
     projected country gradients, and antimeridian world-copy presentation.
     **Complete.**
-30. Native gameplay UI/editor/community parity remains later work after the
+30. Match the browser foreground/background frame scheduler, 1x/2x/3x logical
+    admission, paused-frame behavior, coalesced immutable frame publication,
+    frame-based operational timers, and exact checkpoint v13 continuation.
+    **Complete.**
+31. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

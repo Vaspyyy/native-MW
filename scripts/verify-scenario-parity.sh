@@ -28,6 +28,7 @@ cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpo
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v10
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v11
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v12
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v13
 
 scenarios=(
 	"world-map-2022-v2.mwsc.gz"

@@ -95,6 +95,7 @@ fn restored_runtime(state: NativeRuntimeCheckpointState) -> NativeRuntime {
         RuntimeCheckpoint {
             tick: state.tick,
             frame: state.frame,
+            operational_timers_use_frame: state.operational_timers_use_frame,
             war_grace_end: state.war_grace_end,
             simulation,
             territory,
