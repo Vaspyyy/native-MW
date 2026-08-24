@@ -39,6 +39,9 @@ reference while systems move into the renderer-independent `mw-core` crate.
   pause/green resume, clamped speed arrows, and a cycling 1x/2x/3x readout
 - browser-style immutable world overlays for live airfields and wings, active
   land battles, and the selected side's task-force routes and hostile contacts
+- browser-matched controller frontlines, population/zoom-filtered cities,
+  curved country names, and live side-strength labels, all layered from
+  immutable territory and unit publications
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
 - versioned browser-to-native checkpoints: loadable v1-v11 state with strict

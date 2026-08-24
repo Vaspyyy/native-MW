@@ -26,7 +26,7 @@ use crate::{
     runtime_worker::{RuntimeWorker, RuntimeWorkerStatus},
 };
 
-const HEADLESS_SCHEMA: &str = "mw-native-headless-v2";
+const HEADLESS_SCHEMA: &str = "mw-native-headless-v3";
 const RESUMABLE_CHECKPOINT_BOUNDARIES: [&str; 2] = ["postStartWar", "midWar"];
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MIN_WATCHDOG: Duration = Duration::from_secs(30);
@@ -717,6 +717,12 @@ fn checksum_territory_update(checksum: &mut Fnv64, update: &TerritoryRenderUpdat
         for &pixel in &tile.pixels {
             checksum.write_u16(pixel);
         }
+        checksum.write_u64(tile.dominant_sides.len() as u64);
+        for &side in &tile.dominant_sides {
+            checksum.write_u16(side as u16);
+        }
+        checksum.write_u64(tile.dominant_city_controlled.len() as u64);
+        checksum.write_bytes(&tile.dominant_city_controlled);
     }
 }
 
@@ -763,7 +769,7 @@ impl Fnv64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mw_core::ConflictResolutionPlan;
+    use mw_core::{ConflictResolutionPlan, TerritoryTilePixels, TileBounds};
 
     #[test]
     fn watchdog_has_a_floor_and_scales_without_overflow() {
@@ -785,6 +791,34 @@ mod tests {
 
         assert_eq!(left.finish(), right.finish());
         assert_ne!(left.finish(), reordered.finish());
+    }
+
+    #[test]
+    fn render_checksum_covers_the_dominant_side_and_city_control_planes() {
+        let update = |dominant_side, city_controlled| TerritoryRenderUpdate {
+            full_update: false,
+            tiles: vec![TerritoryTilePixels {
+                bounds: TileBounds {
+                    tile: 0,
+                    min_x: 0,
+                    min_y: 0,
+                    max_x: 1,
+                    max_y: 1,
+                },
+                pixels: vec![7],
+                dominant_sides: vec![dominant_side],
+                dominant_city_controlled: vec![city_controlled],
+            }],
+        };
+        let mut first = Fnv64::new();
+        checksum_territory_update(&mut first, &update(0, 0));
+        let mut second = Fnv64::new();
+        checksum_territory_update(&mut second, &update(1, 0));
+        let mut controlled = Fnv64::new();
+        checksum_territory_update(&mut controlled, &update(0, 1));
+
+        assert_ne!(first.finish(), second.finish());
+        assert_ne!(first.finish(), controlled.finish());
     }
 
     #[test]

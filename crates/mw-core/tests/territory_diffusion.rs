@@ -145,6 +145,29 @@ fn queued_non_frontier_land_cell_is_smoothed_once_without_requeue() {
 }
 
 #[test]
+fn diffusion_city_control_threshold_flip_publishes_without_controller_change() {
+    let mut fixture = maps();
+    fixture.side_influence[0][CENTER] = 0.31;
+
+    let mut territory = TerritoryControl::new(config(fixture)).unwrap();
+    let initial = territory.drain_render_update().unwrap();
+    assert_eq!(initial.tiles[0].dominant_city_controlled[CENTER], 1);
+    territory
+        .restore_influence_runtime(queued_center())
+        .unwrap();
+
+    territory.apply_influence_runtime(&[], &[0], 1).unwrap();
+
+    assert_eq!(territory.dominant_side()[CENTER], 0);
+    let update = territory
+        .drain_render_update()
+        .expect("crossing the city-control threshold must dirty the render tile");
+    assert!(!update.full_update);
+    assert_eq!(update.tiles[0].dominant_sides[CENTER], 0);
+    assert_eq!(update.tiles[0].dominant_city_controlled[CENTER], 0);
+}
+
+#[test]
 fn controller_hysteresis_leaves_stale_occupation_until_the_threshold_is_crossed() {
     let prior_occupation = f32::from_bits(0x3e99_999a);
 
@@ -171,11 +194,19 @@ fn controller_hysteresis_leaves_stale_occupation_until_the_threshold_is_crossed(
     above.side_influence[0][CENTER] = 0.60;
     above.side_influence[1][CENTER] = 0.76;
     let mut above = TerritoryControl::new(config(above)).unwrap();
+    assert!(above.drain_render_update().unwrap().full_update);
     above.restore_influence_runtime(queued_center()).unwrap();
     above.apply_influence_runtime(&[], &[], 1).unwrap();
 
     assert_eq!(above.dominant_side()[CENTER], 1);
     assert_eq!(above.occupation()[CENTER].to_bits(), (-0.76_f32).to_bits());
+    let render = above
+        .drain_render_update()
+        .expect("diffusion controller flip must publish a renderer tile");
+    assert!(!render.full_update);
+    assert_eq!(render.tiles.len(), 1);
+    assert_eq!(render.tiles[0].dominant_sides[CENTER], 1);
+    assert_eq!(render.tiles[0].dominant_city_controlled[CENTER], 1);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -15,11 +15,11 @@ use mw_checkpoint::native_runtime::{
 };
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
-    NativeWarBootstrapConfig, ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy,
-    RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy, ScenarioProduction, Simulation,
-    SimulationConfig, SimulationUnit, StrategicSimulation, TerritoryCity, TerritoryConfig,
-    TerritoryControl, TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels, UnitKind,
-    bootstrap_native_war, decode_mwsc_gzip_file, derive_scenario_production,
+    NativeWarBootstrapConfig, ProductionCity, ProductionConfig, RuntimeCheckpoint, RuntimeConfig,
+    RuntimeDiplomacy, RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy, ScenarioProduction,
+    Simulation, SimulationConfig, SimulationUnit, StrategicSimulation, TerritoryCity,
+    TerritoryConfig, TerritoryControl, TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels,
+    UnitKind, bootstrap_native_war, decode_mwsc_gzip_file, derive_scenario_production,
 };
 use serde_json::Value;
 use wgpu::util::DeviceExt;
@@ -33,6 +33,7 @@ use winit::{
 };
 
 mod headless;
+mod map_label;
 mod observer;
 mod observer_hud;
 mod options;
@@ -40,6 +41,7 @@ mod runtime_worker;
 mod unit_renderer;
 mod world_overlay;
 
+use map_label::{MapLabelRenderer, MapLabelView};
 use observer::ObserverHudModel;
 use observer_hud::{
     HudHit, ObserverHudRenderer, ObserverHudUpload, PlaybackAction, PlaybackPresentation,
@@ -63,6 +65,8 @@ struct ViewUniform {
     pixels_per_world: f32,
     palette_len: u32,
     grid_size: [u32; 2],
+    frontlines_active: u32,
+    _padding: [u32; 3],
 }
 
 struct GpuState {
@@ -74,8 +78,10 @@ struct GpuState {
     bind_group: wgpu::BindGroup,
     view_buffer: wgpu::Buffer,
     ownership_texture: wgpu::Texture,
+    dominant_texture: wgpu::Texture,
     unit_renderer: UnitRenderer,
     world_overlay: WorldOverlayRenderer,
+    map_labels: MapLabelRenderer,
     observer_hud: ObserverHudRenderer,
 }
 
@@ -101,9 +107,13 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     ownership: Vec<u16>,
+    dominant_sides: Vec<i16>,
+    dominant_city_controlled: Vec<u8>,
     land: Vec<u8>,
     palette: Vec<[f32; 4]>,
     metadata: Value,
+    map_cities: Arc<[ProductionCity]>,
+    country_names: HashMap<u16, String>,
     grid_width: u32,
     grid_height: u32,
     grid_res: f32,
@@ -125,6 +135,8 @@ struct App {
     latest_snapshot: Option<Arc<RuntimeSnapshot>>,
     snapshot_dirty: bool,
     world_overlay_dirty: bool,
+    map_labels_static_dirty: bool,
+    map_labels_sides_dirty: bool,
     observer_hud_visible: bool,
     observer_hud_dirty: bool,
     selected_country_id: Option<u16>,
@@ -152,9 +164,13 @@ impl App {
             window: None,
             gpu: None,
             ownership: Vec::new(),
+            dominant_sides: Vec::new(),
+            dominant_city_controlled: Vec::new(),
             land: Vec::new(),
             palette: Vec::new(),
             metadata: Value::Null,
+            map_cities: Arc::from([]),
+            country_names: HashMap::new(),
             grid_width: 0,
             grid_height: 0,
             grid_res: 0.15,
@@ -176,6 +192,8 @@ impl App {
             latest_snapshot: None,
             snapshot_dirty: false,
             world_overlay_dirty: false,
+            map_labels_static_dirty: false,
+            map_labels_sides_dirty: false,
             observer_hud_visible: true,
             observer_hud_dirty: true,
             selected_country_id: None,
@@ -303,6 +321,21 @@ impl App {
             decoded.world_control.len()
         );
 
+        let map_production = if let Some(runtime) = pending_runtime.as_ref() {
+            runtime.scenario().clone()
+        } else {
+            derive_scenario_production(&decoded, &ProductionConfig::default())
+                .context("failed to derive scenario cities and country labels")?
+        };
+        self.map_cities = Arc::clone(&map_production.cities);
+        self.country_names = map_production
+            .countries
+            .iter()
+            .map(|country| (country.country_id, country.name.clone()))
+            .collect();
+
+        self.dominant_sides = vec![-1; decoded.world_control.len()];
+        self.dominant_city_controlled = vec![0; decoded.world_control.len()];
         self.ownership = decoded.world_control;
         self.land = decoded.land;
         self.metadata = decoded.metadata;
@@ -315,6 +348,8 @@ impl App {
             while let Some(update) = runtime.pop_render_update() {
                 apply_territory_update_to_grid(
                     &mut self.ownership,
+                    &mut self.dominant_sides,
+                    &mut self.dominant_city_controlled,
                     self.grid_width as usize,
                     self.grid_height as usize,
                     &update,
@@ -437,6 +472,43 @@ impl App {
             ownership_texture.size(),
         );
 
+        let dominant_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dominant side R16Sint"),
+            size: ownership_texture.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R16Sint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dominant_view = dominant_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut dominant_padded = vec![0_u8; padded_bpr * self.grid_height as usize];
+        for (row, source) in self
+            .dominant_sides
+            .chunks_exact(self.grid_width as usize)
+            .enumerate()
+        {
+            let bytes = bytemuck::cast_slice(source);
+            dominant_padded[row * padded_bpr..row * padded_bpr + unpadded_bpr]
+                .copy_from_slice(bytes);
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &dominant_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &dominant_padded,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bpr as u32),
+                rows_per_image: Some(self.grid_height),
+            },
+            dominant_texture.size(),
+        );
+
         let view_uniform = self.view_uniform(size, self.palette.len() as u32);
         let view_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("map view uniform"),
@@ -482,6 +554,16 @@ impl App {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Sint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -499,6 +581,10 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: palette_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&dominant_view),
                 },
             ],
         });
@@ -541,6 +627,30 @@ impl App {
             world_overlay.upload(&device, &queue, snapshot, self.selected_runtime_side());
         }
         self.world_overlay_dirty = false;
+        let mut map_labels = MapLabelRenderer::new(&device, &view_buffer, format);
+        let map_label_view = self.map_label_view(size);
+        map_labels.upload_static(
+            &device,
+            &queue,
+            map_label_view,
+            [self.grid_width as usize, self.grid_height as usize],
+            &self.ownership,
+            &self.dominant_sides,
+            &self.dominant_city_controlled,
+            &self.map_cities,
+            &self.country_names,
+            true,
+        );
+        map_labels.upload_sides(
+            &device,
+            &queue,
+            map_label_view,
+            self.latest_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.frame_snapshot.as_ref()),
+        );
+        self.map_labels_static_dirty = false;
+        self.map_labels_sides_dirty = false;
         let mut observer_hud = ObserverHudRenderer::new(&device, format);
         let observer_model = self.observer_hud_model();
         observer_hud.upload(
@@ -556,10 +666,13 @@ impl App {
         );
         self.observer_hud_dirty = false;
         log::info!(
-            "world overlays initialized with {} units, {} markers, and {} route segments",
+            "world overlays initialized with {} units, {} markers, {} route segments, {} cities, {} side labels, and {} country labels",
             unit_renderer.instance_count(),
             world_overlay.marker_count(),
-            world_overlay.segment_count()
+            world_overlay.segment_count(),
+            map_labels.layout().city_markers,
+            map_labels.layout().side_labels,
+            map_labels.layout().country_labels,
         );
 
         self.gpu = Some(GpuState {
@@ -571,8 +684,10 @@ impl App {
             bind_group,
             view_buffer,
             ownership_texture,
+            dominant_texture,
             unit_renderer,
             world_overlay,
+            map_labels,
             observer_hud,
         });
         self.window = Some(window);
@@ -603,13 +718,34 @@ impl App {
     }
 
     fn view_uniform(&self, size: PhysicalSize<u32>, palette_len: u32) -> ViewUniform {
+        let frontlines_active = self.latest_snapshot.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.state,
+                RuntimeState::Running | RuntimeState::AwaitingStrategicEffects { .. }
+            )
+        });
         ViewUniform {
             viewport: [size.width.max(1) as f32, size.height.max(1) as f32],
             center: self.center,
             pixels_per_world: self.zoom,
             palette_len,
             grid_size: [self.grid_width, self.grid_height],
+            frontlines_active: u32::from(frontlines_active),
+            _padding: [0; 3],
         }
+    }
+
+    fn map_label_view(&self, size: PhysicalSize<u32>) -> MapLabelView {
+        MapLabelView {
+            viewport: [size.width.max(1) as f32, size.height.max(1) as f32],
+            center: self.center,
+            pixels_per_world: self.zoom,
+        }
+    }
+
+    fn invalidate_map_labels(&mut self) {
+        self.map_labels_static_dirty = true;
+        self.map_labels_sides_dirty = true;
     }
 
     fn reset_camera(&mut self, size: PhysicalSize<u32>) {
@@ -732,10 +868,13 @@ impl App {
         for update in drained.territory_updates {
             apply_territory_update_to_grid(
                 &mut self.ownership,
+                &mut self.dominant_sides,
+                &mut self.dominant_city_controlled,
                 self.grid_width as usize,
                 self.grid_height as usize,
                 &update,
             )?;
+            self.map_labels_static_dirty = true;
             self.territory_updates.push_back(update);
         }
         if let Some(snapshot) = drained.snapshot {
@@ -752,6 +891,7 @@ impl App {
             self.latest_snapshot = Some(snapshot);
             self.snapshot_dirty = true;
             self.world_overlay_dirty = true;
+            self.map_labels_sides_dirty = true;
             self.observer_hud_dirty = true;
         }
         for event in control_events {
@@ -994,6 +1134,9 @@ impl App {
         let size = window.inner_size();
         let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
+        let map_label_view = self.map_label_view(size);
+        let map_labels_static_dirty = self.map_labels_static_dirty;
+        let map_labels_sides_dirty = self.map_labels_sides_dirty;
         let observer_hud_visible = self.observer_hud_visible;
         let world_overlay_upload = self.world_overlay_dirty.then(|| {
             self.latest_snapshot
@@ -1013,8 +1156,13 @@ impl App {
         gpu.queue
             .write_buffer(&gpu.view_buffer, 0, bytemuck::bytes_of(&uniform));
         while let Some(update) = self.territory_updates.pop_front() {
-            upload_territory_update(&gpu.queue, &gpu.ownership_texture, &update)
-                .inspect_err(|_| self.territory_updates.push_front(Arc::clone(&update)))?;
+            upload_territory_update(
+                &gpu.queue,
+                &gpu.ownership_texture,
+                &gpu.dominant_texture,
+                &update,
+            )
+            .inspect_err(|_| self.territory_updates.push_front(Arc::clone(&update)))?;
         }
         if self.snapshot_dirty
             && let Some(snapshot) = &self.latest_snapshot
@@ -1032,6 +1180,32 @@ impl App {
                 .upload(&gpu.device, &gpu.queue, &snapshot, selected_side);
         }
         self.world_overlay_dirty = false;
+        if map_labels_static_dirty {
+            gpu.map_labels.upload_static(
+                &gpu.device,
+                &gpu.queue,
+                map_label_view,
+                [self.grid_width as usize, self.grid_height as usize],
+                &self.ownership,
+                &self.dominant_sides,
+                &self.dominant_city_controlled,
+                &self.map_cities,
+                &self.country_names,
+                true,
+            );
+            self.map_labels_static_dirty = false;
+        }
+        if map_labels_sides_dirty {
+            gpu.map_labels.upload_sides(
+                &gpu.device,
+                &gpu.queue,
+                map_label_view,
+                self.latest_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.frame_snapshot.as_ref()),
+            );
+            self.map_labels_sides_dirty = false;
+        }
         if let Some((model, accent, playback)) = observer_upload {
             gpu.observer_hud.upload(
                 &gpu.device,
@@ -1100,8 +1274,13 @@ impl App {
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.draw(0..3, 0..1);
+            gpu.world_overlay.draw_air(&mut pass);
+            gpu.map_labels.draw_cities(&mut pass);
             gpu.unit_renderer.draw(&mut pass);
-            gpu.world_overlay.draw(&mut pass);
+            gpu.world_overlay.draw_battles(&mut pass);
+            gpu.map_labels.draw_side_labels(&mut pass);
+            gpu.map_labels.draw_country_labels(&mut pass);
+            gpu.world_overlay.draw_operations(&mut pass);
             gpu.observer_hud.draw(&mut pass);
         }
         gpu.queue.submit(Some(encoder.finish()));
@@ -1185,6 +1364,7 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
                     PhysicalKey::Code(KeyCode::KeyR) => {
                         self.reset_camera(window.inner_size());
+                        self.invalidate_map_labels();
                         window.request_redraw();
                     }
                     PhysicalKey::Code(KeyCode::KeyH) => {
@@ -1223,6 +1403,7 @@ impl ApplicationHandler for App {
                     gpu.surface.configure(&gpu.device, &gpu.config);
                 }
                 self.observer_hud_dirty = true;
+                self.invalidate_map_labels();
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1270,6 +1451,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 } else {
+                    let was_dragging = self.dragging;
                     self.dragging = false;
                     let released_action =
                         match self.current_hud_hit(self.cursor, window.inner_size()) {
@@ -1289,6 +1471,9 @@ impl ApplicationHandler for App {
                         }
                         window.request_redraw();
                         return;
+                    }
+                    if was_dragging {
+                        self.invalidate_map_labels();
                     }
                     let clicked = self.drag_origin.take().is_some_and(|origin| {
                         let dx = self.cursor.x - origin.x;
@@ -1316,6 +1501,7 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => (p.y as f32 / 80.0).clamp(-4.0, 4.0),
                 };
                 self.zoom_at_cursor(amount);
+                self.invalidate_map_labels();
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -1833,6 +2019,8 @@ fn resolve_native_war_sides(
 
 fn apply_territory_update_to_grid(
     ownership: &mut [u16],
+    dominant_sides: &mut [i16],
+    dominant_city_controlled: &mut [u8],
     width: usize,
     height: usize,
     update: &TerritoryRenderUpdate,
@@ -1844,6 +2032,16 @@ fn apply_territory_update_to_grid(
         ownership.len() == expected_cells,
         "ownership grid has {} cells, expected {expected_cells}",
         ownership.len()
+    );
+    anyhow::ensure!(
+        dominant_sides.len() == expected_cells,
+        "dominant-side grid has {} cells, expected {expected_cells}",
+        dominant_sides.len()
+    );
+    anyhow::ensure!(
+        dominant_city_controlled.len() == expected_cells,
+        "dominant-city-controlled grid has {} cells, expected {expected_cells}",
+        dominant_city_controlled.len()
     );
     for tile in &update.tiles {
         let bounds = tile.bounds;
@@ -1866,11 +2064,28 @@ fn apply_territory_update_to_grid(
             bounds.tile,
             tile.pixels.len()
         );
+        anyhow::ensure!(
+            tile.dominant_sides.len() == expected_pixels,
+            "territory tile {} has {} dominant sides, expected {expected_pixels}",
+            bounds.tile,
+            tile.dominant_sides.len()
+        );
+        anyhow::ensure!(
+            tile.dominant_city_controlled.len() == expected_pixels,
+            "territory tile {} has {} dominant city-control flags, expected {expected_pixels}",
+            bounds.tile,
+            tile.dominant_city_controlled.len()
+        );
         for row in 0..tile_height {
             let source_start = row * tile_width;
             let target_start = (bounds.min_y + row) * width + bounds.min_x;
             ownership[target_start..target_start + tile_width]
                 .copy_from_slice(&tile.pixels[source_start..source_start + tile_width]);
+            dominant_sides[target_start..target_start + tile_width]
+                .copy_from_slice(&tile.dominant_sides[source_start..source_start + tile_width]);
+            dominant_city_controlled[target_start..target_start + tile_width].copy_from_slice(
+                &tile.dominant_city_controlled[source_start..source_start + tile_width],
+            );
         }
     }
     Ok(())
@@ -1912,12 +2127,53 @@ fn pack_territory_tile(tile: &TerritoryTilePixels) -> Result<(Vec<u8>, u32, u32)
     ))
 }
 
+fn pack_dominant_tile(tile: &TerritoryTilePixels) -> Result<(Vec<u8>, u32, u32)> {
+    let bounds = tile.bounds;
+    anyhow::ensure!(
+        bounds.min_x < bounds.max_x && bounds.min_y < bounds.max_y,
+        "territory tile {} has empty bounds",
+        bounds.tile
+    );
+    let width = bounds.max_x - bounds.min_x;
+    let height = bounds.max_y - bounds.min_y;
+    let expected_pixels = width
+        .checked_mul(height)
+        .context("territory tile dimensions overflow")?;
+    anyhow::ensure!(
+        tile.dominant_sides.len() == expected_pixels,
+        "territory tile {} has {} dominant sides, expected {expected_pixels}",
+        bounds.tile,
+        tile.dominant_sides.len()
+    );
+    let unpadded_bytes_per_row = width
+        .checked_mul(std::mem::size_of::<i16>())
+        .context("dominant-side tile row size overflow")?;
+    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(ROW_ALIGNMENT) * ROW_ALIGNMENT;
+    let mut packed = vec![0_u8; padded_bytes_per_row * height];
+    for row in 0..height {
+        let source = &tile.dominant_sides[row * width..(row + 1) * width];
+        let bytes = bytemuck::cast_slice(source);
+        let target_start = row * padded_bytes_per_row;
+        packed[target_start..target_start + unpadded_bytes_per_row].copy_from_slice(bytes);
+    }
+    Ok((
+        packed,
+        u32::try_from(padded_bytes_per_row).context("dominant-side tile row exceeds GPU limits")?,
+        u32::try_from(height).context("dominant-side tile height exceeds GPU limits")?,
+    ))
+}
+
 fn upload_territory_update(
     queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
+    ownership_texture: &wgpu::Texture,
+    dominant_texture: &wgpu::Texture,
     update: &TerritoryRenderUpdate,
 ) -> Result<()> {
-    let texture_size = texture.size();
+    let texture_size = ownership_texture.size();
+    anyhow::ensure!(
+        dominant_texture.size() == texture_size,
+        "ownership and dominant-side textures differ in size"
+    );
     for tile in &update.tiles {
         let bounds = tile.bounds;
         anyhow::ensure!(
@@ -1929,7 +2185,7 @@ fn upload_territory_update(
         let (packed, bytes_per_row, rows_per_image) = pack_territory_tile(tile)?;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture,
+                texture: ownership_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: u32::try_from(bounds.min_x)
@@ -1950,6 +2206,34 @@ fn upload_territory_update(
                 width: u32::try_from(bounds.max_x - bounds.min_x)
                     .context("territory tile width exceeds GPU limits")?,
                 height: rows_per_image,
+                depth_or_array_layers: 1,
+            },
+        );
+        let (dominant_packed, dominant_bytes_per_row, dominant_rows_per_image) =
+            pack_dominant_tile(tile)?;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: dominant_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: u32::try_from(bounds.min_x)
+                        .context("territory tile x exceeds GPU limits")?,
+                    y: u32::try_from(bounds.min_y)
+                        .context("territory tile y exceeds GPU limits")?,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &dominant_packed,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(dominant_bytes_per_row),
+                rows_per_image: Some(dominant_rows_per_image),
+            },
+            wgpu::Extent3d {
+                width: u32::try_from(bounds.max_x - bounds.min_x)
+                    .context("territory tile width exceeds GPU limits")?,
+                height: dominant_rows_per_image,
                 depth_or_array_layers: 1,
             },
         );
@@ -2345,14 +2629,34 @@ mod tests {
                 max_y: 3,
             },
             pixels: vec![9, 8, 7, 6],
+            dominant_sides: vec![0, 1, 1, 0],
+            dominant_city_controlled: vec![1, 0, 1, 0],
         };
         let update = TerritoryRenderUpdate {
             full_update: false,
             tiles: vec![tile.clone()],
         };
         let mut ownership = vec![0_u16; 12];
-        apply_territory_update_to_grid(&mut ownership, 4, 3, &update).unwrap();
+        let mut dominant_sides = vec![-1_i16; 12];
+        let mut dominant_city_controlled = vec![0_u8; 12];
+        apply_territory_update_to_grid(
+            &mut ownership,
+            &mut dominant_sides,
+            &mut dominant_city_controlled,
+            4,
+            3,
+            &update,
+        )
+        .unwrap();
         assert_eq!(ownership, vec![0, 0, 0, 0, 0, 9, 8, 0, 0, 7, 6, 0]);
+        assert_eq!(
+            dominant_sides,
+            vec![-1, -1, -1, -1, -1, 0, 1, -1, -1, 1, 0, -1]
+        );
+        assert_eq!(
+            dominant_city_controlled,
+            vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0]
+        );
 
         let (packed, bytes_per_row, rows) = pack_territory_tile(&tile).unwrap();
         assert_eq!(bytes_per_row as usize, ROW_ALIGNMENT);
@@ -2361,6 +2665,14 @@ mod tests {
         assert_eq!(
             &packed[ROW_ALIGNMENT..ROW_ALIGNMENT + 4],
             bytemuck::cast_slice::<u16, u8>(&[7_u16, 6])
+        );
+        let (packed_dominant, dominant_bytes_per_row, dominant_rows) =
+            pack_dominant_tile(&tile).unwrap();
+        assert_eq!(dominant_bytes_per_row as usize, ROW_ALIGNMENT);
+        assert_eq!(dominant_rows, 2);
+        assert_eq!(
+            &packed_dominant[..4],
+            bytemuck::cast_slice::<i16, u8>(&[0_i16, 1])
         );
     }
 }

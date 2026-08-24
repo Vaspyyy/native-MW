@@ -86,6 +86,10 @@ browser runtime's shared mutable `main.js` structure.
 25. Project immutable airfields, active wings, combat clusters, and the selected
     side's operational routes and hostile contacts into browser-style native
     map overlays without adding a command path back into the worker.
+26. Publish effective controller and dominant-side dirty tiles together, then
+    render browser-ordered controller frontlines, cities, side strength, and
+    curved contiguous-region country labels without exposing mutable runtime
+    state to presentation.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -520,14 +524,27 @@ false continuation artifact.
 
 ## Rendering model
 
-The world map is a regular geographic grid. Ownership IDs are uploaded as an
-integer GPU texture and converted to colors in WGSL. Borders are detected from
-neighboring ownership IDs in the shader. After initial upload, territory
-changes are transferred as bounded FIFO dirty tiles. Units are rendered from
-reference-counted immutable frame snapshots. The same committed publication
-feeds airfield and wing markers, combat clusters, and renderer-local selected-side
-operation routes and contacts; no overlay reads mutable worker state. Later
-passes can use the same publication model for cities, frontlines, and labels.
+The world map is a regular geographic grid. Effective controller IDs and
+dominant side IDs are uploaded as paired integer GPU textures. WGSL converts
+controllers to political colors, detects thin controller borders, and derives
+live war frontlines where adjacent non-negative dominant sides differ. After
+initial upload, both planes change through the same bounded FIFO dirty tiles,
+so a renderer cannot combine control from one committed publication with side
+influence from another. Published side IDs are normalized to `-1` outside
+active-theater land, and the shader disables frontlines after the runtime leaves
+an active-war state. The same tile publication carries a compact city-control
+bit that flips only when the dominant side's stored Float32 influence crosses
+the browser's strict `> 0.3` color threshold.
+
+Units are rendered from reference-counted immutable frame snapshots. The same
+committed publication feeds airfield and wing markers, combat clusters,
+renderer-local selected-side operation routes and contacts, cities, and live
+side-strength labels; no overlay reads mutable worker state. Static scenario
+cities and country names are exposed through an immutable runtime scenario
+view. Renderer-local contiguous-region sampling rebuilds curved country labels
+from the committed controller plane. Draw order mirrors the browser: base map
+and controller frontlines, air, cities, units, battles, side labels, country
+labels, operations, then the observer HUD.
 
 ## Migration order
 
@@ -600,7 +617,10 @@ passes can use the same publication model for cities, frontlines, and labels.
     **Complete.**
 25. Add browser-style immutable air, battle, operational-route, and contact
     overlays driven by the selected observer country. **Complete.**
-26. Native gameplay UI/editor/community parity remains later work after the
+26. Add browser-ordered controller frontlines, zoom/population-filtered cities,
+    live side-strength labels, and curved labels per contiguous effective
+    controller region. **Complete.**
+27. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

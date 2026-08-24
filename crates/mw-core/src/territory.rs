@@ -18,6 +18,7 @@ pub const TERRITORY_SCHEMA_VERSION: &str = "territory-control-v1";
 pub const DEFAULT_TERRITORY_TILE_SIZE: usize = 32;
 const CONTROL_HYSTERESIS: f64 = 0.15;
 const CREDIT_THRESHOLD: f64 = 0.05;
+const CITY_CONTROL_INFLUENCE_THRESHOLD: f32 = 0.3;
 const COUNTRY_ID_COUNT: usize = u16::MAX as usize + 1;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -198,8 +199,13 @@ pub struct TileBounds {
 #[serde(rename_all = "camelCase")]
 pub struct TerritoryTilePixels {
     pub bounds: TileBounds,
-    /// Only this tile's clamped rectangle, row-major.
+    /// Effective country controller for only this tile's clamped rectangle, row-major.
     pub pixels: Vec<u16>,
+    /// Live dominant-side controller for the same rectangle and ordering.
+    pub dominant_sides: Vec<i16>,
+    /// One when the active-theater dominant side has browser-visible city control
+    /// (`sideInfluenceMaps[dominantSide][cell] > 0.3`), otherwise zero.
+    pub dominant_city_controlled: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -751,16 +757,30 @@ impl TerritoryControl {
         Ok(tile_bounds(tile, self.width, self.height, self.tile_size))
     }
 
-    /// Replace influence transactionally without inferring a new boundary.
+    /// Replace influence transactionally without inferring a new boundary. Cells whose
+    /// browser-visible city-control gate flips are published to the renderer.
     pub fn set_side_influence(&mut self, value: Vec<Vec<f32>>) -> Result<(), TerritoryError> {
         validate_influence(&value, self.max_sides, self.total_cells())?;
+        let changed_cells = (0..self.total_cells())
+            .filter(|&cell| {
+                let side = self.maps.dominant_side[cell];
+                self.maps.land[cell] == 2
+                    && side >= 0
+                    && ((self.maps.side_influence[side as usize][cell]
+                        > CITY_CONTROL_INFLUENCE_THRESHOLD)
+                        != (value[side as usize][cell] > CITY_CONTROL_INFLUENCE_THRESHOLD))
+            })
+            .collect::<Vec<_>>();
         self.maps.side_influence = value;
+        for cell in changed_cells {
+            self.mark_render_cell(cell);
+        }
         Ok(())
     }
 
     /// Transactionally write selected Float32 influence cells without implying
-    /// any controller or census invalidation. Callers explicitly mark the map
-    /// cells whose derived state they also changed.
+    /// any controller or census invalidation. A dominant side crossing the
+    /// browser's city-color threshold still invalidates its render tile.
     pub fn set_side_influence_cells(
         &mut self,
         side: usize,
@@ -778,7 +798,11 @@ impl TerritoryControl {
             }
         }
         for (cell, value) in cells {
+            let was_city_controlled = self.published_city_controlled(*cell);
             self.maps.side_influence[side][*cell] = *value as f32;
+            if was_city_controlled != self.published_city_controlled(*cell) {
+                self.mark_render_cell(*cell);
+            }
         }
         Ok(cells.len())
     }
@@ -905,6 +929,7 @@ impl TerritoryControl {
         self.maps.dominant_side.fill(-1);
         self.maps.occupation.fill(0.0);
         self.reset_census();
+        self.mark_all_render(true);
     }
 
     /// Checked surgical mutation; every supplied field validates before mutation.
@@ -962,7 +987,11 @@ impl TerritoryControl {
         let changed = before != after;
         if changed {
             self.mark_census_region(cell, true);
-            if before.1 != after.1 || before.3 != after.3 {
+            if before.0 != after.0
+                || before.1 != after.1
+                || before.3 != after.3
+                || before.4 != after.4
+            {
                 self.mark_render_cell(cell);
             }
         }
@@ -1203,6 +1232,7 @@ impl TerritoryControl {
         }
         self.capture_influence_undo(cell, transaction);
         let old_controller = self.maps.dominant_side[cell];
+        let old_city_controlled = self.published_city_controlled(cell);
         for &side in active_sides {
             let row = &self.maps.side_influence[side];
             let mut sum = 0.0_f64;
@@ -1220,10 +1250,14 @@ impl TerritoryControl {
         }
         self.sync_occupation(cell);
         let controller_changed = old_controller != self.maps.dominant_side[cell];
+        let city_controlled_changed = old_city_controlled != self.published_city_controlled(cell);
         if controller_changed {
             self.mark_census_region(cell, true);
             counts.controller_change_count += 1;
             changes.record_controller(cell);
+        }
+        if controller_changed || city_controlled_changed {
+            self.mark_render_cell(cell);
         }
         FrontierCellResult {
             remains_frontier: self.is_influence_frontier_index(cell),
@@ -1320,6 +1354,7 @@ impl TerritoryControl {
                     next = current;
                 }
                 let old_controller = self.maps.dominant_side[i];
+                let old_city_controlled = self.published_city_controlled(i);
                 let old_credit = self.maps.primary_occupier[i];
                 if !owner_ally
                     && mapped_side(&self.country_side_index, old_credit) != Some(source.side)
@@ -1370,10 +1405,12 @@ impl TerritoryControl {
                 self.sync_occupation(i);
                 let credit_changed = old_credit != self.maps.primary_occupier[i];
                 let controller_changed = old_controller != self.maps.dominant_side[i];
+                let city_controlled_changed =
+                    old_city_controlled != self.published_city_controlled(i);
                 if credit_changed || controller_changed {
                     self.mark_census_region(i, true);
                 }
-                if credit_changed {
+                if credit_changed || controller_changed || city_controlled_changed {
                     self.mark_render_cell(i);
                 }
                 if credit_changed {
@@ -1512,6 +1549,17 @@ impl TerritoryControl {
         }
     }
 
+    fn published_city_controlled(&self, cell: usize) -> u8 {
+        if self.maps.land[cell] != 2 {
+            return 0;
+        }
+        let side = self.maps.dominant_side[cell];
+        if side < 0 {
+            return 0;
+        }
+        u8::from(self.maps.side_influence[side as usize][cell] > CITY_CONTROL_INFLUENCE_THRESHOLD)
+    }
+
     pub fn drain_render_update(&mut self) -> Option<Arc<TerritoryRenderUpdate>> {
         if self.render_dirty.is_empty() {
             return None;
@@ -1522,6 +1570,8 @@ impl TerritoryControl {
             let bounds = tile_bounds(tile, self.width, self.height, self.tile_size);
             let mut pixels =
                 Vec::with_capacity((bounds.max_x - bounds.min_x) * (bounds.max_y - bounds.min_y));
+            let mut dominant_sides = Vec::with_capacity(pixels.capacity());
+            let mut dominant_city_controlled = Vec::with_capacity(pixels.capacity());
             for y in bounds.min_y..bounds.max_y {
                 for x in bounds.min_x..bounds.max_x {
                     let i = y * self.width + x;
@@ -1531,9 +1581,24 @@ impl TerritoryControl {
                     } else {
                         self.maps.world_control[i]
                     });
+                    // The browser draws controller fronts only inside the active
+                    // theater (`landMask === 2`). Normalizing the presentation
+                    // plane also prevents valid stable-land controller values
+                    // from producing phantom fronts.
+                    dominant_sides.push(if self.maps.land[i] == 2 {
+                        self.maps.dominant_side[i]
+                    } else {
+                        -1
+                    });
+                    dominant_city_controlled.push(self.published_city_controlled(i));
                 }
             }
-            tiles.push(TerritoryTilePixels { bounds, pixels });
+            tiles.push(TerritoryTilePixels {
+                bounds,
+                pixels,
+                dominant_sides,
+                dominant_city_controlled,
+            });
         }
         let update = Arc::new(TerritoryRenderUpdate {
             full_update: self.full_render_pending,
@@ -3043,14 +3108,35 @@ mod tests {
         let mut c = config(70, 33, 2, 32);
         for (i, v) in c.maps.world_control.iter_mut().enumerate() {
             *v = (i % 4 + 1) as u16;
+            c.maps.dominant_side[i] = (i % 2) as i16;
         }
+        c.maps.side_influence[1][1] = 0.9;
+        c.maps.side_influence[1][3] = 0.31;
+        c.maps.land[1] = 1;
         let mut t = TerritoryControl::new(c).unwrap();
         let first = t.drain_render_update().unwrap();
         assert!(first.full_update);
         assert_eq!(first.tiles.len(), 6);
         assert_eq!(first.tiles[0].pixels.len(), 1024);
+        assert_eq!(first.tiles[0].dominant_sides.len(), 1024);
+        assert_eq!(first.tiles[0].dominant_city_controlled.len(), 1024);
         assert_eq!(first.tiles[2].pixels.len(), 192);
         assert_eq!(first.tiles[5].pixels.len(), 6);
+        assert_eq!(first.tiles[0].dominant_sides[1], -1);
+        assert_eq!(first.tiles[0].dominant_city_controlled[1], 0);
+        assert_eq!(first.tiles[0].dominant_sides[3], 1);
+        assert_eq!(first.tiles[0].dominant_city_controlled[3], 1);
+        t.set_cell_state(
+            1,
+            CellStateUpdate {
+                land: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let theater_update = t.drain_render_update().unwrap();
+        assert_eq!(theater_update.tiles[0].dominant_sides[1], 1);
+        assert_eq!(theater_update.tiles[0].dominant_city_controlled[1], 1);
         t.set_cell_state(
             31,
             CellStateUpdate {
@@ -3072,6 +3158,33 @@ mod tests {
     }
 
     #[test]
+    fn dominant_city_control_gate_dirties_only_when_strict_threshold_flips() {
+        let mut c = config(2, 1, 1, 2);
+        c.maps.dominant_side.fill(0);
+        c.maps.side_influence[0].fill(CITY_CONTROL_INFLUENCE_THRESHOLD);
+        let mut t = TerritoryControl::new(c).unwrap();
+        let initial = t.drain_render_update().unwrap();
+        assert_eq!(initial.tiles[0].dominant_city_controlled, vec![0, 0]);
+
+        t.set_side_influence_cells(0, &[(0, 0.300_001)]).unwrap();
+        let controlled = t
+            .drain_render_update()
+            .expect("crossing above the city-color threshold must publish");
+        assert_eq!(controlled.tiles[0].dominant_sides[0], 0);
+        assert_eq!(controlled.tiles[0].dominant_city_controlled[0], 1);
+
+        t.set_side_influence_cells(0, &[(0, 0.9)]).unwrap();
+        assert!(t.drain_render_update().is_none());
+
+        t.set_side_influence_cells(0, &[(0, 0.3)]).unwrap();
+        let uncontrolled = t
+            .drain_render_update()
+            .expect("the browser gate is strict, so equality must publish white");
+        assert_eq!(uncontrolled.tiles[0].dominant_sides[0], 0);
+        assert_eq!(uncontrolled.tiles[0].dominant_city_controlled[0], 0);
+    }
+
+    #[test]
     fn census_neighbors_and_render_tiles_are_invalidated_independently() {
         let mut c = config(70, 33, 2, 32);
         c.maps.primary_occupier[31] = 1;
@@ -3085,8 +3198,9 @@ mod tests {
         assert_eq!(result.controller_change_count, 1);
         assert_eq!(result.credit_change_count, 0);
         assert_eq!(t.dirty_tiles(), vec![0, 1, 3, 4]);
-        assert!(t.render_dirty_tiles().is_empty());
-        assert!(t.drain_render_update().is_none());
+        assert_eq!(t.render_dirty_tiles(), vec![0]);
+        let controller_update = t.drain_render_update().unwrap();
+        assert_eq!(controller_update.tiles[0].dominant_sides[31], 0);
 
         t.flush_census(10_000);
         let mut hostile = source(1, 2, -90.0, -149.0);

@@ -3198,6 +3198,12 @@ impl NativeRuntime {
         self.latest.clone()
     }
 
+    /// Immutable scenario features used by renderer initialization. Live
+    /// simulation state remains available only through atomic publications.
+    pub fn scenario(&self) -> &ScenarioProduction {
+        &self.scenario
+    }
+
     pub const fn state(&self) -> RuntimeState {
         self.state
     }

@@ -59,6 +59,9 @@ struct SegmentInstance {
 struct OverlayProjection {
     markers: Vec<MarkerInstance>,
     segments: Vec<SegmentInstance>,
+    air_markers: [usize; 2],
+    battle_markers: [usize; 2],
+    operation_markers: [usize; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,6 +81,9 @@ pub struct WorldOverlayRenderer {
     segment_capacity: usize,
     marker_count: u32,
     segment_count: u32,
+    air_markers: [u32; 2],
+    battle_markers: [u32; 2],
+    operation_markers: [u32; 2],
     markers: Vec<MarkerInstance>,
     segments: Vec<SegmentInstance>,
 }
@@ -195,6 +201,9 @@ impl WorldOverlayRenderer {
             segment_capacity: 1,
             marker_count: 0,
             segment_count: 0,
+            air_markers: [0; 2],
+            battle_markers: [0; 2],
+            operation_markers: [0; 2],
             markers: Vec::new(),
             segments: Vec::new(),
         }
@@ -239,20 +248,35 @@ impl WorldOverlayRenderer {
         }
         self.marker_count = self.markers.len() as u32;
         self.segment_count = self.segments.len() as u32;
+        self.air_markers = projection.air_markers.map(|index| index as u32);
+        self.battle_markers = projection.battle_markers.map(|index| index as u32);
+        self.operation_markers = projection.operation_markers.map(|index| index as u32);
     }
 
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    pub fn draw_air<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.draw_marker_range(pass, self.air_markers);
+    }
+
+    pub fn draw_battles<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.draw_marker_range(pass, self.battle_markers);
+    }
+
+    pub fn draw_operations<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         if self.segment_count > 0 {
             pass.set_pipeline(&self.segment_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.segment_buffer.slice(..));
             pass.draw(0..6, 0..self.segment_count);
         }
-        if self.marker_count > 0 {
+        self.draw_marker_range(pass, self.operation_markers);
+    }
+
+    fn draw_marker_range<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, range: [u32; 2]) {
+        if range[0] < range[1] {
             pass.set_pipeline(&self.marker_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.marker_buffer.slice(..));
-            pass.draw(0..6, 0..self.marker_count);
+            pass.draw(0..6, range[0]..range[1]);
         }
     }
 
@@ -287,11 +311,15 @@ fn project_world_overlays(
         snapshot.air_power_snapshot.as_deref(),
         &mut projection.markers,
     );
+    projection.air_markers = [0, projection.markers.len()];
+    let battle_start = projection.markers.len();
     append_battle_markers(
         &snapshot.frame_snapshot,
         snapshot.frame,
         &mut projection.markers,
     );
+    projection.battle_markers = [battle_start, projection.markers.len()];
+    let operation_start = projection.markers.len();
     if let (Some(side), Some(operations)) =
         (selected_side, snapshot.operational_snapshot.as_deref())
     {
@@ -303,6 +331,7 @@ fn project_world_overlays(
     ) {
         append_execution(execution, side, &mut projection);
     }
+    projection.operation_markers = [operation_start, projection.markers.len()];
     projection
 }
 
