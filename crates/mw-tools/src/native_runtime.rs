@@ -5655,9 +5655,17 @@ fn snapshot_checksum(snapshot: &RuntimeSnapshot) -> Result<String> {
             checksum.write_u64(value);
         }
         checksum.write_u64(u64::from(unit.coast_stuck_ticks));
-        for value in [unit.landing_penalty_active, unit.transport, unit.at_sea] {
+        for value in [
+            unit.landing_penalty_active,
+            unit.transport,
+            unit.at_sea,
+            unit.armor_supported,
+            unit.is_alpenjager,
+        ] {
             checksum.write_bool(value);
         }
+        checksum.write_u64(unit.encircled_ticks);
+        checksum.write_f64(f64::from(unit.mountain_intensity));
     }
     checksum.write_usize(snapshot.frame_snapshot.events.len());
     for event in snapshot.frame_snapshot.events.iter() {

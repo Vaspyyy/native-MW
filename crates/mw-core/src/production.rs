@@ -1181,6 +1181,10 @@ mod tests {
             landing_penalty_active: false,
             transport: false,
             at_sea: false,
+            armor_supported: false,
+            is_alpenjager: false,
+            encircled_ticks: 0,
+            mountain_intensity: 0.0,
         }
     }
 

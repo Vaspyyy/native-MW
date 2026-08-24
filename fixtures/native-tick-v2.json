@@ -1,6 +1,8 @@
 {
-  "schema": "native-tick-v1",
-  "config": { "tacticalCellSize": 0.6 },
+  "schema": "native-tick-v2",
+  "config": {
+    "tacticalCellSize": 0.6
+  },
   "grid": {
     "gridRes": 90,
     "width": 4,

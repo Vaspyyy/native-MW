@@ -29,7 +29,7 @@ use crate::{
     world::{WorldGridError, WorldGridView},
 };
 
-pub const NATIVE_TICK_SCHEMA_VERSION: &str = "native-tick-v1";
+pub const NATIVE_TICK_SCHEMA_VERSION: &str = "native-tick-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResolvedCombatOrder {
@@ -152,6 +152,10 @@ pub struct UnitSnapshot {
     pub landing_penalty_active: bool,
     pub transport: bool,
     pub at_sea: bool,
+    pub armor_supported: bool,
+    pub is_alpenjager: bool,
+    pub encircled_ticks: u64,
+    pub mountain_intensity: f32,
 }
 
 /// Immutable data that may safely outlive further simulation ticks.
@@ -896,6 +900,12 @@ impl Simulation {
                 landing_penalty_active: unit.armor_landing_penalty_until_tick > tick,
                 transport: unit.combat.transport,
                 at_sea: unit.combat.at_sea,
+                armor_supported: unit.combat.armor_supported,
+                // These values are owned by the optional live-battlefield layer. Runtime
+                // publications enrich this renderer-independent simulation snapshot.
+                is_alpenjager: false,
+                encircled_ticks: 0,
+                mountain_intensity: 0.0,
             })
             .collect::<Vec<_>>();
         units.sort_unstable_by_key(|unit| unit.id);

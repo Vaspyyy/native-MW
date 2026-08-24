@@ -161,6 +161,14 @@ while the simulation advances without reading mutable gameplay state. The GPU
 overlay uploads a snapshot only when a new one is published and reuses its CPU
 and GPU instance capacity.
 
+`native-tick-v2` also publishes the immutable unit-visual contract. The base
+simulation copies armor support and defaults battlefield-owned presentation
+fields; `NativeRuntime` v3 enriches every ID-sorted publication with Alpenjager
+identity, encirclement duration, and finite `[0, 1]` mountain intensity from the
+authoritative optional battlefield state. A live tick retains the browser's
+pre-movement terrain sample, while legacy runtimes explicitly publish zero/false
+defaults. Previously retained `Arc<FrameSnapshot>` values are never rewritten.
+
 The native sandbox observer retains the enclosing immutable `RuntimeSnapshot`
 and derives its panel model without reaching into the worker. Its country
 selection is presentation-only. Live economy records are published every tick
@@ -542,9 +550,19 @@ renderer-local selected-side operation routes and contacts, cities, and live
 side-strength labels; no overlay reads mutable worker state. Static scenario
 cities and country names are exposed through an immutable runtime scenario
 view. Renderer-local contiguous-region sampling rebuilds curved country labels
-from the committed controller plane. Draw order mirrors the browser: base map
-and controller frontlines, air, cities, units, battles, side labels, country
-labels, operations, then the observer HUD.
+from the committed controller plane. The unit pass resolves stock flag URLs
+against an embedded offline atlas, packs supported scenario data-image flags at
+startup, and draws browser-sized national flags, armor, or ships in one
+instanced GPU pass. A separate immutable label pass adds only the browser's
+equipment, victory, encirclement, mountain, and variable-formation adornments.
+Browser formations use fractional RNG IDs for macro-zoom thinning; native IDs
+are stable integers, so an FNV-derived fraction preserves the same deterministic
+20/50/100-percent density without adding renderer state. Unit quads are batched
+before the adornment batch, retaining the browser's category order while
+avoiding a pipeline switch and draw call per formation.
+Draw order mirrors the browser: base map and controller frontlines, air, cities,
+units and their adornments, battles, side labels, country labels, operations,
+then the observer HUD.
 
 ## Migration order
 
@@ -620,7 +638,10 @@ labels, operations, then the observer HUD.
 26. Add browser-ordered controller frontlines, zoom/population-filtered cities,
     live side-strength labels, and curved labels per contiguous effective
     controller region. **Complete.**
-27. Native gameplay UI/editor/community parity remains later work after the
+27. Match browser sandbox unit presentation with immutable visual-state
+    publication, offline national flags, procedural armor/ships, exact
+    zoom-density rules, and status/formation adornments. **Complete.**
+28. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

@@ -7,9 +7,11 @@ rust-version.workspace = true
 [dependencies]
 ab_glyph.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 bytemuck.workspace = true
 env_logger.workspace = true
 futures-lite.workspace = true
+image.workspace = true
 log.workspace = true
 mw-checkpoint = { package = "mw-tools", path = "../mw-tools" }
 mw-core = { path = "../mw-core" }

@@ -618,9 +618,10 @@ impl App {
             multiview_mask: None,
             cache: None,
         });
-        let mut unit_renderer = UnitRenderer::new(&device, &view_buffer, format);
+        let mut unit_renderer =
+            UnitRenderer::new(&device, &queue, &view_buffer, format, &self.metadata);
         if let Some(snapshot) = &self.latest_snapshot {
-            unit_renderer.upload(&device, &queue, &snapshot.frame_snapshot, &self.palette);
+            unit_renderer.upload(&device, &queue, &snapshot.frame_snapshot);
         }
         let mut world_overlay = WorldOverlayRenderer::new(&device, &view_buffer, format);
         if let Some(snapshot) = &self.latest_snapshot {
@@ -649,6 +650,14 @@ impl App {
                 .as_ref()
                 .map(|snapshot| snapshot.frame_snapshot.as_ref()),
         );
+        map_labels.upload_unit_adornments(
+            &device,
+            &queue,
+            map_label_view,
+            self.latest_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.frame_snapshot.as_ref()),
+        );
         self.map_labels_static_dirty = false;
         self.map_labels_sides_dirty = false;
         let mut observer_hud = ObserverHudRenderer::new(&device, format);
@@ -666,8 +675,10 @@ impl App {
         );
         self.observer_hud_dirty = false;
         log::info!(
-            "world overlays initialized with {} units, {} markers, {} route segments, {} cities, {} side labels, and {} country labels",
+            "world overlays initialized with {} units, {} national flags, {} unit adornments, {} markers, {} route segments, {} cities, {} side labels, and {} country labels",
             unit_renderer.instance_count(),
+            unit_renderer.flag_count(),
+            map_labels.layout().unit_adornments,
             world_overlay.marker_count(),
             world_overlay.segment_count(),
             map_labels.layout().city_markers,
@@ -1167,12 +1178,8 @@ impl App {
         if self.snapshot_dirty
             && let Some(snapshot) = &self.latest_snapshot
         {
-            gpu.unit_renderer.upload(
-                &gpu.device,
-                &gpu.queue,
-                &snapshot.frame_snapshot,
-                &self.palette,
-            );
+            gpu.unit_renderer
+                .upload(&gpu.device, &gpu.queue, &snapshot.frame_snapshot);
             self.snapshot_dirty = false;
         }
         if let Some(Some((snapshot, selected_side))) = world_overlay_upload {
@@ -1197,6 +1204,14 @@ impl App {
         }
         if map_labels_sides_dirty {
             gpu.map_labels.upload_sides(
+                &gpu.device,
+                &gpu.queue,
+                map_label_view,
+                self.latest_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.frame_snapshot.as_ref()),
+            );
+            gpu.map_labels.upload_unit_adornments(
                 &gpu.device,
                 &gpu.queue,
                 map_label_view,
@@ -1277,6 +1292,7 @@ impl App {
             gpu.world_overlay.draw_air(&mut pass);
             gpu.map_labels.draw_cities(&mut pass);
             gpu.unit_renderer.draw(&mut pass);
+            gpu.map_labels.draw_unit_adornments(&mut pass);
             gpu.world_overlay.draw_battles(&mut pass);
             gpu.map_labels.draw_side_labels(&mut pass);
             gpu.map_labels.draw_country_labels(&mut pass);

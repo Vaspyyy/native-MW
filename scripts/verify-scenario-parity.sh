@@ -83,9 +83,9 @@ node "$native_root/scripts/compare-unit-kernel-parity.mjs" \
 
 node "$native_root/scripts/compare-native-tick-parity.mjs" \
 	<(node "$native_root/scripts/js-native-tick-reference.mjs" report \
-		"$web_root" "$native_root/fixtures/native-tick-v1.json") \
+		"$web_root" "$native_root/fixtures/native-tick-v2.json") \
 	<("$native_root/target/debug/mw-tools" native-tick-fixture \
-		"$native_root/fixtures/native-tick-v1.json" --json)
+		"$native_root/fixtures/native-tick-v2.json" --json)
 
 node "$native_root/scripts/compare-ai-orders-parity.mjs" \
 	<(node "$native_root/scripts/js-ai-orders-reference.mjs" \
@@ -120,7 +120,7 @@ fi
 
 if ! jq -e '
 	.schema == "native-runtime-checkpoint-v1"
-	and .runtimeSchema == "native-runtime-v2"
+	and .runtimeSchema == "native-runtime-v3"
 	and .checkpointBoundary.kind == "baselineReplay"
 	and .checkpointBoundary.resumable == false
 	and .requestedSteps == 3

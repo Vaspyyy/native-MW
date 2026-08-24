@@ -143,7 +143,7 @@ function run(f, tactical) {
 		});
 	}
 	return {
-		schema: "native-tick-v1",
+		schema: "native-tick-v2",
 		steps,
 		final_units: us.map(report).sort((left, right) => left.id - right.id),
 	};

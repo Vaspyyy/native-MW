@@ -763,6 +763,10 @@ mod tests {
             landing_penalty_active: false,
             transport: false,
             at_sea: false,
+            armor_supported: false,
+            is_alpenjager: false,
+            encircled_ticks: 0,
+            mountain_intensity: 0.0,
         }
     }
 
@@ -811,7 +815,7 @@ mod tests {
 
     fn frame(units: Vec<UnitSnapshot>, events: Vec<CombatEvent>) -> FrameSnapshot {
         FrameSnapshot {
-            schema_version: "native-tick-v1",
+            schema_version: "native-tick-v2",
             tick: 1,
             frame: 1,
             units: Arc::from(units),

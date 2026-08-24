@@ -12,6 +12,7 @@ const COUNTRY_SPACING_FACTOR: f32 = 0.35;
 const COUNTRY_DRAW_CHAR_FACTOR: f32 = 0.6;
 const MAX_REGION_SAMPLES: usize = 100_000;
 const REGION_PADDING_CELLS: usize = 25;
+const BROWSER_NOMINAL_FORMATION_PERSONNEL: f64 = 1_000.0;
 const LABEL_CENTER_CULL_PX: f32 = 400.0;
 const ATLAS_SIZE: u32 = 2_048;
 const GLYPH_PADDING: u32 = 12;
@@ -255,6 +256,7 @@ pub struct MapLabelLayout {
     pub city_names: usize,
     pub side_labels: usize,
     pub country_labels: usize,
+    pub unit_adornments: usize,
 }
 
 struct VertexStore {
@@ -307,6 +309,7 @@ pub struct MapLabelRenderer {
     cities: VertexStore,
     sides: VertexStore,
     countries: VertexStore,
+    unit_adornments: VertexStore,
     layout: MapLabelLayout,
 }
 
@@ -440,6 +443,7 @@ impl MapLabelRenderer {
             cities: VertexStore::new(device, "city label vertices"),
             sides: VertexStore::new(device, "side label vertices"),
             countries: VertexStore::new(device, "country label vertices"),
+            unit_adornments: VertexStore::new(device, "unit adornment vertices"),
             layout: MapLabelLayout::default(),
         }
     }
@@ -500,6 +504,25 @@ impl MapLabelRenderer {
         self.layout.clone()
     }
 
+    pub fn upload_unit_adornments(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: MapLabelView,
+        snapshot: Option<&FrameSnapshot>,
+    ) -> MapLabelLayout {
+        self.unit_adornments.vertices.clear();
+        self.layout.unit_adornments = build_unit_adornments(
+            view,
+            snapshot,
+            &mut self.atlas,
+            &mut self.unit_adornments.vertices,
+        );
+        self.unit_adornments.upload(device, queue);
+        self.upload_atlas(queue);
+        self.layout.clone()
+    }
+
     pub fn draw_cities<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         self.draw_store(pass, &self.cities);
     }
@@ -508,6 +531,9 @@ impl MapLabelRenderer {
     }
     pub fn draw_country_labels<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         self.draw_store(pass, &self.countries);
+    }
+    pub fn draw_unit_adornments<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.draw_store(pass, &self.unit_adornments);
     }
     pub fn layout(&self) -> &MapLabelLayout {
         &self.layout
@@ -559,6 +585,56 @@ pub fn geographic_to_world(lat: f64, lng: f64) -> [f32; 2] {
         ((lng + 180.0) / 180.0) as f32,
         ((90.0 - lat) / 180.0) as f32,
     ]
+}
+
+const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+pub(crate) fn unit_visible_at_zoom(id: u64, zoom: f32) -> bool {
+    let probability = if zoom < 3.0 {
+        0.2
+    } else if zoom < 4.0 {
+        0.5
+    } else {
+        1.0
+    };
+    unit_visibility_seed(id) <= probability
+}
+
+fn unit_visibility_seed(id: u64) -> f32 {
+    let hash = id
+        .to_le_bytes()
+        .into_iter()
+        .fold(FNV64_OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(FNV64_PRIME)
+        });
+    ((hash >> 40) as u32) as f32 / 16_777_216.0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UnitAdornmentGeometry {
+    zoom_scale: f32,
+    marker_width: f32,
+    marker_height: f32,
+    armor_font_size: f32,
+    star_font_size: f32,
+    status_font_size: f32,
+    mountain_size: f32,
+    mountain_offset: f32,
+}
+
+fn unit_adornment_geometry(zoom: f32) -> UnitAdornmentGeometry {
+    let zoom_scale = 1.3_f32.powf(zoom - 3.0);
+    UnitAdornmentGeometry {
+        zoom_scale,
+        marker_width: 7.0 * zoom_scale,
+        marker_height: 4.5 * zoom_scale,
+        armor_font_size: (7.0 * zoom_scale).max(6.0),
+        star_font_size: 10.0 * zoom_scale,
+        status_font_size: (7.0 * zoom_scale).max(6.0),
+        mountain_size: 5.0 * zoom_scale,
+        mountain_offset: 10.0 * zoom_scale,
+    }
 }
 
 fn visible(view: MapLabelView, world: [f32; 2], padding: f32) -> bool {
@@ -760,6 +836,180 @@ fn build_side_labels(
         );
     }
     groups.len()
+}
+
+fn build_unit_adornments(
+    view: MapLabelView,
+    snapshot: Option<&FrameSnapshot>,
+    atlas: &mut FontAtlas,
+    vertices: &mut Vec<LabelVertex>,
+) -> usize {
+    let Some(frame) = snapshot else { return 0 };
+    let zoom = browser_zoom(view.pixels_per_world);
+    let geometry = unit_adornment_geometry(zoom);
+    let mut count = 0;
+
+    for unit in frame.units.iter() {
+        if !unit_visible_at_zoom(unit.id, zoom) {
+            continue;
+        }
+        let world = geographic_to_world(unit.lat, unit.lng);
+        if !visible(view, world, 0.02) {
+            continue;
+        }
+
+        if !unit.at_sea {
+            if unit.kind == UnitKind::Armor {
+                push_centered_bottom_text(
+                    vertices,
+                    atlas,
+                    FontFace::Mono,
+                    &unit.equipment.to_string(),
+                    world,
+                    [0.0, -geometry.marker_height * 0.7],
+                    geometry.armor_font_size,
+                    [1.0; 4],
+                    TextEffect {
+                        radius: 0.0,
+                        alpha: 0.0,
+                        softness: 0.0,
+                    },
+                );
+                count += 1;
+            }
+
+            if unit.victory_boost_ticks > 0 {
+                push_centered_text(
+                    vertices,
+                    atlas,
+                    FontFace::Serif,
+                    "★",
+                    world,
+                    [0.0, -geometry.marker_height - 2.0],
+                    geometry.star_font_size,
+                    [1.0, 0.84, 0.0, 1.0],
+                    TextEffect {
+                        radius: 6.0,
+                        alpha: 0.9,
+                        softness: 0.65,
+                    },
+                    0.0,
+                );
+                count += 1;
+            }
+
+            if unit.encircled_ticks > 30 {
+                push_centered_bottom_text(
+                    vertices,
+                    atlas,
+                    FontFace::Mono,
+                    "ENCIRCLED",
+                    world,
+                    [0.0, -geometry.marker_height * 0.5 - 3.0],
+                    geometry.status_font_size,
+                    [1.0, 0.0, 0.0, 0.9],
+                    TextEffect {
+                        radius: 0.0,
+                        alpha: 0.0,
+                        softness: 0.0,
+                    },
+                );
+                count += 1;
+            }
+
+            let mountain_intensity = unit.mountain_intensity.clamp(0.0, 1.0);
+            if mountain_intensity > 0.0 {
+                let top = -geometry.marker_height * 0.5 - geometry.mountain_offset;
+                let apex = [0.0, top];
+                let left = [-geometry.mountain_size * 0.5, top + geometry.mountain_size];
+                let right = [geometry.mountain_size * 0.5, top + geometry.mountain_size];
+                push_triangle(
+                    vertices,
+                    world,
+                    apex,
+                    left,
+                    right,
+                    [1.0, 1.0, 1.0, 0.7 + mountain_intensity * 0.3],
+                );
+                let line_width = 0.5 * geometry.zoom_scale;
+                for (start, end) in [(apex, left), (left, right), (right, apex)] {
+                    push_line(
+                        vertices,
+                        world,
+                        start,
+                        end,
+                        line_width,
+                        [0.0, 0.0, 0.0, 0.6],
+                    );
+                }
+                count += 1;
+            }
+        }
+
+        if zoom >= 3.0
+            && let Some(multiplier) = formation_multiplier(unit)
+            && multiplier > 1.15
+        {
+            let text = format_formation_multiplier(multiplier);
+            let font_size = (6.0 * geometry.zoom_scale).clamp(6.0, 10.0);
+            let padding_x = (2.0 * geometry.zoom_scale).max(2.0);
+            let badge_height = font_size + (2.0 * geometry.zoom_scale).max(2.0);
+            let badge_width =
+                measure_text(atlas, FontFace::Mono, &text, font_size) + padding_x * 2.0;
+            let badge_x = geometry.marker_width * 0.5 + geometry.zoom_scale.max(1.0);
+            let badge_min = [badge_x, -badge_height * 0.5];
+            let badge_max = [badge_x + badge_width, badge_height * 0.5];
+            let radius = (2.0 * geometry.zoom_scale).max(2.0).min(badge_height * 0.5);
+            push_rounded_rect(
+                vertices,
+                world,
+                badge_min,
+                badge_max,
+                radius,
+                [7.0 / 255.0, 9.0 / 255.0, 11.0 / 255.0, 0.86],
+            );
+            push_rounded_rect_outline(
+                vertices,
+                world,
+                badge_min,
+                badge_max,
+                radius,
+                (0.75 * geometry.zoom_scale).max(0.75),
+                side_color(unit.side),
+            );
+            push_left_middle_text(
+                vertices,
+                atlas,
+                FontFace::Mono,
+                &text,
+                world,
+                [badge_x + padding_x, 0.0],
+                font_size,
+                [243.0 / 255.0, 245.0 / 255.0, 247.0 / 255.0, 1.0],
+                TextEffect {
+                    radius: 0.0,
+                    alpha: 0.0,
+                    softness: 0.0,
+                },
+            );
+            count += 1;
+        }
+    }
+    count
+}
+
+fn formation_multiplier(unit: &mw_core::UnitSnapshot) -> Option<f64> {
+    let multiplier = unit.personnel as f64 / BROWSER_NOMINAL_FORMATION_PERSONNEL;
+    multiplier.is_finite().then_some(multiplier)
+}
+
+fn format_formation_multiplier(multiplier: f64) -> String {
+    let mut number = format!("{multiplier:.1}");
+    if number.ends_with(".0") {
+        number.truncate(number.len() - 2);
+    }
+    number.push('×');
+    number
 }
 
 fn side_color(side: u16) -> [f32; 4] {
@@ -1035,6 +1285,89 @@ fn push_annulus(
     }
 }
 
+fn measure_text(atlas: &mut FontAtlas, face: FontFace, text: &str, font_size: f32) -> f32 {
+    text.chars()
+        .filter_map(|character| atlas.glyph(face, character, font_size))
+        .map(|glyph| glyph.advance * font_size / glyph.raster_px)
+        .sum()
+}
+
+fn measured_glyphs(
+    atlas: &mut FontAtlas,
+    face: FontFace,
+    text: &str,
+    font_size: f32,
+) -> (Vec<(AtlasGlyph, f32)>, f32) {
+    let glyphs = text
+        .chars()
+        .filter_map(|character| atlas.glyph(face, character, font_size))
+        .map(|glyph| {
+            let advance = glyph.advance * font_size / glyph.raster_px;
+            (glyph, advance)
+        })
+        .collect::<Vec<_>>();
+    let width = glyphs.iter().map(|(_, advance)| advance).sum();
+    (glyphs, width)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_centered_bottom_text(
+    out: &mut Vec<LabelVertex>,
+    atlas: &mut FontAtlas,
+    face: FontFace,
+    text: &str,
+    world: [f32; 2],
+    bottom_center: [f32; 2],
+    font_size: f32,
+    color: [f32; 4],
+    effect: TextEffect,
+) {
+    let (glyphs, width) = measured_glyphs(atlas, face, text, font_size);
+    let (_, descent) = atlas.vertical_metrics(face, font_size);
+    let mut pen_x = bottom_center[0] - width * 0.5;
+    let baseline_y = bottom_center[1] + descent;
+    for (glyph, advance) in glyphs {
+        push_atlas_glyph(
+            out,
+            glyph,
+            world,
+            [pen_x, baseline_y],
+            font_size,
+            color,
+            effect,
+            0.0,
+            bottom_center,
+        );
+        pen_x += advance;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_left_middle_text(
+    out: &mut Vec<LabelVertex>,
+    atlas: &mut FontAtlas,
+    face: FontFace,
+    text: &str,
+    world: [f32; 2],
+    middle_left: [f32; 2],
+    font_size: f32,
+    color: [f32; 4],
+    effect: TextEffect,
+) {
+    let (ascent, descent) = atlas.vertical_metrics(face, font_size);
+    push_left_baseline_text(
+        out,
+        atlas,
+        face,
+        text,
+        world,
+        [middle_left[0], middle_left[1] + (ascent + descent) * 0.5],
+        font_size,
+        color,
+        effect,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_left_baseline_text(
     out: &mut Vec<LabelVertex>,
@@ -1296,6 +1629,108 @@ fn push_triangle(
     }
 }
 
+fn push_line(
+    out: &mut Vec<LabelVertex>,
+    world: [f32; 2],
+    start: [f32; 2],
+    end: [f32; 2],
+    width: f32,
+    color: [f32; 4],
+) {
+    let direction = [end[0] - start[0], end[1] - start[1]];
+    let length = direction[0].hypot(direction[1]);
+    if length <= f32::EPSILON || width <= 0.0 {
+        return;
+    }
+    let normal = [
+        -direction[1] / length * width * 0.5,
+        direction[0] / length * width * 0.5,
+    ];
+    let a = [start[0] + normal[0], start[1] + normal[1]];
+    let b = [end[0] + normal[0], end[1] + normal[1]];
+    let c = [end[0] - normal[0], end[1] - normal[1]];
+    let d = [start[0] - normal[0], start[1] - normal[1]];
+    push_triangle(out, world, a, b, c, color);
+    push_triangle(out, world, a, c, d, color);
+}
+
+fn rounded_rect_points(min: [f32; 2], max: [f32; 2], radius: f32) -> Vec<[f32; 2]> {
+    const CORNER_SEGMENTS: usize = 3;
+    let radius = radius
+        .max(0.0)
+        .min((max[0] - min[0]).max(0.0) * 0.5)
+        .min((max[1] - min[1]).max(0.0) * 0.5);
+    let corners = [
+        ([min[0] + radius, min[1] + radius], std::f32::consts::PI),
+        (
+            [max[0] - radius, min[1] + radius],
+            std::f32::consts::FRAC_PI_2 * 3.0,
+        ),
+        ([max[0] - radius, max[1] - radius], 0.0),
+        (
+            [min[0] + radius, max[1] - radius],
+            std::f32::consts::FRAC_PI_2,
+        ),
+    ];
+    let mut points = Vec::with_capacity(corners.len() * (CORNER_SEGMENTS + 1));
+    for (center, start_angle) in corners {
+        for segment in 0..=CORNER_SEGMENTS {
+            let angle =
+                start_angle + std::f32::consts::FRAC_PI_2 * segment as f32 / CORNER_SEGMENTS as f32;
+            points.push([
+                center[0] + angle.cos() * radius,
+                center[1] + angle.sin() * radius,
+            ]);
+        }
+    }
+    points
+}
+
+fn push_rounded_rect(
+    out: &mut Vec<LabelVertex>,
+    world: [f32; 2],
+    min: [f32; 2],
+    max: [f32; 2],
+    radius: f32,
+    color: [f32; 4],
+) {
+    let points = rounded_rect_points(min, max, radius);
+    let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
+    for index in 0..points.len() {
+        push_triangle(
+            out,
+            world,
+            center,
+            points[index],
+            points[(index + 1) % points.len()],
+            color,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_rounded_rect_outline(
+    out: &mut Vec<LabelVertex>,
+    world: [f32; 2],
+    min: [f32; 2],
+    max: [f32; 2],
+    radius: f32,
+    width: f32,
+    color: [f32; 4],
+) {
+    let points = rounded_rect_points(min, max, radius);
+    for index in 0..points.len() {
+        push_line(
+            out,
+            world,
+            points[index],
+            points[(index + 1) % points.len()],
+            width,
+            color,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1332,6 +1767,18 @@ mod tests {
             landing_penalty_active: false,
             transport: false,
             at_sea: false,
+            armor_supported: false,
+            is_alpenjager: false,
+            encircled_ticks: 0,
+            mountain_intensity: 0.0,
+        }
+    }
+
+    fn view_at_zoom(zoom: f32) -> MapLabelView {
+        MapLabelView {
+            viewport: [800.0; 2],
+            center: [1.0, 0.5],
+            pixels_per_world: TILE_SIZE / WORLD_WIDTH * 2.0_f32.powf(zoom),
         }
     }
 
@@ -1771,6 +2218,181 @@ mod tests {
         assert!(
             !first.is_empty(),
             "zero personnel must still produce glyph geometry"
+        );
+    }
+
+    #[test]
+    fn unit_density_uses_shared_fnv_thresholds() {
+        let middle = (1..10_000)
+            .find(|id| {
+                let seed = unit_visibility_seed(*id);
+                seed > 0.2 && seed <= 0.5
+            })
+            .unwrap();
+        assert!(!unit_visible_at_zoom(middle, 2.999));
+        assert!(unit_visible_at_zoom(middle, 3.0));
+        assert!(unit_visible_at_zoom(middle, 3.999));
+
+        let high = (1..10_000)
+            .find(|id| unit_visibility_seed(*id) > 0.5)
+            .unwrap();
+        assert!(!unit_visible_at_zoom(high, 3.5));
+        assert!(unit_visible_at_zoom(high, 4.0));
+
+        let low_count = (1..=10_000)
+            .filter(|id| unit_visible_at_zoom(*id, 2.5))
+            .count();
+        let middle_count = (1..=10_000)
+            .filter(|id| unit_visible_at_zoom(*id, 3.5))
+            .count();
+        assert!((1_850..=2_150).contains(&low_count));
+        assert!((4_850..=5_150).contains(&middle_count));
+        assert!((1..=10_000).all(|id| unit_visible_at_zoom(id, 4.0)));
+    }
+
+    #[test]
+    fn unit_adornment_geometry_matches_browser_zoom_scale() {
+        let base = unit_adornment_geometry(3.0);
+        assert!((base.zoom_scale - 1.0).abs() < 1e-6);
+        assert!((base.marker_width - 7.0).abs() < 1e-6);
+        assert!((base.marker_height - 4.5).abs() < 1e-6);
+        assert!((base.mountain_size - 5.0).abs() < 1e-6);
+        assert!((base.mountain_offset - 10.0).abs() < 1e-6);
+
+        let zoomed = unit_adornment_geometry(4.0);
+        assert!((zoomed.zoom_scale - 1.3).abs() < 1e-6);
+        assert!((zoomed.marker_width - 9.1).abs() < 1e-5);
+        assert!((zoomed.marker_height - 5.85).abs() < 1e-5);
+    }
+
+    #[test]
+    fn status_thresholds_and_land_sea_split_match_browser() {
+        let mut decorated = unit(1, 0, UnitKind::Armor, 2_300, 0.0, 0.0);
+        decorated.personnel_capacity = 2_300;
+        decorated.equipment = 37;
+        decorated.victory_boost_ticks = 1;
+        decorated.encircled_ticks = 31;
+        decorated.mountain_intensity = 0.5;
+
+        let mut sea = decorated;
+        sea.id = 2;
+        sea.at_sea = true;
+
+        let mut threshold = unit(3, 0, UnitKind::Army, 1_000, 0.0, 0.0);
+        threshold.personnel_capacity = 1_000;
+        threshold.encircled_ticks = 30;
+
+        let mut atlas = FontAtlas::new();
+        let mut vertices = Vec::new();
+        let count = build_unit_adornments(
+            view_at_zoom(4.0),
+            Some(&frame(vec![decorated, sea, threshold])),
+            &mut atlas,
+            &mut vertices,
+        );
+        assert_eq!(count, 6, "five land adornments plus the sea strength badge");
+        assert!(!vertices.is_empty());
+        assert!(vertices.iter().all(|vertex| {
+            vertex.world.iter().all(|value| value.is_finite())
+                && vertex.offset.iter().all(|value| value.is_finite())
+                && vertex.color.iter().all(|value| value.is_finite())
+        }));
+    }
+
+    #[test]
+    fn mountain_triangle_alpha_and_encirclement_threshold_are_exact() {
+        let mut mountain = unit(1, 0, UnitKind::Army, 1_000, 0.0, 0.0);
+        mountain.mountain_intensity = 0.5;
+        let mut atlas = FontAtlas::new();
+        let mut vertices = Vec::new();
+        assert_eq!(
+            build_unit_adornments(
+                view_at_zoom(4.0),
+                Some(&frame(vec![mountain])),
+                &mut atlas,
+                &mut vertices,
+            ),
+            1
+        );
+        assert_eq!(vertices.len(), 3 + 3 * 6);
+        assert!(
+            vertices[..3]
+                .iter()
+                .all(|vertex| (vertex.color[3] - 0.85).abs() < 1e-6)
+        );
+        assert!(
+            vertices[3..]
+                .iter()
+                .all(|vertex| vertex.color == [0.0, 0.0, 0.0, 0.6])
+        );
+
+        let mut exact = unit(2, 0, UnitKind::Army, 1_000, 0.0, 0.0);
+        exact.encircled_ticks = 30;
+        vertices.clear();
+        assert_eq!(
+            build_unit_adornments(
+                view_at_zoom(4.0),
+                Some(&frame(vec![exact])),
+                &mut atlas,
+                &mut vertices,
+            ),
+            0
+        );
+        exact.encircled_ticks = 31;
+        assert_eq!(
+            build_unit_adornments(
+                view_at_zoom(4.0),
+                Some(&frame(vec![exact])),
+                &mut atlas,
+                &mut vertices,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn formation_badge_threshold_and_format_are_browser_style() {
+        assert_eq!(format_formation_multiplier(1.16), "1.2×");
+        assert_eq!(format_formation_multiplier(2.0), "2×");
+
+        let mut exact = unit(1, 1, UnitKind::Army, 1_150, 0.0, 0.0);
+        exact.personnel_capacity = 3_000;
+        let mut above = exact;
+        above.id = 2;
+        above.personnel = 1_151;
+        above.personnel_capacity = 3_000;
+        let mut atlas = FontAtlas::new();
+        let mut vertices = Vec::new();
+        assert_eq!(
+            build_unit_adornments(
+                view_at_zoom(4.0),
+                Some(&frame(vec![exact])),
+                &mut atlas,
+                &mut vertices,
+            ),
+            0
+        );
+        assert_eq!(
+            build_unit_adornments(
+                view_at_zoom(4.0),
+                Some(&frame(vec![above])),
+                &mut atlas,
+                &mut vertices,
+            ),
+            1
+        );
+        assert!(vertices.iter().any(|vertex| vertex.textured == 0.0));
+        assert!(vertices.iter().any(|vertex| vertex.textured == 1.0));
+
+        vertices.clear();
+        assert_eq!(
+            build_unit_adornments(
+                view_at_zoom(2.999),
+                Some(&frame(vec![above])),
+                &mut atlas,
+                &mut vertices,
+            ),
+            0
         );
     }
 }

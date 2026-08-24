@@ -26,7 +26,7 @@ use crate::{
     runtime_worker::{RuntimeWorker, RuntimeWorkerStatus},
 };
 
-const HEADLESS_SCHEMA: &str = "mw-native-headless-v3";
+const HEADLESS_SCHEMA: &str = "mw-native-headless-v4";
 const RESUMABLE_CHECKPOINT_BOUNDARIES: [&str; 2] = ["postStartWar", "midWar"];
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MIN_WATCHDOG: Duration = Duration::from_secs(30);
@@ -601,6 +601,10 @@ fn checksum_runtime_snapshot(checksum: &mut Fnv64, snapshot: &RuntimeSnapshot) -
         checksum.write_bool(unit.landing_penalty_active);
         checksum.write_bool(unit.transport);
         checksum.write_bool(unit.at_sea);
+        checksum.write_bool(unit.armor_supported);
+        checksum.write_bool(unit.is_alpenjager);
+        checksum.write_u64(unit.encircled_ticks);
+        checksum.write_f64(f64::from(unit.mountain_intensity));
     }
 
     checksum.write_u64(frame.events.len() as u64);

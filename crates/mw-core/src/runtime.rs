@@ -87,7 +87,7 @@ use crate::{
     world::WorldGridView,
 };
 
-pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v2";
+pub const NATIVE_RUNTIME_SCHEMA_VERSION: &str = "native-runtime-v3";
 pub const DEFAULT_FRONT_REFRESH_TICKS: u64 = 30;
 pub const DEFAULT_CENSUS_BUDGET: usize = 16_384;
 pub const DEFAULT_CENSUS_FLUSH_CHUNK: usize = 65_536;
@@ -1625,6 +1625,75 @@ struct StagedBattlefieldTick {
     influence_eligible: BTreeSet<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PublishedUnitVisuals {
+    armor_supported: bool,
+    is_alpenjager: bool,
+    encircled_ticks: u64,
+    mountain_intensity: f32,
+}
+
+fn enrich_unit_visuals(
+    frame: &mut FrameSnapshot,
+    battlefield: Option<&BattlefieldRuntimeState>,
+    territory: &TerritoryControl,
+    staged: Option<&StagedBattlefieldTick>,
+) -> Result<(), RuntimeError> {
+    let Some(battlefield) = battlefield else {
+        return Ok(());
+    };
+    let world = WorldGridView::new(
+        territory.grid_resolution(),
+        territory.width(),
+        territory.height(),
+        territory.land(),
+    )
+    .map_err(BattlefieldError::from)?;
+    let mut units = frame.units.to_vec();
+    for unit in &mut units {
+        let memory = staged
+            .and_then(|stage| stage.next_unit_state.get(&unit.id))
+            .or_else(|| battlefield.units.get(&unit.id))
+            .ok_or(RuntimeError::InvalidCheckpoint(
+                "battlefield state does not cover a published unit",
+            ))?;
+        let mountain_intensity = staged
+            .and_then(|stage| stage.resolved_unit(unit.id))
+            .map(|resolved| resolved.cell.mountain_intensity as f32)
+            .unwrap_or_else(|| {
+                if battlefield.mountains_enabled {
+                    world
+                        .grid_index(unit.lat, unit.lng)
+                        .map_or(0.0, |cell| battlefield.terrain_intensity[cell])
+                } else {
+                    0.0
+                }
+            });
+        if !mountain_intensity.is_finite() || !(0.0..=1.0).contains(&mountain_intensity) {
+            return Err(RuntimeError::InvalidCheckpoint(
+                "published unit mountain intensity is invalid",
+            ));
+        }
+        let visuals = PublishedUnitVisuals {
+            armor_supported: staged
+                .and_then(|stage| stage.local_unit(unit.id))
+                .map_or(unit.armor_supported, |local| local.armor_supported),
+            is_alpenjager: memory.is_alpenjager,
+            encircled_ticks: staged
+                .and_then(|stage| stage.resolved_unit(unit.id))
+                .map_or(memory.encircled_ticks, |resolved| resolved.encircled_ticks),
+            mountain_intensity,
+        };
+        unit.armor_supported = visuals.armor_supported;
+        unit.is_alpenjager = visuals.is_alpenjager;
+        unit.encircled_ticks = visuals.encircled_ticks;
+        unit.mountain_intensity = visuals.mountain_intensity;
+    }
+    debug_assert!(units.windows(2).all(|pair| pair[0].id < pair[1].id));
+    frame.units = units.into();
+    Ok(())
+}
+
 struct StagedInfluenceTick {
     transaction: InfluenceTransaction,
     source_count: usize,
@@ -3053,11 +3122,16 @@ impl NativeRuntime {
         // A checkpoint may have an in-progress bounded census. Construction finishes it before
         // exposing the first cross-kernel publication.
         let territory_snapshot = checkpoint.territory.flush_census(config.census_flush_chunk);
-        let frame_snapshot = Arc::new(
-            checkpoint
-                .simulation
-                .initial_snapshot(checkpoint.tick, checkpoint.frame),
-        );
+        let mut initial_frame = checkpoint
+            .simulation
+            .initial_snapshot(checkpoint.tick, checkpoint.frame);
+        enrich_unit_visuals(
+            &mut initial_frame,
+            checkpoint.battlefield.as_ref(),
+            &checkpoint.territory,
+            None,
+        )?;
+        let frame_snapshot = Arc::new(initial_frame);
         validate_production_boundary(
             checkpoint.tick,
             &checkpoint.scenario,
@@ -5163,6 +5237,12 @@ impl NativeRuntime {
                 .map(|unit| (unit.combat.id, unit.combat.sovereign as u16)),
         );
         self.unit_sovereign_by_id.sort_unstable();
+        enrich_unit_visuals(
+            &mut frame_snapshot,
+            self.battlefield.as_ref(),
+            &self.territory,
+            staged_battlefield.as_ref(),
+        )?;
         let surviving_ids = frame_snapshot
             .units
             .iter()
@@ -6408,6 +6488,97 @@ mod tests {
             units,
         });
         NativeRuntime::new(config, runtime_checkpoint(captured)).unwrap()
+    }
+
+    #[test]
+    fn unit_visual_publication_is_enriched_and_immutable_across_continuation() {
+        let mut base = fixture(0, false);
+        let mut captured = base.checkpoint_state().unwrap();
+        captured.units[0].combat.armor_supported = true;
+        let countries = captured
+            .territory_config
+            .country_to_side
+            .keys()
+            .copied()
+            .map(|country| (country, CountryBattlefieldPrimitives::default()))
+            .collect();
+        let mut units = captured
+            .units
+            .iter()
+            .map(|unit| (unit.combat.id, BattlefieldUnitState::default()))
+            .collect::<BTreeMap<_, _>>();
+        units.get_mut(&1).unwrap().is_alpenjager = true;
+        units.get_mut(&1).unwrap().encircled_ticks = 61;
+        captured.battlefield = Some(BattlefieldRuntimeState {
+            config: BattlefieldConfig {
+                encirclement_radius: 90.0,
+                ..BattlefieldConfig::default()
+            },
+            mountains_enabled: true,
+            terrain_intensity: vec![0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            urban_centers: Vec::new(),
+            countries,
+            units,
+        });
+
+        let mut runtime = NativeRuntime::new(base.config, runtime_checkpoint(captured)).unwrap();
+        let initial = runtime.latest_snapshot();
+        let unit = initial
+            .frame_snapshot
+            .units
+            .iter()
+            .find(|unit| unit.id == 1)
+            .unwrap();
+        assert!(unit.armor_supported);
+        assert!(unit.is_alpenjager);
+        assert_eq!(unit.encircled_ticks, 61);
+        assert_eq!(unit.mountain_intensity, 0.5);
+
+        let next = runtime.step().unwrap();
+        let next_unit = next
+            .frame_snapshot
+            .units
+            .iter()
+            .find(|unit| unit.id == 1)
+            .unwrap();
+        assert!(next_unit.is_alpenjager);
+        assert_eq!(next_unit.mountain_intensity, 0.5);
+        assert_eq!(initial.frame_snapshot.units[0].encircled_ticks, 61);
+        assert_eq!(initial.frame_snapshot.units[0].mountain_intensity, 0.5);
+
+        let state = runtime.checkpoint_state().unwrap();
+        let resumed = NativeRuntime::new(runtime.config, runtime_checkpoint(state)).unwrap();
+        let resumed_snapshot = resumed.latest_snapshot();
+        for resumed_unit in resumed_snapshot.frame_snapshot.units.iter() {
+            let continued_unit = next
+                .frame_snapshot
+                .units
+                .iter()
+                .find(|unit| unit.id == resumed_unit.id)
+                .unwrap();
+            assert_eq!(resumed_unit.armor_supported, continued_unit.armor_supported);
+            assert_eq!(resumed_unit.is_alpenjager, continued_unit.is_alpenjager);
+            assert_eq!(resumed_unit.encircled_ticks, continued_unit.encircled_ticks);
+            assert!(resumed_unit.mountain_intensity.is_finite());
+            assert!((0.0..=1.0).contains(&resumed_unit.mountain_intensity));
+        }
+    }
+
+    #[test]
+    fn legacy_runtime_unit_visuals_use_explicit_defaults() {
+        let runtime = fixture(0, false);
+        assert!(
+            runtime
+                .latest_snapshot()
+                .frame_snapshot
+                .units
+                .iter()
+                .all(|unit| {
+                    !unit.is_alpenjager
+                        && unit.encircled_ticks == 0
+                        && unit.mountain_intensity == 0.0
+                })
+        );
     }
 
     fn enable_side_dynamics(runtime: &mut NativeRuntime) {

@@ -644,7 +644,7 @@ mod tests {
     fn fixture_json(extra: &str) -> String {
         format!(
             r#"{{
-                "schema":"native-tick-v1",
+                "schema":"native-tick-v2",
                 "config":{{"tacticalCellSize":0.6}},
                 "grid":{{"gridRes":90,"width":4,"height":2,"landMask":[1,1,1,1,1,1,1,1]}},
                 "maxSides":1,

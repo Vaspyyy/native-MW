@@ -108,7 +108,7 @@ for (let pairIndex = 0; pairIndex < unitsPerSide; pairIndex++) {
 
 console.log(
 	JSON.stringify({
-		schema: "native-tick-v1",
+		schema: "native-tick-v2",
 		config: { tacticalCellSize: CELL_SIZE },
 		grid: { gridRes: 1, width: 360, height: 180, landMask: mask },
 		maxSides: 2,

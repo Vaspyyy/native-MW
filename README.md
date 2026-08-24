@@ -59,6 +59,9 @@ reference while systems move into the renderer-independent `mw-core` crate.
   window-free worker validation with clean terminal-conflict completion
 - optimized full-cap territory and combat hot paths using dense lookup tables,
   reusable cell tracking, and in-place prevalidated pair dispatch
+- browser-matched sandbox unit markers: offline national flags, procedural
+  armor and ships, zoom-density filtering, victory/encirclement/mountain
+  indicators, and variable-strength formation badges
 - headless JavaScript parity fixtures and timing for every migrated slice
 
 The repository intentionally starts with the existing browser scenarios rather
@@ -82,7 +85,7 @@ cargo run --release -p mw-tools -- inspect ../modern-wars/assets/maps/compiled/w
 cargo run --release -p mw-tools -- production-inspect ../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz --grid-res 0.15 --country Germany
 cargo run --release -p mw-tools -- tactical-fixture fixtures/tactical-grid-v1.json
 cargo run --release -p mw-tools -- unit-fixture fixtures/movement-combat-v1.json
-cargo run --release -p mw-tools -- native-tick-fixture fixtures/native-tick-v1.json
+cargo run --release -p mw-tools -- native-tick-fixture fixtures/native-tick-v2.json
 cargo run --release -p mw-tools -- ai-orders-fixture fixtures/ai-orders-v1.json
 cargo run --release -p mw-tools -- territory-control-fixture fixtures/territory-control-v1.json
 cargo run --release -p mw-tools -- strategic-cycle-fixture fixtures/strategic-cycle-v1.json
@@ -196,6 +199,12 @@ gameplay-RNG and naval-exile reserve continuation, and v10 adds reinforcement,
 recruitment, and air-logistics continuation. They reject the synthetic, non-resumable
 `baselineReplay` boundary. Normal startup remains a map-only viewer, and
 `--demo-units` remains available as the small scenario-derived runtime.
+
+Unit flags are resolved without runtime network access. Stock flag CDN URLs map
+to the embedded 271-flag atlas, while scenario-embedded PNG, JPEG, and WebP data
+flags are decoded into its reserved cells. Unknown external URLs fall back to a
+matching atlas country name or the browser side color. Atlas provenance and its
+MIT license are documented in `crates/mw-native/assets/flags/README.md`.
 
 For an automated three-frame GPU/window smoke test:
 
