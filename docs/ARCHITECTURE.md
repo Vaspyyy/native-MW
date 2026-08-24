@@ -667,7 +667,12 @@ then the observer HUD.
     through the transactional influence path, preserving exact shared-RNG and
     checkpoint continuation. **Complete for dynamic-influence runtime ticks;
     legacy v1/v2 behavior remains unchanged.**
-29. Native gameplay UI/editor/community parity remains later work after the
+29. Match the browser Simplified-map projection boundary with shared EPSG:3857
+    map, unit, label, route, marker, camera, and picking transforms; preserve
+    Leaflet's default center and zoom range, fractional debounced wheel curve,
+    projected country gradients, and antimeridian world-copy presentation.
+    **Complete.**
+30. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

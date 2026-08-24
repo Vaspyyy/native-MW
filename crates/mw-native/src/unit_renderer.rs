@@ -477,12 +477,7 @@ fn side_color(side: u16) -> [f32; 4] {
     COLORS[side as usize % COLORS.len()]
 }
 
-pub fn geographic_to_world(lat: f64, lng: f64) -> [f32; 2] {
-    [
-        ((lng + 180.0) / 180.0) as f32,
-        ((90.0 - lat) / 180.0) as f32,
-    ]
-}
+pub use crate::projection::geographic_to_world;
 
 #[cfg(test)]
 mod tests {
@@ -492,8 +487,8 @@ mod tests {
     #[test]
     fn geographic_mapping_matches_map_projection() {
         assert_eq!(geographic_to_world(90.0, -180.0), [0.0, 0.0]);
-        assert_eq!(geographic_to_world(0.0, 0.0), [1.0, 0.5]);
-        assert_eq!(geographic_to_world(-90.0, 180.0), [2.0, 1.0]);
+        assert_eq!(geographic_to_world(0.0, 0.0), [1.0, 1.0]);
+        assert_eq!(geographic_to_world(-90.0, 180.0), [2.0, 2.0]);
     }
 
     #[test]

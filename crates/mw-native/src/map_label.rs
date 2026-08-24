@@ -4,8 +4,6 @@ use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use bytemuck::{Pod, Zeroable};
 use mw_core::{FrameSnapshot, ProductionCity, UnitKind};
 
-const WORLD_WIDTH: f32 = 2.0;
-const TILE_SIZE: f32 = 256.0;
 const COUNTRY_SAMPLE_BINS: usize = 4;
 const COUNTRY_FIT_CHAR_FACTOR: f32 = 0.65;
 const COUNTRY_SPACING_FACTOR: f32 = 0.35;
@@ -576,16 +574,8 @@ impl MapLabelRenderer {
     }
 }
 
-pub fn browser_zoom(pixels_per_world: f32) -> f32 {
-    (pixels_per_world.max(1.0) * WORLD_WIDTH / TILE_SIZE).log2()
-}
-
-pub fn geographic_to_world(lat: f64, lng: f64) -> [f32; 2] {
-    [
-        ((lng + 180.0) / 180.0) as f32,
-        ((90.0 - lat) / 180.0) as f32,
-    ]
-}
+pub use crate::projection::{browser_zoom, geographic_to_world};
+use crate::projection::{grid_to_world, world_to_geographic, wrapped_world_delta_x};
 
 const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -642,7 +632,8 @@ fn visible(view: MapLabelView, world: [f32; 2], padding: f32) -> bool {
         view.viewport[0] / view.pixels_per_world * 0.5 + padding,
         view.viewport[1] / view.pixels_per_world * 0.5 + padding,
     ];
-    (world[0] - view.center[0]).abs() <= half[0] && (world[1] - view.center[1]).abs() <= half[1]
+    wrapped_world_delta_x(world[0], view.center[0]).abs() <= half[0]
+        && (world[1] - view.center[1]).abs() <= half[1]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1062,17 +1053,23 @@ struct Region {
 
 impl Region {
     fn anchor_world(&self, grid: [usize; 2]) -> [f32; 2] {
-        [
-            self.component_sum[0] as f32 / self.component_count as f32 / grid[0] as f32 * 2.0,
-            1.0 - self.component_sum[1] as f32 / self.component_count as f32 / grid[1] as f32,
-        ]
+        grid_to_world(
+            self.component_sum[0] as f64 / self.component_count as f64,
+            self.component_sum[1] as f64 / self.component_count as f64,
+            grid[0] as f64,
+            grid[1] as f64,
+        )
     }
 
     fn center_is_near_view(&self, view: MapLabelView, grid: [usize; 2]) -> bool {
         let world = self.anchor_world(grid);
-        let offset = [world[0] - view.center[0], world[1] - view.center[1]];
-        if offset[0].abs() > view.viewport[0] / view.pixels_per_world
-            || offset[1].abs() > view.viewport[1] / view.pixels_per_world
+        let offset = [
+            wrapped_world_delta_x(world[0], view.center[0]),
+            world[1] - view.center[1],
+        ];
+        let margin_world = LABEL_CENTER_CULL_PX / view.pixels_per_world;
+        if offset[0].abs() > view.viewport[0] / view.pixels_per_world + margin_world
+            || offset[1].abs() > view.viewport[1] / view.pixels_per_world + margin_world
         {
             return false;
         }
@@ -1092,10 +1089,7 @@ impl Region {
         let width = (self.max[0] - self.min[0] + 1).max(1) as f32;
         for [x, y] in &self.visible_cells {
             let bin = (((*x - self.min[0]) as f32 / width) * 4.0).floor().min(3.0) as usize;
-            let world = [
-                *x as f32 / grid[0] as f32 * 2.0,
-                1.0 - *y as f32 / grid[1] as f32,
-            ];
+            let world = grid_to_world(*x as f64, *y as f64, grid[0] as f64, grid[1] as f64);
             sums[bin][0] += world[0];
             sums[bin][1] += world[1];
             sums[bin][2] += 1.0;
@@ -1140,7 +1134,19 @@ impl Region {
 
     fn screen_area(&self, view: MapLabelView, grid: [usize; 2]) -> f32 {
         let w = (self.max[0] - self.min[0]) as f32 / grid[0] as f32 * 2.0 * view.pixels_per_world;
-        let h = (self.max[1] - self.min[1]) as f32 / grid[1] as f32 * view.pixels_per_world;
+        let top = grid_to_world(
+            self.min[0] as f64,
+            self.min[1] as f64,
+            grid[0] as f64,
+            grid[1] as f64,
+        )[1];
+        let bottom = grid_to_world(
+            self.min[0] as f64,
+            self.max[1] as f64,
+            grid[0] as f64,
+            grid[1] as f64,
+        )[1];
+        let h = (bottom - top).abs() * view.pixels_per_world;
         w * h
     }
 }
@@ -1161,19 +1167,30 @@ fn sampled_regions(view: MapLabelView, grid: [usize; 2], owners: &[u16]) -> Vec<
         view.viewport[0] / view.pixels_per_world * 0.5,
         view.viewport[1] / view.pixels_per_world * 0.5,
     ];
-    let view_x_min = ((view.center[0] - half_world[0]) * grid[0] as f32 / 2.0)
+    let raw_x_min = view.center[0] - half_world[0];
+    let raw_x_max = view.center[0] + half_world[0];
+    let crosses_antimeridian = raw_x_min < 0.0 || raw_x_max >= 2.0;
+    let (view_x_min, view_x_max) = if crosses_antimeridian {
+        (0, grid[0] - 1)
+    } else {
+        (
+            (raw_x_min * grid[0] as f32 / 2.0)
+                .floor()
+                .clamp(0.0, grid[0] as f32 - 1.0) as usize,
+            (raw_x_max * grid[0] as f32 / 2.0)
+                .ceil()
+                .clamp(0.0, grid[0] as f32 - 1.0) as usize,
+        )
+    };
+    // Source rows run south-to-north; invert Mercator before selecting rows.
+    let south_lat = world_to_geographic([0.0, (view.center[1] + half_world[1]) as f64])[0];
+    let north_lat = world_to_geographic([0.0, (view.center[1] - half_world[1]) as f64])[0];
+    let view_y_min = (((south_lat + 90.0) / 180.0) * grid[1] as f64)
         .floor()
-        .clamp(0.0, grid[0] as f32 - 1.0) as usize;
-    let view_x_max = ((view.center[0] + half_world[0]) * grid[0] as f32 / 2.0)
+        .clamp(0.0, grid[1] as f64 - 1.0) as usize;
+    let view_y_max = (((north_lat + 90.0) / 180.0) * grid[1] as f64)
         .ceil()
-        .clamp(0.0, grid[0] as f32 - 1.0) as usize;
-    // Source rows run south-to-north, while world Y runs north-to-south.
-    let view_y_min = ((1.0 - view.center[1] - half_world[1]) * grid[1] as f32)
-        .floor()
-        .clamp(0.0, grid[1] as f32 - 1.0) as usize;
-    let view_y_max = ((1.0 - view.center[1] + half_world[1]) * grid[1] as f32)
-        .ceil()
-        .clamp(0.0, grid[1] as f32 - 1.0) as usize;
+        .clamp(0.0, grid[1] as f64 - 1.0) as usize;
     let search_x_min = view_x_min.saturating_sub(REGION_PADDING_CELLS);
     let search_x_max = (view_x_max + REGION_PADDING_CELLS).min(grid[0] - 1);
     let search_y_min = view_y_min.saturating_sub(REGION_PADDING_CELLS);
@@ -1777,8 +1794,8 @@ mod tests {
     fn view_at_zoom(zoom: f32) -> MapLabelView {
         MapLabelView {
             viewport: [800.0; 2],
-            center: [1.0, 0.5],
-            pixels_per_world: TILE_SIZE / WORLD_WIDTH * 2.0_f32.powf(zoom),
+            center: [1.0, 1.0],
+            pixels_per_world: crate::projection::pixels_per_world_for_zoom(zoom),
         }
     }
 
@@ -1800,7 +1817,7 @@ mod tests {
     }
     #[test]
     fn projection_matches_native_map() {
-        assert_eq!(geographic_to_world(0.0, 0.0), [1.0, 0.5]);
+        assert_eq!(geographic_to_world(0.0, 0.0), [1.0, 1.0]);
     }
 
     #[test]
@@ -1827,7 +1844,7 @@ mod tests {
         push_atlas_glyph(
             &mut vertices,
             glyph,
-            [1.0, 0.5],
+            [1.0, 1.0],
             [0.0, 0.0],
             10.0,
             [1.0; 4],
@@ -1855,7 +1872,7 @@ mod tests {
         let regions = sampled_regions(
             MapLabelView {
                 viewport: [65_536.0, 32_768.0],
-                center: [1.0, 0.5],
+                center: [1.0, 1.0],
                 pixels_per_world: 32768.0,
             },
             [3, 3],
@@ -1867,7 +1884,7 @@ mod tests {
     fn city_population_thresholds_are_strict() {
         let view = MapLabelView {
             viewport: [800.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 2048.0,
         };
         assert_eq!(browser_zoom(view.pixels_per_world), 4.0);
@@ -1920,7 +1937,7 @@ mod tests {
     fn active_city_comes_from_dominant_side_not_owner() {
         let view = MapLabelView {
             viewport: [800.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 1024.0,
         };
         let city = ProductionCity {
@@ -1971,7 +1988,7 @@ mod tests {
     fn city_fill_and_one_pixel_annulus_follow_browser_control_gate() {
         let view = MapLabelView {
             viewport: [800.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 2048.0,
         };
         let city = ProductionCity {
@@ -2076,10 +2093,14 @@ mod tests {
         };
         let view = MapLabelView {
             viewport: [800.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 100.0,
         };
-        assert!((region.screen_area(view, [8, 4]) - 13_125.0).abs() < 1e-6);
+        let expected_height =
+            (grid_to_world(0.0, 3.0, 8.0, 4.0)[1] - grid_to_world(0.0, 0.0, 8.0, 4.0)[1]).abs()
+                * view.pixels_per_world;
+        let expected = 7.0 / 8.0 * 2.0 * view.pixels_per_world * expected_height;
+        assert!((region.screen_area(view, [8, 4]) - expected).abs() < 1e-4);
     }
 
     #[test]
@@ -2094,7 +2115,7 @@ mod tests {
         };
         let view = MapLabelView {
             viewport: [800.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 100.0,
         };
         let points = region.screen_points(view, [8, 4]);
@@ -2124,7 +2145,7 @@ mod tests {
         };
         let view = MapLabelView {
             viewport: [100.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 1_000.0,
         };
         assert!(near.center_is_near_view(view, [8, 4]));
@@ -2135,15 +2156,15 @@ mod tests {
     fn region_center_must_also_fit_browser_half_padded_bounds() {
         let outside_padded_bounds_but_inside_pixel_margin = Region {
             owner: 1,
-            visible_cells: vec![[5, 2]],
-            component_sum: [5, 2],
+            visible_cells: vec![[6, 2]],
+            component_sum: [6, 2],
             component_count: 1,
-            min: [5, 2],
-            max: [5, 2],
+            min: [6, 2],
+            max: [6, 2],
         };
         let view = MapLabelView {
             viewport: [100.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 1_000.0,
         };
         assert!(!outside_padded_bounds_but_inside_pixel_margin.center_is_near_view(view, [8, 4]));
@@ -2155,7 +2176,7 @@ mod tests {
         let owners = vec![1; grid[0] * grid[1]];
         let view = MapLabelView {
             viewport: [100.0; 2],
-            center: [0.1, 0.5],
+            center: [0.1, 1.0],
             pixels_per_world: 1000.0,
         };
         let regions = sampled_regions(view, grid, &owners);
@@ -2167,6 +2188,30 @@ mod tests {
         );
         assert!(regions[0].visible_cells.len() < owners.len());
         assert!(regions[0].component_count > regions[0].visible_cells.len());
+    }
+
+    #[test]
+    fn antimeridian_view_keeps_nearest_labels_and_both_edge_regions() {
+        let view = MapLabelView {
+            viewport: [40.0; 2],
+            center: [0.001, 1.0],
+            pixels_per_world: 8_192.0,
+        };
+        assert!(visible(view, [1.999, 1.0], 0.0));
+        assert!(!visible(view, [1.0, 1.0], 0.0));
+
+        let grid = [8, 4];
+        let mut owners = vec![0; grid[0] * grid[1]];
+        owners[2 * grid[0]] = 1;
+        owners[2 * grid[0] + 7] = 2;
+        let regions = sampled_regions(view, grid, &owners);
+        assert_eq!(
+            regions
+                .iter()
+                .map(|region| region.owner)
+                .collect::<HashSet<_>>(),
+            HashSet::from([1, 2])
+        );
     }
 
     #[test]
@@ -2189,7 +2234,7 @@ mod tests {
         let zero = unit(2, 0, UnitKind::Army, 0, 1.0, 1.0);
         let view = MapLabelView {
             viewport: [800.0; 2],
-            center: [1.0, 0.5],
+            center: [1.0, 1.0],
             pixels_per_world: 1024.0,
         };
         let mut first = Vec::new();

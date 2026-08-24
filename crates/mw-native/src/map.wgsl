@@ -35,29 +35,31 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return output;
 }
 
+fn wrapped_cell(cell: vec2<i32>) -> vec2<i32> {
+    let width = max(i32(view.grid_size.x), 1);
+    let height = max(i32(view.grid_size.y), 1);
+    let x = ((cell.x % width) + width) % width;
+    return vec2<i32>(x, clamp(cell.y, 0, height - 1));
+}
+
 fn owner_at(cell: vec2<i32>) -> u32 {
-    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
-    return textureLoad(ownership, clamp(cell, vec2<i32>(0), maximum), 0).r;
+    return textureLoad(ownership, wrapped_cell(cell), 0).r;
 }
 
 fn side_at(cell: vec2<i32>) -> i32 {
-    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
-    return textureLoad(dominant_sides, clamp(cell, vec2<i32>(0), maximum), 0).r;
+    return textureLoad(dominant_sides, wrapped_cell(cell), 0).r;
 }
 
 fn sovereign_at(cell: vec2<i32>) -> u32 {
-    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
-    return textureLoad(sovereign_ownership, clamp(cell, vec2<i32>(0), maximum), 0).r;
+    return textureLoad(sovereign_ownership, wrapped_cell(cell), 0).r;
 }
 
 fn land_at(cell: vec2<i32>) -> u32 {
-    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
-    return textureLoad(geographic_land, clamp(cell, vec2<i32>(0), maximum), 0).r;
+    return textureLoad(geographic_land, wrapped_cell(cell), 0).r;
 }
 
 fn biome_at(cell: vec2<i32>) -> u32 {
-    let maximum = vec2<i32>(view.grid_size) - vec2<i32>(1);
-    return textureLoad(biome, clamp(cell, vec2<i32>(0), maximum), 0).r;
+    return textureLoad(biome, wrapped_cell(cell), 0).r;
 }
 
 fn country_side_at(country_id: u32) -> i32 {
@@ -82,18 +84,45 @@ fn desert_transform(color: vec3<f32>) -> vec3<f32> {
     );
 }
 
-fn country_gradient(color: vec3<f32>, country_id: u32, grid_y: f32) -> vec3<f32> {
+fn grid_y_to_world_y(grid_y: f32) -> f32 {
+    let latitude = clamp(
+        (grid_y / max(f32(view.grid_size.y), 1.0)) * 3.141592653589793
+            - 1.5707963267948966,
+        -1.4844222297453324,
+        1.4844222297453324,
+    );
+    return 1.0
+        - log(tan(0.7853981633974483 + latitude * 0.5)) / 3.141592653589793;
+}
+
+fn country_gradient(color: vec3<f32>, country_id: u32, world_y: f32) -> vec3<f32> {
     if (country_id == 0u || country_id >= view.palette_len) {
         return color;
     }
     let bounds = country_y_bounds[country_id];
-    let span = max(f32(bounds.y - bounds.x), 1.0);
-    let t = clamp((grid_y - f32(bounds.x)) / span, 0.0, 1.0);
+    let south_y = grid_y_to_world_y(f32(bounds.x));
+    let north_y = grid_y_to_world_y(f32(bounds.y));
+    let span = north_y - south_y;
+    var t = 0.0;
+    if (abs(span) > 0.000001) {
+        t = clamp((world_y - south_y) / span, 0.0, 1.0);
+    }
     let bright = min(color + vec3<f32>(25.0 / 255.0), vec3<f32>(1.0));
     if (t < 0.3) {
         return mix(bright, color, t / 0.3);
     }
     return mix(color, floor(color * 0.65 * 255.0) / 255.0, (t - 0.3) / 0.7);
+}
+
+fn world_y_to_latitude_radians(world_y: f32) -> f32 {
+    // Leaflet's default CRS is EPSG:3857. Native world space keeps the
+    // existing two-unit world width, so its square Mercator world is 2x2.
+    let mercator_y = 3.141592653589793 * (1.0 - world_y);
+    return 2.0 * atan(exp(mercator_y)) - 1.5707963267948966;
+}
+
+fn world_y_to_latitude(world_y: f32) -> f32 {
+    return world_y_to_latitude_radians(world_y) * (180.0 / 3.141592653589793);
 }
 
 fn ocean_color(screen_y: f32) -> vec3<f32> {
@@ -108,8 +137,8 @@ fn ocean_color(screen_y: f32) -> vec3<f32> {
     let upper_y = view.viewport.y * f32(upper) / 12.0;
     let lower_world_y = view.center.y + (lower_y - view.viewport.y * 0.5) / view.pixels_per_world;
     let upper_world_y = view.center.y + (upper_y - view.viewport.y * 0.5) / view.pixels_per_world;
-    let lower_lat = 90.0 - lower_world_y * 180.0;
-    let upper_lat = 90.0 - upper_world_y * 180.0;
+    let lower_lat = world_y_to_latitude(lower_world_y);
+    let upper_lat = world_y_to_latitude(upper_world_y);
     let lower_noise = sin(f32(lower) * 0.7 + center_lng * 0.04) * 3.5;
     let upper_noise = sin(f32(upper) * 0.7 + center_lng * 0.04) * 3.5;
     let lower_t = clamp((abs(lower_lat) + lower_noise) / 90.0, 0.0, 1.0);
@@ -152,10 +181,19 @@ fn segment_distance(point: vec2<f32>, start: vec2<f32>, end: vec2<f32>) -> f32 {
     return length(point - (start + delta * t));
 }
 
-fn frontline_distance(grid_position: vec2<f32>, cell: vec2<i32>) -> f32 {
-    let maximum_quad = max(vec2<i32>(view.grid_size) - vec2<i32>(2), vec2<i32>(0));
-    let quad = clamp(cell, vec2<i32>(0), maximum_quad);
-    let local = grid_position - vec2<f32>(quad);
+fn frontline_distance(
+    grid_position: vec2<f32>,
+    cell: vec2<i32>,
+    cell_pixels: vec2<f32>,
+) -> f32 {
+    // Longitude is cyclic: the final cell's right-hand neighbor is the first
+    // cell in the repeated world. Latitude remains bounded at the poles.
+    let maximum_quad_y = max(i32(view.grid_size.y) - 2, 0);
+    let quad = vec2<i32>(wrapped_cell(cell).x, clamp(cell.y, 0, maximum_quad_y));
+    let local = vec2<f32>(
+        fract(grid_position.x),
+        grid_position.y - f32(quad.y),
+    ) * cell_pixels;
     let top_left = side_at(quad);
     let top_right = side_at(quad + vec2<i32>(1, 0));
     let bottom_right = side_at(quad + vec2<i32>(1, 1));
@@ -181,27 +219,42 @@ fn frontline_distance(grid_position: vec2<f32>, cell: vec2<i32>) -> f32 {
 
     var distance = 1000000.0;
     if (count >= 2u) {
-        distance = segment_distance(local, crossings[0], crossings[1]);
+        distance = segment_distance(local, crossings[0] * cell_pixels, crossings[1] * cell_pixels);
         if (count >= 3u) {
-            distance = min(distance, segment_distance(local, crossings[1], crossings[2]));
+            distance = min(
+                distance,
+                segment_distance(local, crossings[1] * cell_pixels, crossings[2] * cell_pixels),
+            );
         }
     } else if (count == 1u) {
-        distance = segment_distance(local, crossings[0], vec2<f32>(0.5));
+        distance = segment_distance(
+            local,
+            crossings[0] * cell_pixels,
+            vec2<f32>(0.5) * cell_pixels,
+        );
     }
     return distance;
 }
 
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let world = view.center + (position.xy - view.viewport * 0.5) / view.pixels_per_world;
+    let unwrapped_world =
+        view.center + (position.xy - view.viewport * 0.5) / view.pixels_per_world;
     let ocean = ocean_color(position.y);
-    if (world.x < 0.0 || world.x >= 2.0 || world.y < 0.0 || world.y >= 1.0) {
+    if (unwrapped_world.y < 0.0 || unwrapped_world.y >= 2.0) {
         return vec4<f32>(output_color(ocean), 1.0);
     }
+    let world = vec2<f32>(
+        unwrapped_world.x - floor(unwrapped_world.x * 0.5) * 2.0,
+        unwrapped_world.y,
+    );
 
-    // Scenario rows run south-to-north, while framebuffer Y runs top-to-bottom.
-    // World X spans two units so 360x180 degrees renders at a true 2:1 aspect.
-    let grid_uv = vec2<f32>(world.x * 0.5, 1.0 - world.y);
+    // Scenario rows remain linear latitude south-to-north. Invert Web Mercator
+    // only at the renderer boundary so simulation/checkpoint coordinates stay
+    // in geographic degrees.
+    let latitude_radians = world_y_to_latitude_radians(world.y);
+    let latitude = latitude_radians * (180.0 / 3.141592653589793);
+    let grid_uv = vec2<f32>(world.x * 0.5, (latitude + 90.0) / 180.0);
     let grid_position = grid_uv * vec2<f32>(view.grid_size);
     let cell = min(vec2<i32>(grid_position), vec2<i32>(view.grid_size) - vec2<i32>(1));
     let local = fract(grid_position);
@@ -237,23 +290,24 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     if (biome_at(cell) == 1u) {
         color = desert_transform(color);
     }
-    color = country_gradient(color, display_owner, grid_position.y);
+    color = country_gradient(color, display_owner, world.y);
     // The swapchain is opaque. Match browser alpha fills by compositing them
     // against the simplified ocean rather than dropping alpha at the output.
     var map_color = mix(ocean, color, alpha);
 
     let cell_pixels = max(
-        min(
+        vec2<f32>(
             view.pixels_per_world * 2.0 / f32(view.grid_size.x),
-            view.pixels_per_world / f32(view.grid_size.y),
+            view.pixels_per_world
+                / (f32(view.grid_size.y) * max(cos(latitude_radians), 0.000001)),
         ),
-        0.001,
+        vec2<f32>(0.001),
     );
     var frontline_alpha = 0.0;
     if (view.frontlines_active != 0u) {
         let browser_zoom = max(log2(max(view.pixels_per_world / 128.0, 1.0)), 0.0);
         let frontline_width = max(1.2, 3.5 * (browser_zoom / 5.0));
-        let frontline_pixels = frontline_distance(grid_position, cell) * cell_pixels;
+        let frontline_pixels = frontline_distance(grid_position, cell, cell_pixels);
         frontline_alpha = 1.0 - smoothstep(
             max(0.0, frontline_width * 0.5 - 0.75),
             frontline_width * 0.5 + 0.75,
@@ -267,12 +321,12 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
 
     let political = political_id(cell);
     if (political >= 0) {
-        let border_half = clamp(0.5 / cell_pixels, 0.0, 0.5);
+        let border_half = clamp(vec2<f32>(0.5) / cell_pixels, vec2<f32>(0.0), vec2<f32>(0.5));
         let border =
-            (local.x < border_half && political_id(cell + vec2<i32>(-1, 0)) != political) ||
-            (1.0 - local.x < border_half && political_id(cell + vec2<i32>(1, 0)) != political) ||
-            (local.y < border_half && political_id(cell + vec2<i32>(0, -1)) != political) ||
-            (1.0 - local.y < border_half && political_id(cell + vec2<i32>(0, 1)) != political);
+            (local.x < border_half.x && political_id(cell + vec2<i32>(-1, 0)) != political) ||
+            (1.0 - local.x < border_half.x && political_id(cell + vec2<i32>(1, 0)) != political) ||
+            (local.y < border_half.y && political_id(cell + vec2<i32>(0, -1)) != political) ||
+            (1.0 - local.y < border_half.y && political_id(cell + vec2<i32>(0, 1)) != political);
         if (border) {
             map_color = mix(map_color, vec3<f32>(0.0), 0.3);
         }

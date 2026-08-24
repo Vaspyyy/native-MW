@@ -39,6 +39,7 @@ mod map_material;
 mod observer;
 mod observer_hud;
 mod options;
+mod projection;
 mod runtime_worker;
 mod unit_renderer;
 mod world_overlay;
@@ -51,14 +52,25 @@ use observer_hud::{
     hud_hit_test, hud_layout,
 };
 use options::{AppOptions, help_text, parse_app_options};
+use projection::{
+    browser_zoom, geographic_to_world, pixels_per_world_for_zoom, world_to_geographic,
+    world_to_grid,
+};
 use runtime_worker::{RuntimeWorker, RuntimeWorkerControlEvent, RuntimeWorkerStatus};
-use unit_renderer::{UnitRenderer, geographic_to_world};
+use unit_renderer::UnitRenderer;
 use world_overlay::WorldOverlayRenderer;
 
 const ROW_ALIGNMENT: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
 const PLAYBACK_SPEEDS: [u8; 3] = [1, 2, 3];
 const DEMO_CAMERA_ZOOM_MULTIPLIER: f32 = 70.0;
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSER_DEFAULT_CENTER: [f64; 2] = [20.0, 0.0];
+const BROWSER_DEFAULT_ZOOM: f32 = 3.0;
+const BROWSER_MIN_ZOOM: f32 = 2.0;
+const BROWSER_MAX_ZOOM: f32 = 12.0;
+const BROWSER_WHEEL_DEBOUNCE: Duration = Duration::from_millis(24);
+const BROWSER_WHEEL_PX_PER_ZOOM: f32 = 90.0;
+const BROWSER_LINE_SCROLL_PX: f32 = 20.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -158,6 +170,9 @@ struct App {
     dragging: bool,
     drag_origin: Option<PhysicalPosition<f64>>,
     last_drag: PhysicalPosition<f64>,
+    wheel_delta: f32,
+    wheel_started_at: Option<Instant>,
+    wheel_cursor: PhysicalPosition<f64>,
     frame_count: u64,
     presented_frames: u64,
     smoke_frames: Option<u64>,
@@ -211,12 +226,15 @@ impl App {
             grid_width: 0,
             grid_height: 0,
             grid_res: 0.15,
-            center: [1.0, 0.5],
-            zoom: 1.0,
+            center: geographic_to_world(BROWSER_DEFAULT_CENTER[0], BROWSER_DEFAULT_CENTER[1]),
+            zoom: pixels_per_world_for_zoom(BROWSER_DEFAULT_ZOOM),
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
             drag_origin: None,
             last_drag: PhysicalPosition::new(0.0, 0.0),
+            wheel_delta: 0.0,
+            wheel_started_at: None,
+            wheel_cursor: PhysicalPosition::new(0.0, 0.0),
             frame_count: 0,
             presented_frames: 0,
             smoke_frames: options.smoke_frames,
@@ -935,9 +953,10 @@ impl App {
             self.center = center;
             self.zoom = self.runtime_zoom.unwrap_or_else(|| reset_zoom(size));
         } else {
-            self.center = [1.0, 0.5];
+            self.center = geographic_to_world(BROWSER_DEFAULT_CENTER[0], BROWSER_DEFAULT_CENTER[1]);
             self.zoom = reset_zoom(size);
         }
+        self.center = world_copy_jump(self.center);
     }
 
     fn stop_runtime_worker(&mut self) {
@@ -1151,27 +1170,48 @@ impl App {
         ]
     }
 
-    fn zoom_at_cursor(&mut self, delta: f32) {
+    fn zoom_at(&mut self, cursor: PhysicalPosition<f64>, delta_zoom: f32) {
         let Some(window) = &self.window else { return };
         let size = window.inner_size();
-        let before = self.world_at(self.cursor, size);
-        let minimum_zoom = reset_zoom(size) * 0.75;
-        self.zoom = (self.zoom * (delta * 0.16).exp()).clamp(minimum_zoom, 100_000.0);
-        let after = self.world_at(self.cursor, size);
+        let before = self.world_at(cursor, size);
+        let zoom = (browser_zoom(self.zoom) + delta_zoom).clamp(BROWSER_MIN_ZOOM, BROWSER_MAX_ZOOM);
+        self.zoom = pixels_per_world_for_zoom(zoom);
+        let after = self.world_at(cursor, size);
         self.center[0] += (before[0] - after[0]) as f32;
         self.center[1] += (before[1] - after[1]) as f32;
+        self.center = world_copy_jump(self.center);
+    }
+
+    fn queue_wheel_zoom(&mut self, delta: f32) {
+        self.wheel_delta += delta;
+        self.wheel_cursor = self.cursor;
+        self.wheel_started_at.get_or_insert_with(Instant::now);
+    }
+
+    fn flush_wheel_zoom(&mut self) -> bool {
+        let Some(started_at) = self.wheel_started_at else {
+            return false;
+        };
+        if started_at.elapsed() < BROWSER_WHEEL_DEBOUNCE {
+            return false;
+        }
+        let delta = std::mem::take(&mut self.wheel_delta);
+        self.wheel_started_at = None;
+        let delta_zoom = leaflet_wheel_zoom_delta(delta);
+        if delta_zoom == 0.0 {
+            return false;
+        }
+        self.zoom_at(self.wheel_cursor, delta_zoom);
+        self.invalidate_map_labels();
+        true
     }
 
     fn country_at_cursor(&self) -> Option<(u16, f64, f64)> {
         let window = self.window.as_ref()?;
         let world = self.world_at(self.cursor, window.inner_size());
-        if !(0.0..2.0).contains(&world[0]) || !(0.0..1.0).contains(&world[1]) {
-            return None;
-        }
         let (x, y) = world_to_cell(world, self.grid_width, self.grid_height)?;
         let id = *self.ownership.get(y * self.grid_width as usize + x)?;
-        let lng = world[0] * 180.0 - 180.0;
-        let lat = 90.0 - world[1] * 180.0;
+        let [lat, lng] = world_to_geographic(world);
         Some((id, lat, lng))
     }
 
@@ -1504,7 +1544,7 @@ impl App {
                 self.grid_width,
                 self.grid_height,
                 self.grid_res,
-                self.zoom,
+                browser_zoom(self.zoom),
                 snapshot_status
             ));
         }
@@ -1604,6 +1644,11 @@ impl ApplicationHandler for App {
                 self.invalidate_map_labels();
                 window.request_redraw();
             }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.observer_hud_dirty = true;
+                self.invalidate_map_labels();
+                window.request_redraw();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 let hovered = match self.current_hud_hit(position, window.inner_size()) {
@@ -1618,6 +1663,7 @@ impl ApplicationHandler for App {
                 if self.dragging {
                     self.center[0] -= (position.x - self.last_drag.x) as f32 / self.zoom;
                     self.center[1] -= (position.y - self.last_drag.y) as f32 / self.zoom;
+                    self.center = world_copy_jump(self.center);
                     window.request_redraw();
                 }
                 self.last_drag = position;
@@ -1695,12 +1741,10 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let amount = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y as f32 / 80.0).clamp(-4.0, 4.0),
+                    MouseScrollDelta::LineDelta(_, y) => y * BROWSER_LINE_SCROLL_PX,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
-                self.zoom_at_cursor(amount);
-                self.invalidate_map_labels();
-                window.request_redraw();
+                self.queue_wheel_zoom(amount);
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.render() {
@@ -1722,6 +1766,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.flush_wheel_zoom()
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
         if let Some(target) = self.smoke_frames {
             // An occluded Wayland surface may coalesce compositor-driven redraw
             // callbacks after the first present. Exercise the requested GPU
@@ -1777,21 +1826,39 @@ fn playback_speed_index(current: usize, action: PlaybackAction) -> usize {
     }
 }
 
-fn reset_zoom(size: PhysicalSize<u32>) -> f32 {
-    (size.width as f32 * 0.5).min(size.height as f32).max(1.0)
+fn reset_zoom(_size: PhysicalSize<u32>) -> f32 {
+    pixels_per_world_for_zoom(BROWSER_DEFAULT_ZOOM)
 }
 
 fn demo_zoom(size: PhysicalSize<u32>) -> f32 {
-    (reset_zoom(size) * DEMO_CAMERA_ZOOM_MULTIPLIER).clamp(1.0, 100_000.0)
+    (reset_zoom(size) * DEMO_CAMERA_ZOOM_MULTIPLIER).clamp(
+        pixels_per_world_for_zoom(BROWSER_MIN_ZOOM),
+        pixels_per_world_for_zoom(BROWSER_MAX_ZOOM),
+    )
+}
+
+fn world_copy_jump(center: [f32; 2]) -> [f32; 2] {
+    [center[0].rem_euclid(2.0), center[1]]
+}
+
+fn leaflet_wheel_zoom_delta(delta: f32) -> f32 {
+    if delta == 0.0 || !delta.is_finite() {
+        return 0.0;
+    }
+    let scaled = delta.abs() / (BROWSER_WHEEL_PX_PER_ZOOM * 4.0);
+    let sigmoid = 4.0 * (2.0 / (1.0 + (-scaled).exp())).ln() / std::f32::consts::LN_2;
+    sigmoid.copysign(delta)
 }
 
 fn camera_for_runtime(snapshot: &FrameSnapshot, size: PhysicalSize<u32>) -> ([f32; 2], f32) {
     if snapshot.units.is_empty() {
-        return ([1.0, 0.5], reset_zoom(size));
+        let center = geographic_to_world(BROWSER_DEFAULT_CENTER[0], BROWSER_DEFAULT_CENTER[1]);
+        let zoom = reset_zoom(size);
+        return (world_copy_jump(center), zoom);
     }
-    // The current map shader does not repeat at the antimeridian, so use the
-    // literal projected bounds. A circular fit could hide units on the other
-    // edge until world-wrap rendering itself is implemented.
+    // Match Leaflet fitBounds by fitting the literal longitude interval. The
+    // renderer repeats that fitted map horizontally when the camera crosses a
+    // world edge.
     let (min_x, max_x, min_y, max_y) = snapshot
         .units
         .iter()
@@ -1811,17 +1878,20 @@ fn camera_for_runtime(snapshot: &FrameSnapshot, size: PhysicalSize<u32>) -> ([f3
         );
     let horizontal_span = (max_x - min_x).max(0.02);
     let vertical_span = (max_y - min_y).max(0.02);
-    let padding = 1.35_f64;
+    // Browser startWar() calls fitBounds(bounds.pad(0.2)), expanding each
+    // dimension by forty percent before Leaflet selects a zoom.
+    let padding = 1.4_f64;
     let horizontal_zoom = size.width.max(1) as f64 / (horizontal_span * padding);
     let vertical_zoom = size.height.max(1) as f64 / (vertical_span * padding);
-    let zoom = horizontal_zoom.min(vertical_zoom).clamp(1.0, 100_000.0) as f32;
-    (
-        [
-            ((min_x + max_x) * 0.5) as f32,
-            ((min_y + max_y) * 0.5) as f32,
-        ],
-        zoom,
-    )
+    let zoom = horizontal_zoom.min(vertical_zoom).clamp(
+        f64::from(pixels_per_world_for_zoom(BROWSER_MIN_ZOOM)),
+        f64::from(pixels_per_world_for_zoom(BROWSER_MAX_ZOOM)),
+    ) as f32;
+    let center = [
+        ((min_x + max_x) * 0.5) as f32,
+        ((min_y + max_y) * 0.5) as f32,
+    ];
+    (world_copy_jump(center), zoom)
 }
 
 fn find_demo_border(
@@ -2535,18 +2605,7 @@ fn demo_unit(
 }
 
 fn world_to_cell(world: [f64; 2], width: u32, height: u32) -> Option<(usize, usize)> {
-    if width == 0
-        || height == 0
-        || !(0.0..2.0).contains(&world[0])
-        || !(0.0..1.0).contains(&world[1])
-    {
-        return None;
-    }
-    let x = (world[0] * 0.5 * f64::from(width)).floor() as usize;
-    let y = ((1.0 - world[1]) * f64::from(height))
-        .floor()
-        .min(f64::from(height.saturating_sub(1))) as usize;
-    Some((x, y))
+    world_to_grid(world, width as usize, height as usize)
 }
 
 fn build_palettes(metadata: &Value, ownership: &[u16]) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
@@ -2724,9 +2783,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn camera_fit_preserves_two_to_one_world_aspect() {
-        assert_eq!(reset_zoom(PhysicalSize::new(1_280, 720)), 640.0);
-        assert_eq!(reset_zoom(PhysicalSize::new(2_000, 600)), 600.0);
+    fn reset_camera_matches_browser_default_zoom() {
+        assert_eq!(reset_zoom(PhysicalSize::new(1_280, 720)), 1_024.0);
+        assert_eq!(reset_zoom(PhysicalSize::new(2_000, 600)), 1_024.0);
+        assert_eq!(browser_zoom(reset_zoom(PhysicalSize::new(1, 1))), 3.0);
+        assert_eq!(
+            geographic_to_world(BROWSER_DEFAULT_CENTER[0], BROWSER_DEFAULT_CENTER[1]),
+            geographic_to_world(20.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn camera_world_copy_jump_wraps_longitude_only() {
+        assert_eq!(
+            world_copy_jump([-0.25, -3.0]),
+            [1.75, -3.0],
+            "Leaflet worldCopyJump preserves latitude while wrapping longitude"
+        );
+        assert_eq!(world_copy_jump([2.25, 4.0]), [0.25, 4.0]);
+    }
+
+    #[test]
+    fn wheel_zoom_uses_leaflet_sigmoid_and_direction() {
+        assert_eq!(leaflet_wheel_zoom_delta(0.0), 0.0);
+        let positive = leaflet_wheel_zoom_delta(90.0);
+        assert!(positive > 0.0 && positive < 4.0);
+        assert_eq!(leaflet_wheel_zoom_delta(-90.0), -positive);
+        assert!(leaflet_wheel_zoom_delta(9_000.0) <= 4.0);
     }
 
     #[test]
@@ -2758,19 +2841,27 @@ mod tests {
         let snapshot = simulation.initial_snapshot(0, 0);
         let (center, zoom) = camera_for_runtime(&snapshot, PhysicalSize::new(1_280, 720));
         assert!((center[0] - 1.0).abs() < 1.0e-6);
-        assert!((center[1] - 0.5).abs() < 1.0e-6);
+        assert!((center[1] - 1.0).abs() < 1.0e-6);
         assert!(zoom < reset_zoom(PhysicalSize::new(1_280, 720)));
     }
 
     #[test]
-    fn screen_world_coordinates_flip_scenario_rows() {
-        assert_eq!(world_to_cell([0.0, 0.0], 2_400, 1_200), Some((0, 1_199)));
-        assert_eq!(world_to_cell([1.0, 0.5], 2_400, 1_200), Some((1_200, 600)));
+    fn screen_world_coordinates_inverse_project_to_scenario_rows() {
+        for expected in [(100, 100), (1_200, 600), (2_300, 1_100)] {
+            let world =
+                projection::grid_to_world(expected.0 as f64, expected.1 as f64, 2_400.0, 1_200.0);
+            assert_eq!(
+                world_to_cell([f64::from(world[0]), f64::from(world[1])], 2_400, 1_200),
+                Some(expected)
+            );
+        }
+        assert_eq!(world_to_cell([2.0, 1.0], 2_400, 1_200), Some((0, 600)));
         assert_eq!(
-            world_to_cell([1.999_999, 0.999_999], 2_400, 1_200),
-            Some((2_399, 0))
+            world_to_cell([-0.25, 1.0], 2_400, 1_200),
+            Some((2_100, 600))
         );
-        assert_eq!(world_to_cell([2.0, 0.5], 2_400, 1_200), None);
+        assert_eq!(world_to_cell([1.0, 2.01], 2_400, 1_200), None);
+        assert_eq!(world_to_cell([0.0, 0.0], 2_400, 1_200), Some((0, 1_167)));
     }
 
     #[test]

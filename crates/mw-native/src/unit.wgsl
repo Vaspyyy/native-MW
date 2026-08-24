@@ -25,6 +25,12 @@ fn browser_zoom() -> f32 {
     return log2(max(view.pixels_per_world, 1.0) * 2.0 / 256.0);
 }
 
+fn camera_delta(world: vec2<f32>) -> vec2<f32> {
+    var delta = world - view.center;
+    delta.x -= floor((delta.x + 1.0) * 0.5) * 2.0;
+    return delta;
+}
+
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
@@ -48,8 +54,7 @@ fn vs_main(
     let half_extent = dimensions * vec2(0.72, 0.64);
     let local = corners[vertex_index];
     let local_px = local * half_extent;
-    let screen =
-        (world - view.center) * view.pixels_per_world + view.viewport * 0.5 + local_px;
+    let screen = camera_delta(world) * view.pixels_per_world + view.viewport * 0.5 + local_px;
 
     var output: VertexOutput;
     output.position = vec4(

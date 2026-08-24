@@ -9,7 +9,7 @@ use mw_core::{
     RuntimeSnapshot, StrategicMissileState, TaskForcePhase,
 };
 
-use crate::unit_renderer::geographic_to_world;
+use crate::projection::geographic_to_world;
 
 const MARKER_AIRFIELD: u32 = 0;
 const MARKER_FIGHTER: u32 = 1;

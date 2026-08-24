@@ -8,6 +8,12 @@ struct View {
 
 @group(0) @binding(0) var<uniform> view: View;
 
+fn camera_delta(world: vec2<f32>) -> vec2<f32> {
+    var delta = world - view.center;
+    delta.x -= floor((delta.x + 1.0) * 0.5) * 2.0;
+    return delta;
+}
+
 struct MarkerOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
@@ -53,7 +59,8 @@ fn vs_marker(
         let c = cos(angle); let s = sin(angle);
         screen_local = vec2(c * local.x - s * local.y, s * local.x + c * local.y);
     }
-    let screen = (world - view.center) * view.pixels_per_world + view.viewport * 0.5 + screen_local * marker_size;
+    let screen = camera_delta(world) * view.pixels_per_world + view.viewport * 0.5
+        + screen_local * marker_size;
     var output: MarkerOutput;
     output.position = vec4((screen / view.viewport) * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 0.0, 1.0);
     output.color = color;
@@ -221,8 +228,8 @@ fn vs_segment(
         vec2(0.0, 1.0),
     );
     let corner = corners[vertex_index];
-    let start = (start_world - view.center) * view.pixels_per_world + view.viewport * 0.5;
-    let end = (end_world - view.center) * view.pixels_per_world + view.viewport * 0.5;
+    let start = camera_delta(start_world) * view.pixels_per_world + view.viewport * 0.5;
+    let end = camera_delta(end_world) * view.pixels_per_world + view.viewport * 0.5;
     let delta = end - start;
     let distance = max(length(delta), 0.001);
     let direction = delta / distance;

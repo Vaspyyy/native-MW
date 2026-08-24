@@ -19,6 +19,12 @@ struct VertexOutput {
     @location(3) textured: f32,
 };
 
+fn camera_delta(world: vec2<f32>) -> vec2<f32> {
+    var delta = world - view.center;
+    delta.x -= floor((delta.x + 1.0) * 0.5) * 2.0;
+    return delta;
+}
+
 @vertex
 fn vs_main(
     @location(0) world: vec2<f32>,
@@ -28,7 +34,7 @@ fn vs_main(
     @location(4) effect: vec4<f32>,
     @location(5) textured: f32,
 ) -> VertexOutput {
-    let screen = (world - view.center) * view.pixels_per_world + view.viewport * 0.5 + offset;
+    let screen = camera_delta(world) * view.pixels_per_world + view.viewport * 0.5 + offset;
     var output: VertexOutput;
     output.position = vec4((screen / view.viewport) * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 0.0, 1.0);
     output.uv = uv;

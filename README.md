@@ -248,6 +248,13 @@ Native viewer controls:
 - `S`: save immediately when `--save-checkpoint PATH` is configured
 - `Esc`: quit
 
+The native map uses the browser's EPSG:3857 projection, `[20°, 0°]` default
+center, zoom `3` start with the `2..12` Leaflet range, cursor-anchored
+fractional wheel curve, and antimeridian world-copy behavior. Map materials,
+country labels, units, operational overlays, and country picking all consume
+the same renderer-local projection; runtime snapshots and checkpoints remain
+in geographic latitude/longitude.
+
 The panel is intentionally read-only sandbox/observer UI. It does not issue
 unit orders or expose Commander Mode controls. Playback starts running at 1x,
 matching the browser sandbox. The `--tick-ms` value is the native 1x cadence;
