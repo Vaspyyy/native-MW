@@ -16,10 +16,10 @@ use mw_checkpoint::native_runtime::{
 use mw_core::{
     CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot, GridSpec, NativeRuntime,
     NativeWarBootstrapConfig, ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy,
-    RuntimeState, RuntimeUnitPolicy, ScenarioProduction, Simulation, SimulationConfig,
-    SimulationUnit, StrategicSimulation, TerritoryCity, TerritoryConfig, TerritoryControl,
-    TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels, UnitKind, bootstrap_native_war,
-    decode_mwsc_gzip_file, derive_scenario_production,
+    RuntimeSnapshot, RuntimeState, RuntimeUnitPolicy, ScenarioProduction, Simulation,
+    SimulationConfig, SimulationUnit, StrategicSimulation, TerritoryCity, TerritoryConfig,
+    TerritoryControl, TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels, UnitKind,
+    bootstrap_native_war, decode_mwsc_gzip_file, derive_scenario_production,
 };
 use serde_json::Value;
 use wgpu::util::DeviceExt;
@@ -33,10 +33,14 @@ use winit::{
 };
 
 mod headless;
+mod observer;
+mod observer_hud;
 mod options;
 mod runtime_worker;
 mod unit_renderer;
 
+use observer::ObserverHudModel;
+use observer_hud::{ObserverHudRenderer, panel_contains};
 use options::{AppOptions, help_text, parse_app_options};
 use runtime_worker::{RuntimeWorker, RuntimeWorkerStatus};
 use unit_renderer::{UnitRenderer, geographic_to_world};
@@ -64,6 +68,7 @@ struct GpuState {
     view_buffer: wgpu::Buffer,
     ownership_texture: wgpu::Texture,
     unit_renderer: UnitRenderer,
+    observer_hud: ObserverHudRenderer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,6 +103,7 @@ struct App {
     zoom: f32,
     cursor: PhysicalPosition<f64>,
     dragging: bool,
+    drag_origin: Option<PhysicalPosition<f64>>,
     last_drag: PhysicalPosition<f64>,
     frame_count: u64,
     presented_frames: u64,
@@ -107,8 +113,11 @@ struct App {
     runtime_zoom: Option<f32>,
     runtime_initial_tick: Option<u64>,
     runtime_terminal: bool,
-    latest_snapshot: Option<Arc<FrameSnapshot>>,
+    latest_snapshot: Option<Arc<RuntimeSnapshot>>,
     snapshot_dirty: bool,
+    observer_hud_visible: bool,
+    observer_hud_dirty: bool,
+    selected_country_id: Option<u16>,
     territory_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
     fps_epoch: Instant,
     fps: f64,
@@ -139,6 +148,7 @@ impl App {
             zoom: 1.0,
             cursor: PhysicalPosition::new(0.0, 0.0),
             dragging: false,
+            drag_origin: None,
             last_drag: PhysicalPosition::new(0.0, 0.0),
             frame_count: 0,
             presented_frames: 0,
@@ -150,6 +160,9 @@ impl App {
             runtime_terminal: false,
             latest_snapshot: None,
             snapshot_dirty: false,
+            observer_hud_visible: true,
+            observer_hud_dirty: true,
+            selected_country_id: None,
             territory_updates: VecDeque::new(),
             fps_epoch: Instant::now(),
             fps: 0.0,
@@ -300,8 +313,16 @@ impl App {
             self.center = center;
             self.zoom = zoom;
             self.runtime_initial_tick = Some(published.tick);
-            self.latest_snapshot = Some(published.frame_snapshot.clone());
+            if self.smoke_frames.is_some() && self.selected_country_id.is_none() {
+                self.selected_country_id = published
+                    .territory_snapshot
+                    .countries
+                    .first()
+                    .map(|country| country.country_id);
+            }
+            self.latest_snapshot = Some(Arc::clone(&published));
             self.snapshot_dirty = true;
+            self.observer_hud_dirty = true;
             log::info!(
                 "initialized {} at tick {} with {} rendered units",
                 runtime_label.as_deref().unwrap_or("native runtime"),
@@ -492,8 +513,18 @@ impl App {
         });
         let mut unit_renderer = UnitRenderer::new(&device, &view_buffer, format);
         if let Some(snapshot) = &self.latest_snapshot {
-            unit_renderer.upload(&device, &queue, snapshot, &self.palette);
+            unit_renderer.upload(&device, &queue, &snapshot.frame_snapshot, &self.palette);
         }
+        let mut observer_hud = ObserverHudRenderer::new(&device, format);
+        let observer_model = self.observer_hud_model();
+        observer_hud.upload(
+            &device,
+            &queue,
+            size,
+            &observer_model.lines,
+            self.observer_hud_accent(),
+        );
+        self.observer_hud_dirty = false;
         log::info!(
             "unit overlay initialized with {} instances",
             unit_renderer.instance_count()
@@ -509,6 +540,7 @@ impl App {
             view_buffer,
             ownership_texture,
             unit_renderer,
+            observer_hud,
         });
         self.window = Some(window);
         if let Some(runtime) = pending_runtime {
@@ -679,8 +711,9 @@ impl App {
                 snapshot.counters.influence.touched_influence_cells,
                 snapshot.counters.census.committed,
             );
-            self.latest_snapshot = Some(snapshot.frame_snapshot.clone());
+            self.latest_snapshot = Some(snapshot);
             self.snapshot_dirty = true;
+            self.observer_hud_dirty = true;
         }
         for status in statuses {
             match status {
@@ -752,6 +785,32 @@ impl App {
             .unwrap_or(if id == 0 { "Ocean" } else { "Unknown" })
     }
 
+    fn observer_hud_model(&self) -> ObserverHudModel {
+        let selected = self.selected_country_id;
+        let country_name = selected.map_or("", |country_id| self.country_name(country_id));
+        self.latest_snapshot.as_ref().map_or_else(
+            || {
+                ObserverHudModel::without_runtime(
+                    selected.map(|country_id| (country_id, country_name)),
+                )
+            },
+            |snapshot| {
+                ObserverHudModel::from_runtime(
+                    snapshot,
+                    selected,
+                    country_name,
+                    self.save_checkpoint_path.is_some(),
+                )
+            },
+        )
+    }
+
+    fn observer_hud_accent(&self) -> [f32; 4] {
+        self.selected_country_id
+            .and_then(|country_id| self.palette.get(country_id as usize).copied())
+            .unwrap_or([0.15, 0.72, 0.95, 1.0])
+    }
+
     fn render(&mut self) -> Result<()> {
         self.drain_runtime_worker()?;
         let Some(window) = &self.window else {
@@ -760,6 +819,9 @@ impl App {
         let size = window.inner_size();
         let palette_len = self.palette.len() as u32;
         let uniform = self.view_uniform(size, palette_len);
+        let observer_hud_visible = self.observer_hud_visible;
+        let observer_upload = (observer_hud_visible && self.observer_hud_dirty)
+            .then(|| (self.observer_hud_model(), self.observer_hud_accent()));
         let Some(gpu) = &mut self.gpu else {
             return Ok(());
         };
@@ -772,9 +834,18 @@ impl App {
         if self.snapshot_dirty
             && let Some(snapshot) = &self.latest_snapshot
         {
-            gpu.unit_renderer
-                .upload(&gpu.device, &gpu.queue, snapshot, &self.palette);
+            gpu.unit_renderer.upload(
+                &gpu.device,
+                &gpu.queue,
+                &snapshot.frame_snapshot,
+                &self.palette,
+            );
             self.snapshot_dirty = false;
+        }
+        if let Some((model, accent)) = observer_upload {
+            gpu.observer_hud
+                .upload(&gpu.device, &gpu.queue, size, &model.lines, accent);
+            self.observer_hud_dirty = false;
         }
         let rendered_unit_count = gpu.unit_renderer.instance_count();
         let frame = match gpu.surface.get_current_texture() {
@@ -831,6 +902,9 @@ impl App {
             pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.draw(0..3, 0..1);
             gpu.unit_renderer.draw(&mut pass);
+            if observer_hud_visible {
+                gpu.observer_hud.draw(&mut pass);
+            }
         }
         gpu.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
@@ -913,6 +987,13 @@ impl ApplicationHandler for App {
                         self.reset_camera(window.inner_size());
                         window.request_redraw();
                     }
+                    PhysicalKey::Code(KeyCode::KeyH) => {
+                        self.observer_hud_visible = !self.observer_hud_visible;
+                        self.observer_hud_dirty = self.observer_hud_visible;
+                        self.dragging = false;
+                        self.drag_origin = None;
+                        window.request_redraw();
+                    }
                     PhysicalKey::Code(KeyCode::KeyS) if self.save_checkpoint_path.is_some() => {
                         if let Err(error) = self.save_runtime_checkpoint() {
                             let message = format!("checkpoint save failed: {error:#}");
@@ -930,6 +1011,7 @@ impl ApplicationHandler for App {
                     gpu.config.height = size.height;
                     gpu.surface.configure(&gpu.device, &gpu.config);
                 }
+                self.observer_hud_dirty = true;
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -947,15 +1029,30 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if state == ElementState::Pressed {
-                    self.dragging = true;
-                    self.last_drag = self.cursor;
+                    let over_hud = self.observer_hud_visible && {
+                        let line_count = self.observer_hud_model().lines.len();
+                        panel_contains(self.cursor, window.inner_size(), line_count)
+                    };
+                    self.dragging = !over_hud;
+                    self.drag_origin = (!over_hud).then_some(self.cursor);
+                    if self.dragging {
+                        self.last_drag = self.cursor;
+                    }
                 } else {
                     self.dragging = false;
-                    if let Some((id, lat, lng)) = self.country_at_cursor() {
+                    let clicked = self.drag_origin.take().is_some_and(|origin| {
+                        let dx = self.cursor.x - origin.x;
+                        let dy = self.cursor.y - origin.y;
+                        dx * dx + dy * dy <= 16.0
+                    });
+                    if clicked && let Some((id, lat, lng)) = self.country_at_cursor() {
+                        self.selected_country_id = (id != 0).then_some(id);
+                        self.observer_hud_dirty = true;
                         println!(
                             "country={id} name={:?} lat={lat:.4} lng={lng:.4}",
                             self.country_name(id)
                         );
+                        window.request_redraw();
                     }
                 }
             }
@@ -1850,6 +1947,15 @@ mod tests {
                 .any(|unit| unit.side == 1 && unit.sovereign == 11)
         );
         assert_eq!(snapshot.territory_snapshot.land_cells, 4);
+        assert_eq!(snapshot.economy_snapshot.len(), 2);
+        assert_eq!(snapshot.economy_snapshot[0].country_id, 7);
+        let observer = ObserverHudModel::from_runtime(&snapshot, Some(7), "Seven", false);
+        assert!(observer.lines.iter().any(|line| line == "SEVEN  #7"));
+        assert!(observer.lines.iter().any(|line| line == "TERRITORY"));
+        assert!(observer.lines.iter().any(|line| line == "ECONOMY"));
+        assert!(observer.lines.iter().any(|line| line == "FORCES"));
+        assert!(observer.lines.iter().any(|line| line == "AIR POWER"));
+        assert!(observer.lines.iter().any(|line| line == "OPERATIONS"));
         assert_eq!(runtime.pending_render_updates(), 1);
 
         let next = runtime.step().unwrap();

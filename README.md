@@ -32,6 +32,9 @@ reference while systems move into the renderer-independent `mw-core` crate.
   casualty/desertion manpower continuation
 - reference-counted immutable snapshots, FIFO territory render deltas, and a
   native `wgpu` unit overlay
+- a dependency-free native sandbox observer HUD over immutable runtime
+  publications, with renderer-local country selection and live territory,
+  economy, forces, logistics, air-power, operation, and casualty summaries
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
 - versioned browser-to-native checkpoints: loadable legacy v1-v10 state plus
@@ -198,10 +201,15 @@ Native viewer controls:
 
 - drag left mouse: pan
 - mouse wheel: cursor-anchored zoom
+- left click: select a country for the live observer panel and print its
+  geographic cell
+- `H`: hide or show the observer panel
 - `R`: reset camera
 - `S`: save immediately when `--save-checkpoint PATH` is configured
-- left click: print the selected country and geographic cell
 - `Esc`: quit
+
+The panel is intentionally read-only sandbox/observer UI. It does not issue
+unit orders or expose Commander Mode controls.
 
 Native-only startup accepts repeated `--side` selectors (country ID or unique
 case-insensitive name) and uses deterministic all-Army bootstrap forces. Use

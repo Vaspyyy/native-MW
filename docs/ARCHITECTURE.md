@@ -78,6 +78,9 @@ browser runtime's shared mutable `main.js` structure.
 22. Continue browser-ordered material logistics with airfield repair,
     armor/fighter/strike purchasing, formation reinforcement and bounded
     creation, capitulation cleanup, and immutable checkpoint v11 state.
+23. Project immutable runtime publications into a compact read-only sandbox
+    observer HUD. Country selection remains renderer-local and cannot mutate or
+    issue commands to the simulation.
 
 Every parity-ported kernel from tactical indexing onward has a checked-in JSON
 contract, a JavaScript reference runner, and a Rust fixture runner.
@@ -148,6 +151,12 @@ through reference-counted immutable slices. The renderer can retain a frame
 while the simulation advances without reading mutable gameplay state. The GPU
 overlay uploads a snapshot only when a new one is published and reuses its CPU
 and GPU instance capacity.
+
+The native sandbox observer retains the enclosing immutable `RuntimeSnapshot`
+and derives its panel model without reaching into the worker. Its country
+selection is presentation-only. Live economy records are published every tick
+alongside territory, casualties, personnel, reinforcement, material, air, and
+operational state; the procedural bitmap HUD is drawn after the map and units.
 
 ## Production orchestration boundary
 
@@ -568,11 +577,14 @@ publication model for cities, frontlines, labels, and effects.
 22. Settle browser-ordered material logistics, publish immutable armor and
     logistics snapshots, resolve capitulation air evacuation/loss, and persist
     exact continuation in checkpoint v11. **Complete.**
-23. Native UI/editor/community parity remains later work after the remaining
-    simulation boundaries are chosen and measured.
+23. Add a read-only sandbox observer HUD over immutable runtime publications,
+    with renderer-local country selection and no command path back into the
+    worker. **Complete.**
+24. Native gameplay UI/editor/community parity remains later work after the
+    remaining simulation boundaries are chosen and measured.
 
-The full gameplay HUD, map editor, online/community features, and satellite-map
-parity are still outside
+Player order controls, Commander Mode, the full gameplay HUD, map editor,
+online/community features, and satellite-map parity are still outside
 the native port. The migrated kernel and handoff contracts do not imply exact
 full-browser tick parity.
 

@@ -362,6 +362,8 @@ pub struct RuntimeSnapshot {
     pub state: RuntimeState,
     pub frame_snapshot: Arc<FrameSnapshot>,
     pub territory_snapshot: Arc<TerritorySnapshot>,
+    /// Immutable live country economies, ordered by stable country ID for observer renderers.
+    pub economy_snapshot: Arc<[EconomyState]>,
     pub strategic_snapshot: Option<Arc<StrategicSnapshot>>,
     /// Immutable observer intel, task-force membership, and operational intent for renderers.
     pub operational_snapshot: Option<Arc<OperationalSnapshot>>,
@@ -3119,6 +3121,13 @@ impl NativeRuntime {
             state: initial_state,
             frame_snapshot,
             territory_snapshot,
+            economy_snapshot: checkpoint
+                .strategic
+                .economies()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
             strategic_snapshot,
             operational_snapshot: checkpoint
                 .operations
@@ -5265,6 +5274,13 @@ impl NativeRuntime {
             state: self.state,
             frame_snapshot: Arc::new(frame_snapshot),
             territory_snapshot,
+            economy_snapshot: self
+                .strategic
+                .economies()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .into(),
             strategic_snapshot,
             operational_snapshot: self
                 .operations
