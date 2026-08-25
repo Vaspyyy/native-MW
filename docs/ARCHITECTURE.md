@@ -173,7 +173,9 @@ The native sandbox observer retains the enclosing immutable `RuntimeSnapshot`
 and derives its panel model without reaching into the worker. Its country
 selection is presentation-only. Live economy records are published every tick
 alongside territory, casualties, personnel, reinforcement, material, air, and
-operational state; the procedural bitmap HUD is drawn after the map and units.
+operational state. HUD strings share the map-label renderer's GPU glyph atlas;
+Liberation Serif, Sans, and Mono runs are laid out in screen space after the
+translucent HUD geometry, removing the former procedural bitmap text path.
 
 ## Production orchestration boundary
 
@@ -612,7 +614,10 @@ before the adornment batch, retaining the browser's category order while
 avoiding a pipeline switch and draw call per formation.
 Draw order mirrors the browser: base map and controller frontlines, air, cities,
 units and their adornments, battles, side labels, country labels, operations,
-then the observer HUD.
+then observer HUD geometry and its screen-space glyph batch. The base map first
+samples the highest-resolution visible ArcGIS World Imagery tile from a bounded
+64-layer texture array and composites controller colors at the browser's
+political alpha. Missing tiles retain the deterministic native material.
 
 Runtime publications first accumulate in pending presentation state. Paint
 admission matches the browser's visual cadence: every frame at 1x, every second
@@ -718,13 +723,15 @@ being painted against older ownership textures.
     advancement, pre-1942 silo technology gate, browser paint admission, atomic
     pending snapshot/territory presentation, and exact nullable-game-time
     checkpoint v14 continuation. **Complete.**
-32. Native gameplay UI/editor/community parity remains later work after the
+32. Add asynchronous browser-source World Imagery tile streaming, a bounded GPU
+    atlas with deterministic fallback, translucent political compositing, and
+    browser-style screen typography through the shared glyph atlas. **Complete.**
+33. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,
-online/community features, and satellite-map parity are still outside
-the native port. The migrated kernel and handoff contracts do not imply exact
-full-browser tick parity.
+and online/community features are still outside the native port. The migrated
+kernel and handoff contracts do not imply exact full-browser tick parity.
 
 Native-only startup accepts repeated `--side` selectors (numeric IDs or unique
 case-insensitive names), with deterministic all-Army bootstrap forces.

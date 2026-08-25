@@ -1,33 +1,25 @@
-//! Dependency-free procedural observer HUD rendering.
+//! Browser-matched observer HUD geometry and screen-space typography layout.
 
 use bytemuck::{Pod, Zeroable};
 use mw_core::GameDate;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 
-const PANEL_WIDTH: f32 = 440.0;
+use crate::map_label::{ScreenTextAlign, ScreenTextFace, ScreenTextRun};
+
+const PANEL_WIDTH: f32 = 320.0;
 const PANEL_MIN_HEIGHT: f32 = 80.0;
 const PANEL_MAX_HEIGHT: f32 = 640.0;
 const PANEL_MARGIN: f32 = 12.0;
-const PANEL_PADDING: f32 = 10.0;
-const TOP_BAR_HEIGHT: f32 = 44.0;
+const PANEL_PADDING: f32 = 14.0;
+const PANEL_LINE_HEIGHT: f32 = 13.0;
+const TOP_BAR_HEIGHT: f32 = 60.0;
 const TOP_BAR_MARGIN: f32 = 16.0;
 const CONTROL_HEIGHT: f32 = 30.0;
 const CONTROL_GAP: f32 = 4.0;
 const CONTROL_RIGHT_MARGIN: f32 = 12.0;
 const CONTROL_WIDTHS: [f32; 4] = [32.0, 30.0, 38.0, 30.0];
-const DATE_SCALE: f32 = 2.0;
-const DATE_TOP_GAP: f32 = 8.0;
-const DATE_SHADOW_OFFSET: f32 = 2.0;
-const DATE_SHADOW_OFFSETS: [[f32; 2]; 8] = [
-    [-DATE_SHADOW_OFFSET, -DATE_SHADOW_OFFSET],
-    [0.0, -DATE_SHADOW_OFFSET],
-    [DATE_SHADOW_OFFSET, -DATE_SHADOW_OFFSET],
-    [-DATE_SHADOW_OFFSET, 0.0],
-    [DATE_SHADOW_OFFSET, 0.0],
-    [-DATE_SHADOW_OFFSET, DATE_SHADOW_OFFSET],
-    [0.0, DATE_SHADOW_OFFSET],
-    [DATE_SHADOW_OFFSET, DATE_SHADOW_OFFSET],
-];
+const DATE_TOP_GAP: f32 = 14.0;
+const SECTION_HEADERS: [&str; 5] = ["TERRITORY", "ECONOMY", "FORCES", "AIR POWER", "OPERATIONS"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackAction {
@@ -57,7 +49,6 @@ pub struct ObserverHudUpload<'a> {
     pub lines: &'a [String],
     pub accent: [f32; 4],
     pub playback: Option<PlaybackPresentation>,
-    pub game_date: Option<GameDate>,
     pub show_observer: bool,
 }
 
@@ -95,19 +86,17 @@ impl PanelBounds {
     }
 }
 
-/// Returns the fixed top-right HUD bounds, clamped to the available surface.
 pub fn panel_bounds(viewport: PhysicalSize<u32>, line_count: usize) -> PanelBounds {
     let viewport_width = viewport.width as f32;
     let viewport_height = viewport.height as f32;
     if viewport_width == 0.0 || viewport_height == 0.0 {
         return PanelBounds::default();
     }
-
     let margin = PANEL_MARGIN
         .min(viewport_width * 0.05)
         .min(viewport_height * 0.05);
     let width = PANEL_WIDTH.min((viewport_width - margin * 2.0).max(0.0));
-    let desired_height = (PANEL_PADDING * 2.0 + line_count.max(1) as f32 * 18.0)
+    let desired_height = (PANEL_PADDING * 2.0 + line_count.max(1) as f32 * PANEL_LINE_HEIGHT)
         .clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT);
     let top_margin = TOP_BAR_MARGIN.min(viewport_height * 0.05);
     let top_bar_height = TOP_BAR_HEIGHT.min((viewport_height - top_margin * 2.0).max(0.0));
@@ -145,7 +134,7 @@ pub fn hud_layout(
         let total_width = CONTROL_WIDTHS.iter().sum::<f32>() + CONTROL_GAP * 3.0;
         let scale = (top_bar.width / (total_width + CONTROL_RIGHT_MARGIN * 2.0)).min(1.0);
         let gap = CONTROL_GAP * scale;
-        let control_height = CONTROL_HEIGHT.min(top_bar.height - 8.0).max(0.0);
+        let control_height = CONTROL_HEIGHT.min(top_bar.height - 12.0).max(0.0);
         let scaled_total = CONTROL_WIDTHS.iter().sum::<f32>() * scale + gap * 3.0;
         let mut x =
             (top_bar.right() - CONTROL_RIGHT_MARGIN.min(top_bar.width * 0.04) - scaled_total)
@@ -167,15 +156,9 @@ pub fn hud_layout(
     } else {
         (top_bar.right() - 12.0).max(top_bar.x)
     };
-    let text_x = (top_bar.x + 12.0).min(text_right);
+    let text_x = (top_bar.x + 16.0).min(text_right);
     let text_width = (text_right - text_x).max(0.0);
-    let status_width = text_width.min(216.0);
-    let remaining = (text_width - status_width - 16.0).max(0.0);
-    let unit_width = if remaining >= 72.0 {
-        remaining.min(120.0)
-    } else {
-        0.0
-    };
+    let status_width = text_width.min(280.0);
     HudLayout {
         top_bar,
         observer_panel: if show_observer {
@@ -185,19 +168,151 @@ pub fn hud_layout(
         },
         status_text: PanelBounds {
             x: text_x,
-            y: top_bar.y + 10.0,
+            y: top_bar.y + 8.0,
             width: status_width,
-            height: 24.0_f32.min(top_bar.height),
+            height: 25.0_f32.min(top_bar.height),
         },
         unit_text: PanelBounds {
-            x: (text_x + status_width + 16.0).min(text_right),
-            y: top_bar.y + 12.0,
-            width: unit_width,
+            x: text_x,
+            y: top_bar.y + 34.0,
+            width: text_width.min(180.0),
             height: 18.0_f32.min(top_bar.height),
         },
         playback_buttons: buttons,
         playback_active,
     }
+}
+
+pub fn hud_text_runs(
+    viewport: PhysicalSize<u32>,
+    lines: &[String],
+    playback: Option<PlaybackPresentation>,
+    game_date: Option<GameDate>,
+    show_observer: bool,
+) -> Vec<ScreenTextRun> {
+    let layout = hud_layout(viewport, lines.len(), playback.is_some(), show_observer);
+    if layout.top_bar.width <= 0.0 || layout.top_bar.height <= 0.0 {
+        return Vec::new();
+    }
+    let mut runs = Vec::new();
+    if let Some(playback) = playback {
+        runs.push(ScreenTextRun {
+            text: if playback.paused {
+                "Simulation Paused".to_owned()
+            } else {
+                "Global Conflict Active".to_owned()
+            },
+            screen: [layout.status_text.x, layout.status_text.y + 17.0],
+            font_size: 17.0,
+            color: [0.95, 0.95, 0.93, 1.0],
+            face: ScreenTextFace::Serif,
+            align: ScreenTextAlign::LeftBaseline,
+            halo_radius: 0.0,
+            halo_alpha: 0.0,
+        });
+        if layout.unit_text.width > 0.0 {
+            runs.push(ScreenTextRun {
+                text: format!("{} UNITS", playback.unit_count),
+                screen: [layout.unit_text.x, layout.unit_text.y + 9.0],
+                font_size: 10.0,
+                color: [0.68, 0.70, 0.70, 1.0],
+                face: ScreenTextFace::Sans,
+                align: ScreenTextAlign::LeftBaseline,
+                halo_radius: 0.0,
+                halo_alpha: 0.0,
+            });
+        }
+        let speed = layout.button(PlaybackAction::CycleSpeed);
+        runs.push(ScreenTextRun {
+            text: format!("{}X", playback.speed.clamp(1, 3)),
+            screen: [speed.x + speed.width * 0.5, speed.y + speed.height * 0.5],
+            font_size: 11.0,
+            color: [0.96, 0.96, 0.94, 1.0],
+            face: ScreenTextFace::Mono,
+            align: ScreenTextAlign::Center,
+            halo_radius: 0.0,
+            halo_alpha: 0.0,
+        });
+    }
+    if let Some(game_date) = game_date {
+        runs.push(ScreenTextRun {
+            text: game_date.to_string(),
+            screen: [
+                viewport.width as f32 * 0.5,
+                layout.top_bar.bottom() + DATE_TOP_GAP + 9.0,
+            ],
+            font_size: 17.0,
+            color: [1.0, 1.0, 1.0, 0.98],
+            face: ScreenTextFace::Serif,
+            align: ScreenTextAlign::Center,
+            halo_radius: 2.0,
+            halo_alpha: 0.92,
+        });
+    }
+    if show_observer {
+        let panel = layout.observer_panel;
+        let mut baseline = panel.y + PANEL_PADDING + 12.0;
+        let bottom = panel.bottom() - PANEL_PADDING;
+        for (index, line) in lines.iter().enumerate() {
+            if baseline > bottom {
+                break;
+            }
+            if line.is_empty() {
+                baseline += 5.0;
+                continue;
+            }
+            let section = SECTION_HEADERS.contains(&line.as_str());
+            let title = index == 0;
+            let selected_country = index >= 3
+                && lines
+                    .get(index.wrapping_sub(1))
+                    .is_some_and(String::is_empty)
+                && !section
+                && !line.starts_with("LEFT CLICK");
+            runs.push(ScreenTextRun {
+                text: line.clone(),
+                screen: [panel.x + PANEL_PADDING, baseline],
+                font_size: if title {
+                    16.0
+                } else if section {
+                    9.5
+                } else if selected_country {
+                    13.0
+                } else {
+                    10.5
+                },
+                color: if section {
+                    [0.95, 0.57, 0.22, 1.0]
+                } else if index == 1 {
+                    [0.69, 0.71, 0.71, 1.0]
+                } else {
+                    [0.92, 0.92, 0.89, 1.0]
+                },
+                face: if title || selected_country {
+                    ScreenTextFace::Serif
+                } else if section {
+                    ScreenTextFace::Mono
+                } else {
+                    ScreenTextFace::Sans
+                },
+                align: ScreenTextAlign::LeftBaseline,
+                halo_radius: 0.0,
+                halo_alpha: 0.0,
+            });
+            baseline += if title { 17.0 } else { PANEL_LINE_HEIGHT };
+        }
+        runs.push(ScreenTextRun {
+            text: "Tiles © Esri".to_owned(),
+            screen: [viewport.width as f32 - 8.0, viewport.height as f32 - 8.0],
+            font_size: 9.0,
+            color: [0.88, 0.88, 0.86, 0.82],
+            face: ScreenTextFace::Sans,
+            align: ScreenTextAlign::RightBaseline,
+            halo_radius: 1.5,
+            halo_alpha: 0.8,
+        });
+    }
+    runs
 }
 
 pub fn hud_hit_test(point: PhysicalPosition<f64>, layout: HudLayout) -> HudHit {
@@ -334,7 +449,6 @@ impl ObserverHudRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
         Self {
             pipeline,
             bind_group,
@@ -358,7 +472,6 @@ impl ObserverHudRenderer {
             content.lines,
             content.accent,
             content.playback,
-            content.game_date,
             content.show_observer,
         );
         if self.vertices.len() > self.vertex_capacity {
@@ -370,15 +483,13 @@ impl ObserverHudRenderer {
                 mapped_at_creation: false,
             });
         }
-
-        let viewport_uniform = ViewportUniform {
-            size: [viewport.width as f32, viewport.height as f32],
-            padding: [0.0; 2],
-        };
         queue.write_buffer(
             &self.viewport_buffer,
             0,
-            bytemuck::bytes_of(&viewport_uniform),
+            bytemuck::bytes_of(&ViewportUniform {
+                size: [viewport.width as f32, viewport.height as f32],
+                padding: [0.0; 2],
+            }),
         );
         if !self.vertices.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
@@ -402,99 +513,117 @@ fn build_vertices(
     lines: &[String],
     accent: [f32; 4],
     playback: Option<PlaybackPresentation>,
-    game_date: Option<GameDate>,
     show_observer: bool,
 ) -> Vec<HudVertex> {
     let layout = hud_layout(viewport, lines.len(), playback.is_some(), show_observer);
-    let bounds = layout.observer_panel;
     if layout.top_bar.width <= 0.0 || layout.top_bar.height <= 0.0 {
         return Vec::new();
     }
-
     let accent = accent.map(|channel| channel.clamp(0.0, 1.0));
     let mut vertices = Vec::new();
-    push_rect(
+    push_rounded_rect(
         &mut vertices,
-        layout.top_bar.x,
-        layout.top_bar.y,
-        layout.top_bar.width,
-        layout.top_bar.height,
-        [0.039, 0.039, 0.047, 0.80],
+        PanelBounds {
+            y: layout.top_bar.y + 4.0,
+            ..layout.top_bar
+        },
+        7.0,
+        [0.0, 0.0, 0.0, 0.34],
     );
-    push_outline(&mut vertices, layout.top_bar, [1.0, 1.0, 1.0, 0.10]);
+    push_rounded_rect(
+        &mut vertices,
+        layout.top_bar,
+        7.0,
+        [0.035, 0.039, 0.043, 0.92],
+    );
+    push_outline(&mut vertices, layout.top_bar, [1.0, 1.0, 1.0, 0.11]);
     if let Some(playback) = playback {
         push_playback_controls(&mut vertices, layout, playback);
-    }
-    if let Some(game_date) = game_date {
-        push_game_date(&mut vertices, viewport, layout, game_date);
     }
     if !show_observer {
         return vertices;
     }
+    let bounds = layout.observer_panel;
+    push_rounded_rect(
+        &mut vertices,
+        PanelBounds {
+            y: bounds.y + 4.0,
+            ..bounds
+        },
+        6.0,
+        [0.0, 0.0, 0.0, 0.38],
+    );
+    push_rounded_rect(&mut vertices, bounds, 6.0, [0.028, 0.032, 0.036, 0.94]);
+    push_outline(&mut vertices, bounds, [1.0, 1.0, 1.0, 0.11]);
     push_rect(
         &mut vertices,
         bounds.x,
         bounds.y,
         bounds.width,
-        bounds.height,
-        [0.025, 0.04, 0.065, 0.82],
+        2.0_f32.min(bounds.height),
+        [accent[0], accent[1], accent[2], 0.9],
     );
-    let border = 1.0_f32.min(bounds.width).min(bounds.height);
-    push_rect(
-        &mut vertices,
-        bounds.x,
-        bounds.y,
-        bounds.width,
-        border,
-        [accent[0], accent[1], accent[2], accent[3] * 0.72],
-    );
-    push_rect(
-        &mut vertices,
-        bounds.x,
-        bounds.y,
-        3.0_f32.min(bounds.width),
-        bounds.height,
-        accent,
-    );
+    vertices
+}
 
-    let padding = PANEL_PADDING
-        .min(bounds.width * 0.12)
-        .min(bounds.height * 0.12);
-    let available_width = (bounds.width - padding * 2.0).max(0.0);
-    let available_height = (bounds.height - padding * 2.0).max(0.0);
-    let longest_line = lines
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
-    let line_count = lines.len().max(1) as f32;
-    let width_scale = available_width / (longest_line * 6.0);
-    let height_scale = available_height / (line_count * 9.0);
-    let scale = width_scale.min(height_scale).clamp(1.0, 2.0);
-    let advance_x = 6.0 * scale;
-    let advance_y = 9.0 * scale;
-    let max_columns = (available_width / advance_x).floor() as usize;
-    let max_lines = (available_height / advance_y).floor() as usize;
-    if max_columns == 0 || max_lines == 0 {
-        return vertices;
-    }
-
-    let text_color = [0.91, 0.95, 0.98, 0.94];
-    for (line_index, line) in lines.iter().take(max_lines).enumerate() {
-        let y = bounds.y + padding + line_index as f32 * advance_y;
-        for (column, character) in line.chars().take(max_columns).enumerate() {
-            push_glyph(
-                &mut vertices,
-                character,
-                bounds.x + padding + column as f32 * advance_x,
-                y,
-                scale,
-                text_color,
-            );
+fn push_playback_controls(
+    vertices: &mut Vec<HudVertex>,
+    layout: HudLayout,
+    state: PlaybackPresentation,
+) {
+    for action in PLAYBACK_ACTIONS {
+        let bounds = layout.button(action);
+        push_rounded_rect(vertices, bounds, 3.0, playback_fill(action, state));
+        let border = if action == PlaybackAction::CycleSpeed && state.speed > 1 {
+            [0.247, 0.663, 0.416, 1.0]
+        } else {
+            [1.0, 1.0, 1.0, 0.14]
+        };
+        push_outline(vertices, bounds, border);
+        let cx = bounds.x + bounds.width * 0.5;
+        let cy = bounds.y + bounds.height * 0.5;
+        match action {
+            PlaybackAction::TogglePause if state.paused => push_triangle(
+                vertices,
+                [cx - 4.0, cy - 6.0],
+                [cx - 4.0, cy + 6.0],
+                [cx + 6.0, cy],
+                [1.0; 4],
+            ),
+            PlaybackAction::TogglePause => {
+                push_rect(vertices, cx - 5.0, cy - 6.0, 3.0, 12.0, [1.0; 4]);
+                push_rect(vertices, cx + 2.0, cy - 6.0, 3.0, 12.0, [1.0; 4]);
+            }
+            PlaybackAction::SpeedDown => {
+                push_chevron(vertices, cx, cy, false, [0.88, 0.88, 0.88, 1.0])
+            }
+            PlaybackAction::SpeedUp => {
+                push_chevron(vertices, cx, cy, true, [0.88, 0.88, 0.88, 1.0])
+            }
+            PlaybackAction::CycleSpeed => {}
         }
     }
-    vertices
+}
+
+fn playback_fill(action: PlaybackAction, state: PlaybackPresentation) -> [f32; 4] {
+    let mut color: [f32; 4] = match action {
+        PlaybackAction::TogglePause if state.paused => [0.153, 0.682, 0.376, 1.0],
+        PlaybackAction::TogglePause => [0.953, 0.612, 0.071, 1.0],
+        PlaybackAction::CycleSpeed if state.speed > 1 => [0.149, 0.310, 0.224, 1.0],
+        _ => [1.0, 1.0, 1.0, 0.045],
+    };
+    if state.hovered == Some(action) {
+        for channel in &mut color[..3] {
+            *channel = *channel * 0.78 + 0.22;
+        }
+        color[3] = color[3].max(0.18);
+    }
+    if state.pressed == Some(action) {
+        for channel in &mut color[..3] {
+            *channel *= 0.72;
+        }
+    }
+    color
 }
 
 fn push_rect(
@@ -534,153 +663,110 @@ fn push_rect(
     ]);
 }
 
-fn playback_fill(action: PlaybackAction, state: PlaybackPresentation) -> [f32; 4] {
-    let mut color: [f32; 4] = match action {
-        PlaybackAction::TogglePause if state.paused => [0.153, 0.682, 0.376, 1.0],
-        PlaybackAction::TogglePause => [0.953, 0.612, 0.071, 1.0],
-        PlaybackAction::CycleSpeed if state.speed > 1 => [0.149, 0.310, 0.224, 1.0],
-        _ => [1.0, 1.0, 1.0, 0.03],
-    };
-    if state.hovered == Some(action) {
-        for channel in &mut color[..3] {
-            *channel = *channel * 0.78 + 0.22;
-        }
-        color[3] = color[3].max(0.18_f32);
-    }
-    if state.pressed == Some(action) {
-        for channel in &mut color[..3] {
-            *channel *= 0.72;
-        }
-    }
-    color
-}
-
-fn push_playback_controls(
+fn push_rounded_rect(
     vertices: &mut Vec<HudVertex>,
-    layout: HudLayout,
-    state: PlaybackPresentation,
+    bounds: PanelBounds,
+    radius: f32,
+    color: [f32; 4],
 ) {
-    let status = if state.paused {
-        "SIMULATION PAUSED"
-    } else {
-        "CONNECTION STABLE"
-    };
-    let status_scale = (layout.status_text.width / (status.chars().count() as f32 * 6.0)).min(2.0);
-    if status_scale >= 0.5 {
-        push_text(
-            vertices,
-            status,
-            layout.status_text.x,
-            layout.status_text.y + 4.0,
-            status_scale,
-            [0.91, 0.95, 0.98, 0.94],
-        );
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return;
     }
-    if layout.unit_text.width > 0.0 {
-        let units = format!("{} UNITS", state.unit_count);
-        let unit_scale = (layout.unit_text.width / (units.chars().count() as f32 * 6.0)).min(1.5);
-        push_text(
-            vertices,
-            &units,
-            layout.unit_text.x,
-            layout.unit_text.y + 3.0,
-            unit_scale,
-            [0.62, 0.66, 0.70, 0.94],
-        );
-    }
-
-    for action in PLAYBACK_ACTIONS {
-        let bounds = layout.button(action);
-        let fill = playback_fill(action, state);
+    let radius = radius.min(bounds.width * 0.5).min(bounds.height * 0.5);
+    if radius <= 0.0 {
         push_rect(
             vertices,
             bounds.x,
             bounds.y,
             bounds.width,
             bounds.height,
-            fill,
+            color,
         );
-        let border = if action == PlaybackAction::CycleSpeed && state.speed > 1 {
-            [0.247, 0.663, 0.416, 1.0]
-        } else {
-            [1.0, 1.0, 1.0, 0.10]
-        };
-        push_outline(vertices, bounds, border);
-        let cx = bounds.x + bounds.width * 0.5;
-        let cy = bounds.y + bounds.height * 0.5;
-        match action {
-            PlaybackAction::TogglePause if state.paused => push_triangle(
+        return;
+    }
+    push_rect(
+        vertices,
+        bounds.x + radius,
+        bounds.y,
+        bounds.width - radius * 2.0,
+        bounds.height,
+        color,
+    );
+    push_rect(
+        vertices,
+        bounds.x,
+        bounds.y + radius,
+        radius,
+        bounds.height - radius * 2.0,
+        color,
+    );
+    push_rect(
+        vertices,
+        bounds.right() - radius,
+        bounds.y + radius,
+        radius,
+        bounds.height - radius * 2.0,
+        color,
+    );
+    const SEGMENTS: usize = 5;
+    let corners = [
+        ([bounds.x + radius, bounds.y + radius], std::f32::consts::PI),
+        (
+            [bounds.right() - radius, bounds.y + radius],
+            -std::f32::consts::FRAC_PI_2,
+        ),
+        ([bounds.right() - radius, bounds.bottom() - radius], 0.0),
+        (
+            [bounds.x + radius, bounds.bottom() - radius],
+            std::f32::consts::FRAC_PI_2,
+        ),
+    ];
+    for (center, start) in corners {
+        for segment in 0..SEGMENTS {
+            let a = start + segment as f32 * std::f32::consts::FRAC_PI_2 / SEGMENTS as f32;
+            let b = start + (segment + 1) as f32 * std::f32::consts::FRAC_PI_2 / SEGMENTS as f32;
+            push_triangle(
                 vertices,
-                [cx - 4.0, cy - 6.0],
-                [cx - 4.0, cy + 6.0],
-                [cx + 6.0, cy],
-                [1.0; 4],
-            ),
-            PlaybackAction::TogglePause => {
-                push_rect(vertices, cx - 5.0, cy - 6.0, 3.0, 12.0, [1.0; 4]);
-                push_rect(vertices, cx + 2.0, cy - 6.0, 3.0, 12.0, [1.0; 4]);
-            }
-            PlaybackAction::SpeedDown => {
-                push_chevron(vertices, cx, cy, false, [0.88, 0.88, 0.88, 1.0])
-            }
-            PlaybackAction::SpeedUp => {
-                push_chevron(vertices, cx, cy, true, [0.88, 0.88, 0.88, 1.0])
-            }
-            PlaybackAction::CycleSpeed => {
-                let label = format!("{}X", state.speed.clamp(1, 3));
-                push_text(
-                    vertices,
-                    &label,
-                    cx - 6.0,
-                    cy - 5.0,
-                    1.5,
-                    [0.91, 0.95, 0.98, 0.94],
-                );
-            }
+                center,
+                [center[0] + a.cos() * radius, center[1] + a.sin() * radius],
+                [center[0] + b.cos() * radius, center[1] + b.sin() * radius],
+                color,
+            );
         }
     }
 }
 
-fn push_game_date(
-    vertices: &mut Vec<HudVertex>,
-    viewport: PhysicalSize<u32>,
-    layout: HudLayout,
-    date: GameDate,
-) {
-    let label = date.to_string();
-    let width = label.chars().count() as f32 * 6.0 * DATE_SCALE;
-    let x = ((viewport.width as f32 - width) * 0.5).max(0.0);
-    let y = layout.top_bar.bottom() + DATE_TOP_GAP;
-    for [offset_x, offset_y] in DATE_SHADOW_OFFSETS {
-        push_text(
-            vertices,
-            &label,
-            x + offset_x,
-            y + offset_y,
-            DATE_SCALE,
-            [0.0, 0.0, 0.0, 0.78],
-        );
-    }
-    push_text(vertices, &label, x, y, DATE_SCALE, [1.0, 1.0, 1.0, 0.96]);
-}
-
 fn push_outline(vertices: &mut Vec<HudVertex>, bounds: PanelBounds, color: [f32; 4]) {
-    push_rect(vertices, bounds.x, bounds.y, bounds.width, 1.0, color);
     push_rect(
         vertices,
-        bounds.x,
-        bounds.bottom() - 1.0,
-        bounds.width,
+        bounds.x + 5.0,
+        bounds.y,
+        bounds.width - 10.0,
         1.0,
         color,
     );
-    push_rect(vertices, bounds.x, bounds.y, 1.0, bounds.height, color);
+    push_rect(
+        vertices,
+        bounds.x + 5.0,
+        bounds.bottom() - 1.0,
+        bounds.width - 10.0,
+        1.0,
+        color,
+    );
+    push_rect(
+        vertices,
+        bounds.x,
+        bounds.y + 5.0,
+        1.0,
+        bounds.height - 10.0,
+        color,
+    );
     push_rect(
         vertices,
         bounds.right() - 1.0,
-        bounds.y,
+        bounds.y + 5.0,
         1.0,
-        bounds.height,
+        bounds.height - 10.0,
         color,
     );
 }
@@ -709,208 +795,9 @@ fn push_chevron(vertices: &mut Vec<HudVertex>, cx: f32, cy: f32, right: bool, co
     }
 }
 
-fn push_text(
-    vertices: &mut Vec<HudVertex>,
-    text: &str,
-    x: f32,
-    y: f32,
-    scale: f32,
-    color: [f32; 4],
-) {
-    for (column, character) in text.chars().enumerate() {
-        push_glyph(
-            vertices,
-            character,
-            x + column as f32 * 6.0 * scale,
-            y,
-            scale,
-            color,
-        );
-    }
-}
-
-fn push_glyph(
-    vertices: &mut Vec<HudVertex>,
-    character: char,
-    x: f32,
-    y: f32,
-    scale: f32,
-    color: [f32; 4],
-) {
-    for (row, bits) in glyph_rows(character).iter().copied().enumerate() {
-        for column in 0..5 {
-            if bits & (1 << (4 - column)) != 0 {
-                push_rect(
-                    vertices,
-                    x + column as f32 * scale,
-                    y + row as f32 * scale,
-                    scale,
-                    scale,
-                    color,
-                );
-            }
-        }
-    }
-}
-
-fn glyph_rows(character: char) -> [u8; 7] {
-    match character.to_ascii_uppercase() {
-        'A' => [14, 17, 17, 31, 17, 17, 17],
-        'B' => [30, 17, 17, 30, 17, 17, 30],
-        'C' => [14, 17, 16, 16, 16, 17, 14],
-        'D' => [30, 17, 17, 17, 17, 17, 30],
-        'E' => [31, 16, 16, 30, 16, 16, 31],
-        'F' => [31, 16, 16, 30, 16, 16, 16],
-        'G' => [14, 17, 16, 23, 17, 17, 14],
-        'H' => [17, 17, 17, 31, 17, 17, 17],
-        'I' => [14, 4, 4, 4, 4, 4, 14],
-        'J' => [7, 2, 2, 2, 18, 18, 12],
-        'K' => [17, 18, 20, 24, 20, 18, 17],
-        'L' => [16, 16, 16, 16, 16, 16, 31],
-        'M' => [17, 27, 21, 21, 17, 17, 17],
-        'N' => [17, 25, 21, 19, 17, 17, 17],
-        'O' => [14, 17, 17, 17, 17, 17, 14],
-        'P' => [30, 17, 17, 30, 16, 16, 16],
-        'Q' => [14, 17, 17, 17, 21, 18, 13],
-        'R' => [30, 17, 17, 30, 20, 18, 17],
-        'S' => [15, 16, 16, 14, 1, 1, 30],
-        'T' => [31, 4, 4, 4, 4, 4, 4],
-        'U' => [17, 17, 17, 17, 17, 17, 14],
-        'V' => [17, 17, 17, 17, 17, 10, 4],
-        'W' => [17, 17, 17, 21, 21, 21, 10],
-        'X' => [17, 17, 10, 4, 10, 17, 17],
-        'Y' => [17, 17, 10, 4, 4, 4, 4],
-        'Z' => [31, 1, 2, 4, 8, 16, 31],
-        '0' => [14, 17, 19, 21, 25, 17, 14],
-        '1' => [4, 12, 4, 4, 4, 4, 14],
-        '2' => [14, 17, 1, 2, 4, 8, 31],
-        '3' => [30, 1, 1, 14, 1, 1, 30],
-        '4' => [2, 6, 10, 18, 31, 2, 2],
-        '5' => [31, 16, 16, 30, 1, 1, 30],
-        '6' => [14, 16, 16, 30, 17, 17, 14],
-        '7' => [31, 1, 2, 4, 8, 8, 8],
-        '8' => [14, 17, 17, 14, 17, 17, 14],
-        '9' => [14, 17, 17, 15, 1, 1, 14],
-        '-' => [0, 0, 0, 31, 0, 0, 0],
-        '_' => [0, 0, 0, 0, 0, 0, 31],
-        '=' => [0, 31, 0, 31, 0, 0, 0],
-        '+' => [0, 4, 4, 31, 4, 4, 0],
-        '.' => [0, 0, 0, 0, 0, 12, 12],
-        ',' => [0, 0, 0, 0, 0, 12, 8],
-        ':' => [0, 12, 12, 0, 12, 12, 0],
-        ';' => [0, 12, 12, 0, 12, 8, 0],
-        '!' => [4, 4, 4, 4, 4, 0, 4],
-        '?' => [14, 17, 1, 2, 4, 0, 4],
-        '/' => [1, 2, 2, 4, 8, 8, 16],
-        '\\' => [16, 8, 8, 4, 2, 2, 1],
-        '%' => [17, 2, 4, 4, 8, 16, 17],
-        '(' => [2, 4, 8, 8, 8, 4, 2],
-        ')' => [8, 4, 2, 2, 2, 4, 8],
-        '[' => [14, 8, 8, 8, 8, 8, 14],
-        ']' => [14, 2, 2, 2, 2, 2, 14],
-        '<' => [2, 4, 8, 16, 8, 4, 2],
-        '>' => [8, 4, 2, 1, 2, 4, 8],
-        '#' => [10, 10, 31, 10, 31, 10, 10],
-        '|' => [4, 4, 4, 4, 4, 4, 4],
-        '\'' => [4, 4, 2, 0, 0, 0, 0],
-        '"' => [10, 10, 10, 0, 0, 0, 0],
-        ' ' => [0; 7],
-        _ => [14, 17, 1, 2, 4, 0, 4],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn layout_is_compact_and_top_right() {
-        let bounds = panel_bounds(PhysicalSize::new(1920, 1080), 33);
-        assert_eq!(
-            bounds,
-            PanelBounds {
-                x: 1468.0,
-                y: 72.0,
-                width: 440.0,
-                height: 614.0
-            }
-        );
-        assert!(contains(bounds, PhysicalPosition::new(1900.0, 80.0)));
-        assert!(!contains(bounds, PhysicalPosition::new(1200.0, 20.0)));
-    }
-
-    #[test]
-    fn tiny_and_zero_viewports_are_clamped() {
-        let tiny = panel_bounds(PhysicalSize::new(20, 10), 33);
-        assert!(tiny.x >= 0.0 && tiny.y >= 0.0);
-        assert!(tiny.right() <= 20.0 && tiny.bottom() <= 10.0);
-        assert_eq!(
-            panel_bounds(PhysicalSize::new(0, 10), 33),
-            PanelBounds::default()
-        );
-        assert!(!contains(
-            panel_bounds(PhysicalSize::new(0, 0), 33),
-            PhysicalPosition::new(0.0, 0.0)
-        ));
-    }
-
-    #[test]
-    fn glyph_generation_is_stable_and_case_insensitive() {
-        assert_eq!(glyph_rows('a'), glyph_rows('A'));
-        assert_eq!(glyph_rows('A'), [14, 17, 17, 31, 17, 17, 17]);
-        let mut first = Vec::new();
-        let mut second = Vec::new();
-        push_glyph(&mut first, 'A', 3.0, 4.0, 2.0, [1.0; 4]);
-        push_glyph(&mut second, 'a', 3.0, 4.0, 2.0, [1.0; 4]);
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 18 * 6);
-    }
-
-    #[test]
-    fn empty_text_keeps_only_panel_geometry() {
-        let vertices = build_vertices(
-            PhysicalSize::new(800, 600),
-            &[],
-            [0.2, 0.7, 1.0, 1.0],
-            None,
-            None,
-            true,
-        );
-        assert_eq!(vertices.len(), 48);
-        assert!(
-            build_vertices(PhysicalSize::new(0, 0), &[], [1.0; 4], None, None, true).is_empty()
-        );
-    }
-
-    #[test]
-    fn full_observer_readout_fits_common_viewports() {
-        let lines = vec!["I".to_owned(); 33];
-        let expected_vertices = 48 + 33 * 11 * 6;
-        assert_eq!(
-            build_vertices(
-                PhysicalSize::new(1920, 1080),
-                &lines,
-                [1.0; 4],
-                None,
-                None,
-                true
-            )
-            .len(),
-            expected_vertices
-        );
-        assert_eq!(
-            build_vertices(
-                PhysicalSize::new(800, 600),
-                &lines,
-                [1.0; 4],
-                None,
-                None,
-                true
-            )
-            .len(),
-            expected_vertices
-        );
-    }
 
     fn playback(paused: bool, speed: u8) -> PlaybackPresentation {
         PlaybackPresentation {
@@ -923,44 +810,43 @@ mod tests {
     }
 
     #[test]
-    fn playback_layout_matches_browser_order_and_gaps() {
-        let layout = hud_layout(PhysicalSize::new(1280, 720), 20, true, true);
-        assert_eq!(layout.top_bar.x, 16.0);
-        assert_eq!(layout.top_bar.y, 16.0);
-        assert_eq!(layout.top_bar.height, 44.0);
-        assert!(layout.observer_panel.y >= layout.top_bar.bottom());
+    fn layout_matches_browser_scale_and_top_right_panel() {
+        let layout = hud_layout(PhysicalSize::new(1280, 720), 33, true, true);
+        assert_eq!(
+            layout.top_bar,
+            PanelBounds {
+                x: 16.0,
+                y: 16.0,
+                width: 1248.0,
+                height: 60.0
+            }
+        );
+        assert_eq!(layout.observer_panel.x, 948.0);
+        assert_eq!(layout.observer_panel.width, 320.0);
+        assert_eq!(layout.observer_panel.y, 88.0);
+        assert!(layout.observer_panel.bottom() <= 708.0);
+    }
+
+    #[test]
+    fn tiny_and_zero_viewports_are_clamped() {
+        let tiny = panel_bounds(PhysicalSize::new(20, 10), 33);
+        assert!(tiny.x >= 0.0 && tiny.y >= 0.0);
+        assert!(tiny.right() <= 20.0 && tiny.bottom() <= 10.0);
+        assert_eq!(
+            panel_bounds(PhysicalSize::new(0, 10), 33),
+            PanelBounds::default()
+        );
+    }
+
+    #[test]
+    fn playback_layout_preserves_browser_order_and_hit_targets() {
+        let layout = hud_layout(PhysicalSize::new(1280, 720), 20, true, false);
         for index in 0..3 {
             assert_eq!(
                 layout.playback_buttons[index + 1].x - layout.playback_buttons[index].right(),
                 4.0
             );
         }
-        assert_eq!(
-            layout.playback_buttons.map(|bounds| bounds.width),
-            [32.0, 30.0, 38.0, 30.0]
-        );
-        let compact = hud_layout(PhysicalSize::new(800, 600), 20, true, true);
-        assert!(compact.observer_panel.y >= compact.top_bar.bottom());
-        assert!(compact.observer_panel.bottom() <= 588.0);
-        assert!(compact.status_text.right() <= compact.button(PlaybackAction::TogglePause).x);
-        assert!(
-            compact.unit_text.width == 0.0
-                || compact.unit_text.right() <= compact.button(PlaybackAction::TogglePause).x
-        );
-        let tiny = hud_layout(PhysicalSize::new(120, 80), 2, true, true);
-        assert!(
-            tiny.playback_buttons
-                .iter()
-                .all(|bounds| bounds.x >= 0.0 && bounds.right() <= 120.0)
-        );
-        assert!(tiny.status_text.right() <= tiny.button(PlaybackAction::TogglePause).x);
-        assert!(tiny.observer_panel.y >= tiny.top_bar.bottom());
-        assert!(tiny.observer_panel.bottom() <= 80.0);
-    }
-
-    #[test]
-    fn hit_test_distinguishes_buttons_gaps_panel_and_map() {
-        let layout = hud_layout(PhysicalSize::new(1280, 720), 20, true, false);
         for action in PLAYBACK_ACTIONS {
             let bounds = layout.button(action);
             assert_eq!(
@@ -974,19 +860,61 @@ mod tests {
                 HudHit::Playback(action)
             );
         }
-        let first = layout.button(PlaybackAction::TogglePause);
-        assert_eq!(
-            hud_hit_test(
-                PhysicalPosition::new(f64::from(first.right() + 2.0), f64::from(first.y + 2.0)),
-                layout
-            ),
-            HudHit::Panel
-        );
         assert_eq!(
             hud_hit_test(PhysicalPosition::new(5.0, 200.0), layout),
             HudHit::Outside
         );
-        assert_eq!(layout.observer_panel, PanelBounds::default());
+    }
+
+    #[test]
+    fn geometry_contains_surfaces_and_controls_but_no_text_pixels() {
+        let lines = vec!["MODERN WARS // TICK 1".to_owned(), "TERRITORY".to_owned()];
+        let vertices = build_vertices(
+            PhysicalSize::new(1280, 720),
+            &lines,
+            [0.2, 0.7, 1.0, 1.0],
+            Some(playback(false, 1)),
+            true,
+        );
+        assert!(!vertices.is_empty());
+        assert!(vertices.len() < 1_000);
+    }
+
+    #[test]
+    fn text_runs_use_browser_typography_hierarchy() {
+        let lines = vec![
+            "MODERN WARS // TICK 7".to_owned(),
+            "RUNNING  42 UNITS".to_owned(),
+            String::new(),
+            "GERMANY  #64".to_owned(),
+            String::new(),
+            "TERRITORY".to_owned(),
+        ];
+        let date = GameDate::new(2024, 2, 29).unwrap();
+        let runs = hud_text_runs(
+            PhysicalSize::new(1280, 720),
+            &lines,
+            Some(playback(false, 2)),
+            Some(date),
+            true,
+        );
+        assert!(
+            runs.iter().any(
+                |run| run.text == "Global Conflict Active" && run.face == ScreenTextFace::Serif
+            )
+        );
+        assert!(runs.iter().any(|run| run.text == "2X"
+            && run.face == ScreenTextFace::Mono
+            && run.align == ScreenTextAlign::Center));
+        assert!(
+            runs.iter()
+                .any(|run| run.text == "TERRITORY" && run.face == ScreenTextFace::Mono)
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run.text == date.to_string() && run.halo_radius > 0.0)
+        );
+        assert!(runs.iter().any(|run| run.text == "Tiles © Esri"));
     }
 
     #[test]
@@ -1002,75 +930,6 @@ mod tests {
         assert_eq!(
             playback_fill(PlaybackAction::CycleSpeed, playback(false, 2)),
             [0.149, 0.310, 0.224, 1.0]
-        );
-    }
-
-    #[test]
-    fn top_bar_survives_hidden_observer_and_controls_are_runtime_only() {
-        let viewport = PhysicalSize::new(800, 600);
-        let hidden = build_vertices(
-            viewport,
-            &["HIDDEN".to_owned()],
-            [1.0; 4],
-            Some(playback(false, 1)),
-            None,
-            false,
-        );
-        assert!(!hidden.is_empty());
-        let inactive = hud_layout(viewport, 1, false, false);
-        assert_eq!(inactive.playback_buttons, [PanelBounds::default(); 4]);
-        assert_eq!(
-            hud_hit_test(PhysicalPosition::new(780.0, 20.0), inactive),
-            HudHit::Panel
-        );
-    }
-
-    #[test]
-    fn game_date_is_centered_below_top_bar_with_shadow_and_white_glyphs() {
-        let viewport = PhysicalSize::new(800, 600);
-        let layout = hud_layout(viewport, 1, true, false);
-        let date = GameDate::new(2024, 2, 29).unwrap();
-        let mut vertices = Vec::new();
-        push_game_date(&mut vertices, viewport, layout, date);
-
-        let expected_x = (800.0 - 10.0 * 6.0 * DATE_SCALE) * 0.5;
-        let expected_y = layout.top_bar.bottom() + DATE_TOP_GAP;
-        let shadow = [0.0, 0.0, 0.0, 0.78];
-        let foreground = [1.0, 1.0, 1.0, 0.96];
-        assert!(vertices.iter().any(|vertex| {
-            vertex.color == shadow
-                && vertex.screen
-                    == [
-                        expected_x + DATE_SCALE - DATE_SHADOW_OFFSET,
-                        expected_y - DATE_SHADOW_OFFSET,
-                    ]
-        }));
-        assert!(vertices.iter().any(|vertex| {
-            vertex.color == foreground && vertex.screen == [expected_x + DATE_SCALE, expected_y]
-        }));
-        assert!(
-            vertices
-                .iter()
-                .all(|vertex| vertex.screen[1] > layout.top_bar.bottom())
-        );
-    }
-
-    #[test]
-    fn game_date_remains_visible_when_observer_panel_is_hidden() {
-        let viewport = PhysicalSize::new(800, 600);
-        let date = Some(GameDate::new(2025, 12, 31).unwrap());
-        let with_date = build_vertices(viewport, &[], [1.0; 4], None, date, false);
-        let without_date = build_vertices(viewport, &[], [1.0; 4], None, None, false);
-
-        assert!(with_date.len() > without_date.len());
-        assert!(
-            with_date
-                .iter()
-                .any(|vertex| vertex.color == [1.0, 1.0, 1.0, 0.96])
-        );
-        assert_eq!(
-            hud_layout(viewport, 0, true, false).observer_panel,
-            PanelBounds::default()
         );
     }
 }

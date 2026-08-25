@@ -34,9 +34,10 @@ reference while systems move into the renderer-independent `mw-core` crate.
   casualty/desertion manpower continuation
 - reference-counted immutable snapshots, FIFO territory render deltas, and a
   native `wgpu` unit overlay with atomic pending snapshot/territory presentation
-- a dependency-free native sandbox observer HUD over immutable runtime
-  publications, with renderer-local country selection and live territory,
-  economy, forces, logistics, air-power, operation, and casualty summaries
+- a browser-styled native sandbox observer HUD over immutable runtime
+  publications, with a shared GPU font atlas, serif/sans/mono hierarchy,
+  renderer-local country selection, and live territory, economy, forces,
+  logistics, air-power, operation, and casualty summaries
 - browser-matched sandbox playback controls in the top status bar: orange
   pause/green resume, clamped speed arrows, and a cycling 1x/2x/3x readout
 - browser-style immutable world overlays for live airfields and wings, active
@@ -44,6 +45,9 @@ reference while systems move into the renderer-independent `mw-core` crate.
 - browser-matched controller frontlines, population/zoom-filtered cities,
   curved country names, and live side-strength labels, all layered from
   immutable territory and unit publications
+- the browser's ArcGIS World Imagery tiles beneath translucent political
+  colors, loaded asynchronously into a bounded GPU atlas with an offline
+  deterministic material fallback
 - a named dedicated simulation worker with bounded, lossless atomic
   publications and explicit stop/join shutdown
 - versioned browser-to-native checkpoints: loadable v1-v14 state with strict
@@ -267,7 +271,9 @@ center, zoom `3` start with the `2..12` Leaflet range, cursor-anchored
 fractional wheel curve, and antimeridian world-copy behavior. Map materials,
 country labels, units, operational overlays, and country picking all consume
 the same renderer-local projection; runtime snapshots and checkpoints remain
-in geographic latitude/longitude.
+in geographic latitude/longitude. Visible ArcGIS tiles stream off the runtime
+worker into a fixed 64-layer atlas; network loss leaves the native material
+fallback visible and never blocks simulation ticks or rendering.
 
 The panel is intentionally read-only sandbox/observer UI. It does not issue
 unit orders or expose Commander Mode controls. Playback starts running at 1x,

@@ -35,6 +35,7 @@ use winit::{
 };
 
 mod headless;
+mod imagery;
 mod map_label;
 mod map_material;
 mod observer;
@@ -46,12 +47,13 @@ mod runtime_worker;
 mod unit_renderer;
 mod world_overlay;
 
+use imagery::{ImageryAtlas, ImageryViewport, ImageryWorker};
 use map_label::{MapLabelRenderer, MapLabelView};
 use map_material::MapMaterial;
 use observer::ObserverHudModel;
 use observer_hud::{
     HudHit, ObserverHudRenderer, ObserverHudUpload, PlaybackAction, PlaybackPresentation,
-    hud_hit_test, hud_layout,
+    hud_hit_test, hud_layout, hud_text_runs,
 };
 use options::{AppOptions, help_text, parse_app_options};
 use projection::{
@@ -98,6 +100,7 @@ struct GpuState {
     view_buffer: wgpu::Buffer,
     ownership_texture: wgpu::Texture,
     dominant_texture: wgpu::Texture,
+    imagery_atlas: ImageryAtlas,
     unit_renderer: UnitRenderer,
     world_overlay: WorldOverlayRenderer,
     map_labels: MapLabelRenderer,
@@ -116,6 +119,28 @@ fn texture_binding(
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },
+        count: None,
+    }
+}
+
+fn texture_array_binding(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn sampler_binding(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         count: None,
     }
 }
@@ -183,6 +208,7 @@ struct App {
     smoke_frames: Option<u64>,
     smoke_started_at: Option<Instant>,
     runtime_worker: Option<RuntimeWorker>,
+    imagery_worker: Option<ImageryWorker>,
     runtime_center: Option<[f32; 2]>,
     runtime_zoom: Option<f32>,
     runtime_initial_tick: Option<u64>,
@@ -251,6 +277,7 @@ impl App {
             smoke_frames: options.smoke_frames,
             smoke_started_at: options.smoke_frames.map(|_| Instant::now()),
             runtime_worker: None,
+            imagery_worker: None,
             runtime_center: None,
             runtime_zoom: None,
             runtime_initial_tick: None,
@@ -714,6 +741,7 @@ impl App {
                 contents: bytemuck::cast_slice(&self.occupation_palette),
                 usage: wgpu::BufferUsages::STORAGE,
             });
+        let imagery_atlas = ImageryAtlas::new(&device);
         let shader = device.create_shader_module(wgpu::include_wgsl!("map.wgsl"));
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("map bindings"),
@@ -764,6 +792,9 @@ impl App {
                 storage_binding(7),
                 storage_binding(8),
                 storage_binding(9),
+                texture_array_binding(10),
+                sampler_binding(11),
+                storage_binding(12),
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -809,6 +840,18 @@ impl App {
                 wgpu::BindGroupEntry {
                     binding: 9,
                     resource: occupation_palette_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(imagery_atlas.texture_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::Sampler(imagery_atlas.sampler()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: imagery_atlas.slots_buffer().as_entire_binding(),
                 },
             ],
         });
@@ -886,6 +929,12 @@ impl App {
         self.map_labels_sides_dirty = false;
         let mut observer_hud = ObserverHudRenderer::new(&device, format);
         let observer_model = self.observer_hud_model();
+        let playback = self.playback_presentation();
+        let game_date = self
+            .latest_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.game_calendar_snapshot.as_ref())
+            .map(|calendar| calendar.date);
         observer_hud.upload(
             &device,
             &queue,
@@ -893,15 +942,18 @@ impl App {
             ObserverHudUpload {
                 lines: &observer_model.lines,
                 accent: self.observer_hud_accent(),
-                playback: self.playback_presentation(),
-                game_date: self
-                    .latest_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.game_calendar_snapshot.as_ref())
-                    .map(|calendar| calendar.date),
+                playback,
                 show_observer: self.observer_hud_visible,
             },
         );
+        let hud_runs = hud_text_runs(
+            size,
+            &observer_model.lines,
+            playback,
+            game_date,
+            self.observer_hud_visible,
+        );
+        map_labels.upload_hud_text(&device, &queue, map_label_view, &hud_runs);
         self.observer_hud_dirty = false;
         log::info!(
             "world overlays initialized with {} units, {} national flags, {} unit adornments, {} markers, {} route segments, {} cities, {} side labels, and {} country labels",
@@ -925,11 +977,13 @@ impl App {
             view_buffer,
             ownership_texture,
             dominant_texture,
+            imagery_atlas,
             unit_renderer,
             world_overlay,
             map_labels,
             observer_hud,
         });
+        self.imagery_worker = Some(ImageryWorker::start(2));
         // Geographic material is now immutable GPU state; retaining a second
         // CPU copy would only increase the viewer's baseline memory use.
         self.map_material = None;
@@ -1515,8 +1569,42 @@ impl App {
             .is_some_and(|started| started.elapsed() >= SMOKE_TIMEOUT)
     }
 
+    fn update_imagery(&mut self) {
+        if !self.window_focused && self.smoke_frames.is_none() {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let size = window.inner_size();
+        let Some(worker) = self.imagery_worker.as_mut() else {
+            return;
+        };
+        worker.submit_view(ImageryViewport {
+            width: size.width,
+            height: size.height,
+            center_world: [f64::from(self.center[0]), f64::from(self.center[1])],
+            pixels_per_world: f64::from(self.zoom),
+        });
+        let tiles = worker.poll();
+        if tiles.is_empty() {
+            return;
+        }
+        if let Some(gpu) = self.gpu.as_mut() {
+            let uploaded = gpu.imagery_atlas.upload(&gpu.queue, tiles);
+            if uploaded > 0 {
+                log::debug!(
+                    "uploaded {uploaded} browser imagery tiles ({} resident)",
+                    gpu.imagery_atlas.resident_count()
+                );
+                self.paint_pending = true;
+            }
+        }
+    }
+
     fn render(&mut self) -> Result<()> {
         self.drain_runtime_worker()?;
+        self.update_imagery();
         if !self.window_focused && self.smoke_frames.is_none() {
             return Ok(());
         }
@@ -1624,10 +1712,18 @@ impl App {
                     lines: &model.lines,
                     accent,
                     playback,
-                    game_date,
                     show_observer: observer_hud_visible,
                 },
             );
+            let hud_runs = hud_text_runs(
+                size,
+                &model.lines,
+                playback,
+                game_date,
+                observer_hud_visible,
+            );
+            gpu.map_labels
+                .upload_hud_text(&gpu.device, &gpu.queue, map_label_view, &hud_runs);
             self.observer_hud_dirty = false;
         }
         let rendered_unit_count = gpu.unit_renderer.instance_count();
@@ -1694,6 +1790,7 @@ impl App {
             gpu.map_labels.draw_country_labels(&mut pass);
             gpu.world_overlay.draw_operations(&mut pass);
             gpu.observer_hud.draw(&mut pass);
+            gpu.map_labels.draw_hud_text(&mut pass);
         }
         gpu.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
@@ -2028,6 +2125,9 @@ impl ApplicationHandler for App {
             let message = format!("checkpoint save failed during shutdown: {error:#}");
             log::error!("{message}");
             self.fatal_error = Some(message);
+        }
+        if let Some(mut worker) = self.imagery_worker.take() {
+            worker.shutdown();
         }
         self.stop_runtime_worker();
     }

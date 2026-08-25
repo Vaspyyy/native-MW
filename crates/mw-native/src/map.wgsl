@@ -18,6 +18,17 @@ struct View {
 @group(0) @binding(7) var<storage, read> sovereign_sides: array<i32>;
 @group(0) @binding(8) var<storage, read> country_y_bounds: array<vec2<u32>>;
 @group(0) @binding(9) var<storage, read> occupation_palette: array<vec4<f32>>;
+@group(0) @binding(10) var imagery_tiles: texture_2d_array<f32>;
+@group(0) @binding(11) var imagery_sampler: sampler;
+
+struct ImageryTileSlot {
+    z: u32,
+    x: u32,
+    y: u32,
+    layer: u32,
+};
+
+@group(0) @binding(12) var<storage, read> imagery_slots: array<ImageryTileSlot>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -170,6 +181,34 @@ fn output_color(color: vec3<f32>) -> vec3<f32> {
     return color;
 }
 
+fn imagery_color(world: vec2<f32>) -> vec4<f32> {
+    let normalized = world * 0.5;
+    var chosen = vec4<f32>(0.0);
+    var chosen_zoom = -1;
+    for (var index = 0u; index < 64u; index += 1u) {
+        let slot = imagery_slots[index];
+        if (slot.z == 0xffffffffu || slot.z > 19u || i32(slot.z) < chosen_zoom) {
+            continue;
+        }
+        let tiles_per_axis = f32(1u << slot.z);
+        let tile_position = normalized * tiles_per_axis;
+        let tile = vec2<u32>(floor(tile_position));
+        if (tile.x != slot.x || tile.y != slot.y) {
+            continue;
+        }
+        let uv = fract(tile_position);
+        chosen = textureSampleLevel(
+            imagery_tiles,
+            imagery_sampler,
+            uv,
+            i32(slot.layer),
+            0.0,
+        );
+        chosen_zoom = i32(slot.z);
+    }
+    return chosen;
+}
+
 fn hostile_side_edge(side: i32, other: i32) -> bool {
     return side >= 0 && other >= 0 && side != other;
 }
@@ -248,6 +287,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         unwrapped_world.x - floor(unwrapped_world.x * 0.5) * 2.0,
         unwrapped_world.y,
     );
+    let imagery = imagery_color(world);
 
     // Scenario rows remain linear latitude south-to-north. Invert Web Mercator
     // only at the renderer boundary so simulation/checkpoint coordinates stay
@@ -262,7 +302,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let effective_owner = owner_at(cell);
     let land = land_at(cell);
     if (land == 0u) {
-        return vec4<f32>(output_color(ocean), 1.0);
+        let base = select(ocean, imagery.rgb, imagery.a > 0.0);
+        return vec4<f32>(output_color(base), 1.0);
     }
     let dominant_side = side_at(cell);
     let sovereign_side = country_side_at(sovereign);
@@ -271,7 +312,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let friendly_war_land = war_material_active && dominant_side >= 0 && dominant_side == sovereign_side;
     var display_owner = sovereign;
     var color = vec3<f32>(20.0 / 255.0, 38.0 / 255.0, 20.0 / 255.0);
-    var alpha = 1.0;
+    var alpha = select(1.0, 0.65, imagery.a > 0.0);
     if (sovereign != 0u) {
         if (occupied && effective_owner != 0u) {
             display_owner = effective_owner;
@@ -291,9 +332,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         color = desert_transform(color);
     }
     color = country_gradient(color, display_owner, world.y);
-    // The swapchain is opaque. Match browser alpha fills by compositing them
-    // against the simplified ocean rather than dropping alpha at the output.
-    var map_color = mix(ocean, color, alpha);
+    // Match the browser's Leaflet stack: ArcGIS imagery is the base layer and
+    // political ownership is a translucent canvas overlay. Missing/offline
+    // tiles retain the deterministic WarGames ocean fallback.
+    let base = select(ocean, imagery.rgb, imagery.a > 0.0);
+    var map_color = mix(base, color, alpha);
+    if (sovereign == 0u && imagery.a > 0.0) {
+        map_color = imagery.rgb;
+    }
 
     let cell_pixels = max(
         vec2<f32>(

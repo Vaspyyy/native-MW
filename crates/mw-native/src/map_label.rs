@@ -248,6 +248,32 @@ pub struct MapLabelView {
     pub pixels_per_world: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScreenTextFace {
+    Serif,
+    Sans,
+    Mono,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScreenTextAlign {
+    LeftBaseline,
+    Center,
+    RightBaseline,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenTextRun {
+    pub text: String,
+    pub screen: [f32; 2],
+    pub font_size: f32,
+    pub color: [f32; 4],
+    pub face: ScreenTextFace,
+    pub align: ScreenTextAlign,
+    pub halo_radius: f32,
+    pub halo_alpha: f32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MapLabelLayout {
     pub city_markers: usize,
@@ -308,6 +334,7 @@ pub struct MapLabelRenderer {
     sides: VertexStore,
     countries: VertexStore,
     unit_adornments: VertexStore,
+    hud_text: VertexStore,
     layout: MapLabelLayout,
 }
 
@@ -442,6 +469,7 @@ impl MapLabelRenderer {
             sides: VertexStore::new(device, "side label vertices"),
             countries: VertexStore::new(device, "country label vertices"),
             unit_adornments: VertexStore::new(device, "unit adornment vertices"),
+            hud_text: VertexStore::new(device, "HUD text vertices"),
             layout: MapLabelLayout::default(),
         }
     }
@@ -521,6 +549,78 @@ impl MapLabelRenderer {
         self.layout.clone()
     }
 
+    pub fn upload_hud_text(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: MapLabelView,
+        runs: &[ScreenTextRun],
+    ) {
+        self.hud_text.vertices.clear();
+        let world = view.center;
+        let screen_origin = [view.viewport[0] * 0.5, view.viewport[1] * 0.5];
+        for run in runs {
+            if run.text.is_empty() || run.font_size <= 0.0 {
+                continue;
+            }
+            let face = match run.face {
+                ScreenTextFace::Serif => FontFace::Serif,
+                ScreenTextFace::Sans => FontFace::Sans,
+                ScreenTextFace::Mono => FontFace::Mono,
+            };
+            let origin = [
+                run.screen[0] - screen_origin[0],
+                run.screen[1] - screen_origin[1],
+            ];
+            let effect = TextEffect {
+                radius: run.halo_radius,
+                alpha: run.halo_alpha,
+                softness: 0.35,
+            };
+            match run.align {
+                ScreenTextAlign::LeftBaseline => push_left_baseline_text(
+                    &mut self.hud_text.vertices,
+                    &mut self.atlas,
+                    face,
+                    &run.text,
+                    world,
+                    origin,
+                    run.font_size,
+                    run.color,
+                    effect,
+                ),
+                ScreenTextAlign::Center => push_centered_text(
+                    &mut self.hud_text.vertices,
+                    &mut self.atlas,
+                    face,
+                    &run.text,
+                    world,
+                    origin,
+                    run.font_size,
+                    run.color,
+                    effect,
+                    0.0,
+                ),
+                ScreenTextAlign::RightBaseline => {
+                    let width = measure_text(&mut self.atlas, face, &run.text, run.font_size);
+                    push_left_baseline_text(
+                        &mut self.hud_text.vertices,
+                        &mut self.atlas,
+                        face,
+                        &run.text,
+                        world,
+                        [origin[0] - width, origin[1]],
+                        run.font_size,
+                        run.color,
+                        effect,
+                    );
+                }
+            }
+        }
+        self.hud_text.upload(device, queue);
+        self.upload_atlas(queue);
+    }
+
     pub fn draw_cities<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         self.draw_store(pass, &self.cities);
     }
@@ -532,6 +632,9 @@ impl MapLabelRenderer {
     }
     pub fn draw_unit_adornments<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         self.draw_store(pass, &self.unit_adornments);
+    }
+    pub fn draw_hud_text<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        self.draw_store(pass, &self.hud_text);
     }
     pub fn layout(&self) -> &MapLabelLayout {
         &self.layout
