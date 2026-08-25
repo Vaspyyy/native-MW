@@ -27,6 +27,7 @@ use crate::{
         BattlefieldTickInput, BattlefieldUnitInput, BattlefieldUnitResult, BattlefieldUnitState,
         apply_cohesion_and_repulsion, resolve_battlefield_tick, resolve_local_tactics,
     },
+    calendar::GameCalendarState,
     combat::{
         CombatUnit, PERSONNEL_PER_FORMATION, UNIT_HEALTH, UnitKind, formation_strength,
         wrapped_longitude_delta,
@@ -392,6 +393,9 @@ pub struct RuntimeSnapshot {
     pub schema_version: &'static str,
     pub tick: u64,
     pub frame: u64,
+    /// Browser sandbox calendar at this exact immutable presentation boundary.
+    /// Absence matches an unchecked Time System option in the browser setup.
+    pub game_calendar_snapshot: Option<GameCalendarState>,
     pub state: RuntimeState,
     pub frame_snapshot: Arc<FrameSnapshot>,
     pub territory_snapshot: Arc<TerritorySnapshot>,
@@ -431,6 +435,8 @@ pub enum RuntimeError {
     InvalidUnitPolicy(u64),
     #[error("runtime tick or frame counter overflowed")]
     ClockOverflow,
+    #[error("runtime game calendar is invalid")]
+    InvalidGameCalendar,
     #[error("runtime is waiting for strategic effects from cycle {cycle} at tick {tick}")]
     AwaitingStrategicEffects { cycle: u64, tick: u64 },
     #[error("runtime conflict was resolved in cycle {cycle} at tick {tick}")]
@@ -1609,6 +1615,9 @@ fn unit_deploying(policy: &RuntimeUnitPolicy, tick: u64) -> bool {
 pub struct RuntimeCheckpoint {
     pub tick: u64,
     pub frame: u64,
+    /// Optional browser sandbox calendar. Presentation time advances this only
+    /// after a successful, still-running browser frame.
+    pub game_calendar: Option<GameCalendarState>,
     /// Operational execution timestamps are browser-frame coordinates when
     /// true and legacy logical-tick coordinates when false.
     pub operational_timers_use_frame: bool,
@@ -1657,6 +1666,7 @@ pub struct RuntimeCheckpoint {
 pub struct NativeRuntimeCheckpointState {
     pub tick: u64,
     pub frame: u64,
+    pub game_calendar: Option<GameCalendarState>,
     pub operational_timers_use_frame: bool,
     pub war_grace_end: u64,
     pub runtime_config: RuntimeConfig,
@@ -1695,6 +1705,7 @@ pub struct NativeRuntime {
     config: RuntimeConfig,
     tick: u64,
     frame: u64,
+    game_calendar: Option<GameCalendarState>,
     operational_timers_use_frame: bool,
     war_grace_end: u64,
     simulation: Simulation,
@@ -2904,6 +2915,11 @@ impl NativeRuntime {
         mut checkpoint: RuntimeCheckpoint,
     ) -> Result<Self, RuntimeError> {
         validate_runtime_config(config)?;
+        if let Some(calendar) = &checkpoint.game_calendar {
+            calendar
+                .validate()
+                .map_err(|_| RuntimeError::InvalidGameCalendar)?;
+        }
         validate_diplomacy(&checkpoint.diplomacy, &checkpoint.territory)?;
         validate_scenario_grid(&checkpoint.scenario, &checkpoint.territory)?;
         if let Some(missiles) = &checkpoint.strategic_missiles {
@@ -3324,6 +3340,7 @@ impl NativeRuntime {
             schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
             tick: checkpoint.tick,
             frame: checkpoint.frame,
+            game_calendar_snapshot: checkpoint.game_calendar.clone(),
             state: initial_state,
             frame_snapshot,
             territory_snapshot,
@@ -3371,6 +3388,7 @@ impl NativeRuntime {
             config,
             tick: checkpoint.tick,
             frame: checkpoint.frame,
+            game_calendar: checkpoint.game_calendar,
             operational_timers_use_frame: checkpoint.operational_timers_use_frame,
             war_grace_end: checkpoint.war_grace_end,
             simulation: checkpoint.simulation,
@@ -3431,6 +3449,10 @@ impl NativeRuntime {
 
     pub const fn frame(&self) -> u64 {
         self.frame
+    }
+
+    pub fn game_calendar(&self) -> Option<&GameCalendarState> {
+        self.game_calendar.as_ref()
     }
 
     pub const fn operational_timers_use_frame(&self) -> bool {
@@ -3500,6 +3522,7 @@ impl NativeRuntime {
         Ok(NativeRuntimeCheckpointState {
             tick: self.tick,
             frame: self.frame,
+            game_calendar: self.game_calendar.clone(),
             operational_timers_use_frame: self.operational_timers_use_frame,
             war_grace_end: self.war_grace_end,
             runtime_config: self.config,
@@ -4077,7 +4100,7 @@ impl NativeRuntime {
     /// contract while correcting the browser clock boundary: the tick observes
     /// the current frame, then the published frame advances once.
     pub fn step(&mut self) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
-        self.advance_frame(1, true)
+        self.advance_frame(1, true, None)
     }
 
     /// Advance one browser presentation frame with zero or more logical
@@ -4093,7 +4116,20 @@ impl NativeRuntime {
         &mut self,
         logical_subticks: u8,
     ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
-        self.advance_frame(logical_subticks, false)
+        self.advance_frame(logical_subticks, false, None)
+    }
+
+    /// Advance a foreground browser frame and then consume its clamped real
+    /// presentation time. Like the browser, logical work observes the old
+    /// date; a successful still-running frame publishes the newly advanced
+    /// date for the HUD and the following frame's simulation.
+    pub fn advance_browser_frame_timed(
+        &mut self,
+        logical_subticks: u8,
+        elapsed_ms: f64,
+        speed: u8,
+    ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
+        self.advance_frame(logical_subticks, false, Some((elapsed_ms, speed)))
     }
 
     /// Advance one hidden-tab background interval. Unlike the foreground RAF,
@@ -4103,13 +4139,25 @@ impl NativeRuntime {
         &mut self,
         logical_subticks: u8,
     ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
-        self.advance_frame(logical_subticks, true)
+        self.advance_frame(logical_subticks, true, None)
+    }
+
+    /// Advance one hidden-tab interval and publish its fixed background-time
+    /// contribution after all admitted logical subticks.
+    pub fn advance_browser_background_frame_timed(
+        &mut self,
+        logical_subticks: u8,
+        elapsed_ms: f64,
+        speed: u8,
+    ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
+        self.advance_frame(logical_subticks, true, Some((elapsed_ms, speed)))
     }
 
     fn advance_frame(
         &mut self,
         logical_subticks: u8,
         publish_terminal_frame: bool,
+        game_time: Option<(f64, u8)>,
     ) -> Result<Arc<RuntimeSnapshot>, RuntimeError> {
         match self.state {
             RuntimeState::Running => {}
@@ -4128,6 +4176,18 @@ impl NativeRuntime {
         self.tick
             .checked_add(u64::from(logical_subticks))
             .ok_or(RuntimeError::ClockOverflow)?;
+
+        // Validate and stage presentation time before any logical subtick can
+        // commit. It is installed only if the war remains active, matching
+        // tickGameTime()'s SIMULATING guard in the browser.
+        let mut staged_calendar = self.game_calendar.clone();
+        if let Some((elapsed_ms, speed)) = game_time
+            && let Some(calendar) = &mut staged_calendar
+        {
+            calendar
+                .advance_elapsed(elapsed_ms, speed)
+                .map_err(|_| RuntimeError::InvalidGameCalendar)?;
+        }
 
         let mut published = self.latest.clone();
         for _ in 0..logical_subticks {
@@ -4156,9 +4216,13 @@ impl NativeRuntime {
         } else {
             published_frame
         };
+        if matches!(self.state, RuntimeState::Running) {
+            self.game_calendar = staged_calendar;
+        }
         self.frame = published_frame;
         let mut boundary = (*published).clone();
         boundary.frame = published_frame;
+        boundary.game_calendar_snapshot = self.game_calendar.clone();
         boundary.counters.render_updates_enqueued = self.render_updates.len() - queued_before;
         boundary.pending_render_updates = self.render_updates.len();
         self.latest = Arc::new(boundary);
@@ -5723,6 +5787,7 @@ impl NativeRuntime {
             schema_version: NATIVE_RUNTIME_SCHEMA_VERSION,
             tick: self.tick,
             frame: self.frame,
+            game_calendar_snapshot: self.game_calendar.clone(),
             state: self.state,
             frame_snapshot: Arc::new(frame_snapshot),
             territory_snapshot,
@@ -6751,6 +6816,7 @@ mod tests {
             RuntimeCheckpoint {
                 tick,
                 frame: tick,
+                game_calendar: None,
                 operational_timers_use_frame: false,
                 war_grace_end: u64::MAX,
                 simulation,
@@ -6799,6 +6865,13 @@ mod tests {
         runtime
     }
 
+    fn calendar_fixture(tick: u64, date: crate::calendar::GameDate) -> NativeRuntime {
+        let mut source = fixture(tick, false);
+        let mut state = source.checkpoint_state().unwrap();
+        state.game_calendar = Some(GameCalendarState::new(date).unwrap());
+        NativeRuntime::new(state.runtime_config, runtime_checkpoint(state)).unwrap()
+    }
+
     #[test]
     fn browser_frame_batches_share_preincrement_frame_and_publish_once() {
         let mut runtime = fixture(0, false);
@@ -6830,6 +6903,73 @@ mod tests {
         assert_eq!(published.frame_snapshot, before.frame_snapshot);
         let checkpoint = runtime.checkpoint_state().unwrap();
         assert_eq!((checkpoint.tick, checkpoint.frame), (7, 8));
+    }
+
+    #[test]
+    fn timed_browser_frame_publishes_calendar_after_logical_work() {
+        let initial_date = crate::calendar::GameDate::new(1939, 8, 31).unwrap();
+        let mut runtime = calendar_fixture(0, initial_date);
+        let before = runtime.latest_snapshot();
+
+        let published = runtime.advance_browser_frame_timed(1, 250.0, 2).unwrap();
+
+        assert_eq!(
+            before.game_calendar_snapshot.as_ref().unwrap().date,
+            initial_date
+        );
+        assert_eq!(
+            published.game_calendar_snapshot.as_ref().unwrap().date,
+            crate::calendar::GameDate::new(1939, 9, 1).unwrap()
+        );
+        assert_eq!(
+            runtime.game_calendar().unwrap(),
+            published.game_calendar_snapshot.as_ref().unwrap()
+        );
+        assert_eq!(
+            runtime.checkpoint_state().unwrap().game_calendar,
+            published.game_calendar_snapshot
+        );
+    }
+
+    #[test]
+    fn paused_and_invalid_timed_frames_do_not_advance_calendar() {
+        let initial_date = crate::calendar::GameDate::new(2024, 2, 28).unwrap();
+        let mut runtime = calendar_fixture(0, initial_date);
+
+        let paused = runtime.advance_browser_frame_timed(0, 0.0, 3).unwrap();
+        assert_eq!(
+            paused.game_calendar_snapshot.as_ref().unwrap().date,
+            initial_date
+        );
+        let boundary_before_error = runtime.latest_snapshot();
+        assert!(matches!(
+            runtime.advance_browser_frame_timed(1, f64::NAN, 1),
+            Err(RuntimeError::InvalidGameCalendar)
+        ));
+        assert!(Arc::ptr_eq(
+            &runtime.latest_snapshot(),
+            &boundary_before_error
+        ));
+    }
+
+    #[test]
+    fn terminal_browser_frame_does_not_consume_calendar_time() {
+        let mut runtime = calendar_fixture(
+            PAY_CYCLE_TICKS - 1,
+            crate::calendar::GameDate::new(1941, 12, 31).unwrap(),
+        );
+        runtime.diplomacy.active_sides = vec![0];
+
+        let terminal = runtime.advance_browser_frame_timed(1, 500.0, 1).unwrap();
+
+        assert!(matches!(
+            terminal.state,
+            RuntimeState::ConflictResolved { .. }
+        ));
+        assert_eq!(
+            terminal.game_calendar_snapshot.as_ref().unwrap().date,
+            crate::calendar::GameDate::new(1941, 12, 31).unwrap()
+        );
     }
 
     #[test]
@@ -6924,6 +7064,7 @@ mod tests {
         RuntimeCheckpoint {
             tick: state.tick,
             frame: state.frame,
+            game_calendar: state.game_calendar,
             operational_timers_use_frame: state.operational_timers_use_frame,
             war_grace_end: state.war_grace_end,
             simulation: Simulation::new(state.simulation_config, state.units).unwrap(),

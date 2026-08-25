@@ -1,6 +1,7 @@
 //! Dependency-free procedural observer HUD rendering.
 
 use bytemuck::{Pod, Zeroable};
+use mw_core::GameDate;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 
 const PANEL_WIDTH: f32 = 440.0;
@@ -14,6 +15,19 @@ const CONTROL_HEIGHT: f32 = 30.0;
 const CONTROL_GAP: f32 = 4.0;
 const CONTROL_RIGHT_MARGIN: f32 = 12.0;
 const CONTROL_WIDTHS: [f32; 4] = [32.0, 30.0, 38.0, 30.0];
+const DATE_SCALE: f32 = 2.0;
+const DATE_TOP_GAP: f32 = 8.0;
+const DATE_SHADOW_OFFSET: f32 = 2.0;
+const DATE_SHADOW_OFFSETS: [[f32; 2]; 8] = [
+    [-DATE_SHADOW_OFFSET, -DATE_SHADOW_OFFSET],
+    [0.0, -DATE_SHADOW_OFFSET],
+    [DATE_SHADOW_OFFSET, -DATE_SHADOW_OFFSET],
+    [-DATE_SHADOW_OFFSET, 0.0],
+    [DATE_SHADOW_OFFSET, 0.0],
+    [-DATE_SHADOW_OFFSET, DATE_SHADOW_OFFSET],
+    [0.0, DATE_SHADOW_OFFSET],
+    [DATE_SHADOW_OFFSET, DATE_SHADOW_OFFSET],
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaybackAction {
@@ -43,6 +57,7 @@ pub struct ObserverHudUpload<'a> {
     pub lines: &'a [String],
     pub accent: [f32; 4],
     pub playback: Option<PlaybackPresentation>,
+    pub game_date: Option<GameDate>,
     pub show_observer: bool,
 }
 
@@ -343,6 +358,7 @@ impl ObserverHudRenderer {
             content.lines,
             content.accent,
             content.playback,
+            content.game_date,
             content.show_observer,
         );
         if self.vertices.len() > self.vertex_capacity {
@@ -386,6 +402,7 @@ fn build_vertices(
     lines: &[String],
     accent: [f32; 4],
     playback: Option<PlaybackPresentation>,
+    game_date: Option<GameDate>,
     show_observer: bool,
 ) -> Vec<HudVertex> {
     let layout = hud_layout(viewport, lines.len(), playback.is_some(), show_observer);
@@ -407,6 +424,9 @@ fn build_vertices(
     push_outline(&mut vertices, layout.top_bar, [1.0, 1.0, 1.0, 0.10]);
     if let Some(playback) = playback {
         push_playback_controls(&mut vertices, layout, playback);
+    }
+    if let Some(game_date) = game_date {
+        push_game_date(&mut vertices, viewport, layout, game_date);
     }
     if !show_observer {
         return vertices;
@@ -621,6 +641,29 @@ fn push_playback_controls(
     }
 }
 
+fn push_game_date(
+    vertices: &mut Vec<HudVertex>,
+    viewport: PhysicalSize<u32>,
+    layout: HudLayout,
+    date: GameDate,
+) {
+    let label = date.to_string();
+    let width = label.chars().count() as f32 * 6.0 * DATE_SCALE;
+    let x = ((viewport.width as f32 - width) * 0.5).max(0.0);
+    let y = layout.top_bar.bottom() + DATE_TOP_GAP;
+    for [offset_x, offset_y] in DATE_SHADOW_OFFSETS {
+        push_text(
+            vertices,
+            &label,
+            x + offset_x,
+            y + offset_y,
+            DATE_SCALE,
+            [0.0, 0.0, 0.0, 0.78],
+        );
+    }
+    push_text(vertices, &label, x, y, DATE_SCALE, [1.0, 1.0, 1.0, 0.96]);
+}
+
 fn push_outline(vertices: &mut Vec<HudVertex>, bounds: PanelBounds, color: [f32; 4]) {
     push_rect(vertices, bounds.x, bounds.y, bounds.width, 1.0, color);
     push_rect(
@@ -830,10 +873,13 @@ mod tests {
             &[],
             [0.2, 0.7, 1.0, 1.0],
             None,
+            None,
             true,
         );
         assert_eq!(vertices.len(), 48);
-        assert!(build_vertices(PhysicalSize::new(0, 0), &[], [1.0; 4], None, true).is_empty());
+        assert!(
+            build_vertices(PhysicalSize::new(0, 0), &[], [1.0; 4], None, None, true).is_empty()
+        );
     }
 
     #[test]
@@ -841,11 +887,27 @@ mod tests {
         let lines = vec!["I".to_owned(); 33];
         let expected_vertices = 48 + 33 * 11 * 6;
         assert_eq!(
-            build_vertices(PhysicalSize::new(1920, 1080), &lines, [1.0; 4], None, true).len(),
+            build_vertices(
+                PhysicalSize::new(1920, 1080),
+                &lines,
+                [1.0; 4],
+                None,
+                None,
+                true
+            )
+            .len(),
             expected_vertices
         );
         assert_eq!(
-            build_vertices(PhysicalSize::new(800, 600), &lines, [1.0; 4], None, true).len(),
+            build_vertices(
+                PhysicalSize::new(800, 600),
+                &lines,
+                [1.0; 4],
+                None,
+                None,
+                true
+            )
+            .len(),
             expected_vertices
         );
     }
@@ -951,6 +1013,7 @@ mod tests {
             &["HIDDEN".to_owned()],
             [1.0; 4],
             Some(playback(false, 1)),
+            None,
             false,
         );
         assert!(!hidden.is_empty());
@@ -959,6 +1022,55 @@ mod tests {
         assert_eq!(
             hud_hit_test(PhysicalPosition::new(780.0, 20.0), inactive),
             HudHit::Panel
+        );
+    }
+
+    #[test]
+    fn game_date_is_centered_below_top_bar_with_shadow_and_white_glyphs() {
+        let viewport = PhysicalSize::new(800, 600);
+        let layout = hud_layout(viewport, 1, true, false);
+        let date = GameDate::new(2024, 2, 29).unwrap();
+        let mut vertices = Vec::new();
+        push_game_date(&mut vertices, viewport, layout, date);
+
+        let expected_x = (800.0 - 10.0 * 6.0 * DATE_SCALE) * 0.5;
+        let expected_y = layout.top_bar.bottom() + DATE_TOP_GAP;
+        let shadow = [0.0, 0.0, 0.0, 0.78];
+        let foreground = [1.0, 1.0, 1.0, 0.96];
+        assert!(vertices.iter().any(|vertex| {
+            vertex.color == shadow
+                && vertex.screen
+                    == [
+                        expected_x + DATE_SCALE - DATE_SHADOW_OFFSET,
+                        expected_y - DATE_SHADOW_OFFSET,
+                    ]
+        }));
+        assert!(vertices.iter().any(|vertex| {
+            vertex.color == foreground && vertex.screen == [expected_x + DATE_SCALE, expected_y]
+        }));
+        assert!(
+            vertices
+                .iter()
+                .all(|vertex| vertex.screen[1] > layout.top_bar.bottom())
+        );
+    }
+
+    #[test]
+    fn game_date_remains_visible_when_observer_panel_is_hidden() {
+        let viewport = PhysicalSize::new(800, 600);
+        let date = Some(GameDate::new(2025, 12, 31).unwrap());
+        let with_date = build_vertices(viewport, &[], [1.0; 4], None, date, false);
+        let without_date = build_vertices(viewport, &[], [1.0; 4], None, None, false);
+
+        assert!(with_date.len() > without_date.len());
+        assert!(
+            with_date
+                .iter()
+                .any(|vertex| vertex.color == [1.0, 1.0, 1.0, 0.96])
+        );
+        assert_eq!(
+            hud_layout(viewport, 0, true, false).observer_panel,
+            PanelBounds::default()
         );
     }
 }

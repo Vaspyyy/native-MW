@@ -401,7 +401,7 @@ node scripts/generate-native-runtime-stress.mjs 2400 3 > "$runtime_fixture"
 target/release/mw-tools native-runtime-bench "$scenario" "$runtime_fixture" --ticks 3 --repeat 9 --warmup 3 --json
 ```
 
-Run an exact browser-exported v1 `postStartWar` or native v2-v13 `midWar`
+Run an exact browser-exported v1 `postStartWar` or native v2-v14 `midWar`
 checkpoint in the production viewer, or validate steps without a window:
 
 ```bash
@@ -414,8 +414,8 @@ Native-only starts use repeated `--side` selectors (ID or unique
 case-insensitive name), deterministic all-Army bootstrap, and exact-step saves:
 
 ```bash
-target/release/mw-native --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v12.json "$scenario"
-target/release/mw-native --runtime-checkpoint /tmp/mw-v12.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v12-resumed.json "$scenario"
+target/release/mw-native --side Germany,France --side Poland,Belgium --start-date 1939-09-01 --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v14.json "$scenario"
+target/release/mw-native --runtime-checkpoint /tmp/mw-v14.json --headless --ticks 20 --tick-ms 1 --save-checkpoint /tmp/mw-v14-resumed.json "$scenario"
 ```
 
 V1 `postStartWar` is accepted only at tick/frame/strategic-cycle zero with
@@ -449,7 +449,8 @@ wings, including ordered per-country air-operations funding coverage. V7 retains
 v6 and adds the exact per-side naval reassessment
 clocks plus next native operation sequence. Coastal topology and reusable BFS
 scratch are derived from immutable land and remain outside the serialized
-contract. Windowed native wars save v13 and exact-step headless wars save v12.
+contract. Windowed native wars save v14; exact-step headless wars save v12
+unless `--start-date` enables calendar-bearing v14 state.
 V8 adds required nullable per-unit supply
 collapse markers for exact operational-feedback continuation; v9 adds the
 Mulberry32 gameplay cursor and complete side-level recruitable reserves; v10
@@ -458,7 +459,7 @@ choose the newest schema their owned continuation
 state supports. Checkpoint encoding/decoding and restore remain outside the timed
 benchmark region.
 
-Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v13
+Both `mw-native` production modes accept resumable v1 `postStartWar` and v2-v14
 `midWar` while rejecting `baselineReplay`. Native-written mid-war saves carry
 the current objectives, AI assignment priors, frontline layout priors, and
 last refresh tick, which makes split and uninterrupted native runs exactly
@@ -496,13 +497,26 @@ and background 3x drains all three on a 100 ms cadence. Admitted subticks share
 the pre-increment frame and publish one coalesced immutable boundary. V13 saves
 the scheduler exactly; v1-v12 loads synthesize the default clock and preserve
 elapsed naval/defender execution ages when entering browser playback.
+V14 retains that complete v13 scheduler state and adds required nullable
+`gameTime`. With `--start-date YYYY-MM-DD`, a strict Gregorian calendar consumes
+500 ms per game day after scaling elapsed presentation time by 1x/2x/3x. A
+pre-1942 start disables silo technology and seeds no bases. Exact-step headless
+ticks have no elapsed presentation duration, so dated split saves retain the
+same date and residual accumulator.
+
+Painting is independently admitted at a one/two/four-frame visual cadence for
+1x/2x/3x. Simulation work above 12 ms defers both atomic-commit and generic
+frames, with separate reasons; `max(2, cadence + 1)` starvation and debounced
+zoom settling force an eventual paint. Pending FIFO territory deltas and the
+matching coalesced immutable snapshot become visible in one presentation
+commit, so paint deferral cannot splice snapshot and territory generations.
 
 Browser v2-v6 handoffs carry the exact Float32 terrain plane. Standalone stock
 MWSC files lack `mountainData`, so native bootstrap explicitly disables
 mountains and uses flat terrain. The full-cap timings above use the frozen
 stress fixture and therefore do not measure the live resolver or the new
 influence/side-dynamics schedulers; they are not a claim of complete
-browser-tick parity. A v2-v13 restore rebuilds private territory summaries;
+browser-tick parity. A v2-v14 restore rebuilds private territory summaries;
 partial census work and
 render queues are not serialized. V3 separately preserves pending frontier
 work. Map-only viewing and the small scenario-derived `--demo-units` runtime
@@ -659,7 +673,21 @@ remain loadable without missile state, and exact-step headless new wars save v12
 V13 retains complete v12 continuation and adds a strict `runtimeClock` block:
 top-level tick/frame agreement, 1x/2x/3x speed, residual accumulator,
 foreground/background mode, and pause state. Operational execution timestamps
-remain in browser-frame coordinates. Windowed native wars save v13; headless
-`--ticks` remains the legacy exact-logical-step path and saves v12. This
-orchestration slice has no separate performance claim; the kernel timings above
-remain the relevant cost measurements.
+remain in browser-frame coordinates. V13 remains loadable, while current
+windowed writers supersede it with v14 as described below. Headless `--ticks`
+without calendar state remains the legacy exact-logical-step path and saves
+v12. This orchestration slice has no separate performance claim; the kernel
+timings above remain the relevant cost measurements.
+
+### Native checkpoint v14 calendar and paint-admission contract
+
+V14 retains the complete v13 scheduler contract and requires `gameTime`, using
+`null` when disabled or strict `native-game-calendar-v1` Gregorian state when
+enabled with `--start-date YYYY-MM-DD`. Calendar days consume 500 ms of elapsed
+presentation time scaled by 1x/2x/3x; exact-step headless execution leaves the
+date unchanged. Starts before 1942 resolve missile technology false and seed no
+silos. Windowed native wars now save v14, and dated exact-step headless runs do
+the same. This slice also ports one/two/four-frame paint cadence, the 12 ms
+simulation budget, commit/generic deferral, bounded starvation and zoom force,
+plus atomic pending snapshot/territory presentation. No separate benchmark is
+claimed; existing kernel timings remain the relevant measurements.

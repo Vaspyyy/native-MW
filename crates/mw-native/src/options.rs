@@ -1,6 +1,7 @@
 use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use mw_core::GameDate;
 
 pub const DEFAULT_SCENARIO: &str = "../modern-wars/assets/maps/compiled/world-map-2022-v2.mwsc.gz";
 pub const DEFAULT_RUNTIME_TICK_MS: u64 = 33;
@@ -11,6 +12,7 @@ pub struct AppOptions {
     pub scenario_path: PathBuf,
     pub runtime_checkpoint_path: Option<PathBuf>,
     pub native_war_sides: Vec<Vec<String>>,
+    pub start_date: Option<GameDate>,
     pub save_checkpoint_path: Option<PathBuf>,
     pub demo_units: bool,
     pub smoke_frames: Option<u64>,
@@ -26,6 +28,7 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
     let mut scenario_path = None;
     let mut runtime_checkpoint_path = None;
     let mut native_war_sides = Vec::new();
+    let mut start_date = None;
     let mut save_checkpoint_path = None;
     let mut demo_units = false;
     let mut smoke_frames = None;
@@ -58,6 +61,14 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
                     bail!("--side contains an empty country selector");
                 }
                 native_war_sides.push(selectors);
+            }
+            "--start-date" => {
+                if start_date.is_some() {
+                    bail!("--start-date was supplied more than once");
+                }
+                start_date = Some(parse_start_date(
+                    arguments.next().context("--start-date needs YYYY-MM-DD")?,
+                )?);
             }
             "--runtime-checkpoint" | "--checkpoint" => {
                 if runtime_checkpoint_path.is_some() {
@@ -123,6 +134,9 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
     if demo_units && runtime_checkpoint_path.is_some() {
         bail!("--demo-units and --runtime-checkpoint are mutually exclusive");
     }
+    if start_date.is_some() && !(native_war_requested || demo_units) {
+        bail!("--start-date requires --demo-units or at least two --side arguments");
+    }
     let runtime_mode = native_war_requested || demo_units || runtime_checkpoint_path.is_some();
     if runtime_tuning_requested && !runtime_mode {
         bail!("--tick-ms and --update-queue require a native runtime mode");
@@ -147,6 +161,7 @@ pub fn parse_app_options(arguments: impl IntoIterator<Item = OsString>) -> Resul
         scenario_path: scenario_path.unwrap_or_else(|| PathBuf::from(DEFAULT_SCENARIO)),
         runtime_checkpoint_path,
         native_war_sides,
+        start_date,
         save_checkpoint_path,
         demo_units,
         smoke_frames,
@@ -164,6 +179,7 @@ pub fn help_text() -> &'static str {
      Options:\n\
        --runtime-checkpoint PATH  Load a strict browser postStartWar or midWar checkpoint\n\
        --side COUNTRY[,COUNTRY...]  Add a side; at least two sides start a new war\n\
+       --start-date YYYY-MM-DD   Enable the browser calendar for a new native war\n\
        --demo-units               Run the small scenario-derived demo runtime\n\
        --save-checkpoint PATH     Save resumable runtime state on exit/S; unavailable with --demo-units\n\
        --tick-ms N                Runtime tick interval in milliseconds (default 33)\n\
@@ -173,6 +189,30 @@ pub fn help_text() -> &'static str {
        --json                     Emit the headless result as JSON\n\
        --smoke                    Present three frames (and one runtime tick) then exit\n\
        -h, --help                 Show this help"
+}
+
+fn parse_start_date(value: OsString) -> Result<GameDate> {
+    let value = value.to_str().context("--start-date must be valid UTF-8")?;
+    let mut parts = value.split('-');
+    let year = parts
+        .next()
+        .context("--start-date needs YYYY-MM-DD")?
+        .parse::<u32>()
+        .context("invalid --start-date year")?;
+    let month = parts
+        .next()
+        .context("--start-date needs YYYY-MM-DD")?
+        .parse::<u8>()
+        .context("invalid --start-date month")?;
+    let day = parts
+        .next()
+        .context("--start-date needs YYYY-MM-DD")?
+        .parse::<u8>()
+        .context("invalid --start-date day")?;
+    if parts.next().is_some() {
+        bail!("--start-date needs exactly YYYY-MM-DD");
+    }
+    GameDate::new(year, month, day).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 fn parse_positive<T>(value: OsString, flag: &str) -> Result<T>
@@ -207,6 +247,7 @@ mod tests {
         assert_eq!(options.runtime_queue_capacity, 8);
         assert!(options.runtime_checkpoint_path.is_none());
         assert!(options.native_war_sides.is_empty());
+        assert!(options.start_date.is_none());
         assert!(options.save_checkpoint_path.is_none());
         assert!(!options.demo_units);
         assert!(options.headless_ticks.is_none());
@@ -269,6 +310,8 @@ mod tests {
             "Germany,Italy",
             "--side",
             "France",
+            "--start-date",
+            "1939-09-01",
             "--save-checkpoint",
             "save.json",
             "--tick-ms",
@@ -280,6 +323,7 @@ mod tests {
             options.native_war_sides,
             vec![vec!["Germany", "Italy"], vec!["France"]]
         );
+        assert_eq!(options.start_date, Some(GameDate::new(1939, 9, 1).unwrap()));
         assert_eq!(
             options.save_checkpoint_path,
             Some(PathBuf::from("save.json"))
@@ -309,6 +353,11 @@ mod tests {
             .to_string();
         assert!(demo_save_error.contains("unavailable with --demo-units"));
         assert!(help_text().contains("unavailable with --demo-units"));
+        assert!(help_text().contains("--start-date YYYY-MM-DD"));
+        assert!(parse(&["--start-date", "2024-01-01"]).is_err());
+        assert!(parse(&["--demo-units", "--start-date", "1900-02-29"]).is_err());
+        assert!(parse(&["--demo-units", "--start-date", "2000-02-29"]).is_ok());
+        assert!(parse(&["--checkpoint", "x.json", "--start-date", "2024-01-01"]).is_err());
         assert!(
             parse(&[
                 "--checkpoint",

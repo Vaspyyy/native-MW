@@ -21,6 +21,9 @@ node "$native_root/scripts/js-side-dynamics-reference.mjs"
 cargo build --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools -p mw-native
 cargo build --quiet --release --manifest-path "$native_root/Cargo.toml" -p mw-native
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-core committed_state_restore
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-core calendar
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-native render_admission
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-native observer
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v2
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v7
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v8
@@ -29,6 +32,7 @@ cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpo
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v11
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v12
 cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v13
+cargo test --quiet --manifest-path "$native_root/Cargo.toml" -p mw-tools checkpoint_v14
 
 scenarios=(
 	"world-map-2022-v2.mwsc.gz"
@@ -160,6 +164,26 @@ jq -e '
 	and .gameplayRng.state != 1297567793
 ' "$save_tmp/historical.json" >/dev/null
 printf 'native WW1 browser name gate disables launches but preserves silo RNG seeding\n'
+"$native_bin" --side Germany,France --side Poland,Belgium --start-date 1941-12-31 \
+	--headless --ticks 2 --tick-ms 1 --save-checkpoint "$save_tmp/dated-part.json" \
+	"$modern_path" >/dev/null
+"$native_bin" --runtime-checkpoint "$save_tmp/dated-part.json" --headless --ticks 2 \
+	--tick-ms 1 --save-checkpoint "$save_tmp/dated-resumed.json" "$modern_path" >/dev/null
+for checkpoint in "$save_tmp/dated-part.json" "$save_tmp/dated-resumed.json"; do
+	jq -e '
+		.schema == "native-runtime-checkpoint-v14"
+		and .runtimeClock.schema == "native-runtime-clock-v1"
+		and .runtimeClock.simTick == .tick
+		and .runtimeClock.frame == .frame
+		and .gameTime.schema == "native-game-calendar-v1"
+		and .gameTime.date == {year: 1941, month: 12, day: 31}
+		and .gameTime.accumulatorMs == 0
+		and .gameTime.dayDurationMs == 500
+		and .strategicMissiles.technologyAllowed == false
+		and (.strategicMissiles.bases | length) == 0
+	' "$checkpoint" >/dev/null
+done
+printf 'native v14 dated headless save/resume gate preserves 1941-12-31 and pre-1942 no-silo state\n'
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/part.json" "$modern_path" >/dev/null
 "$native_bin" --runtime-checkpoint "$save_tmp/part.json" --headless --ticks 20 --tick-ms 1 --save-checkpoint "$save_tmp/resumed.json" "$modern_path" >/dev/null
 "$native_bin" --side Germany,France --side Poland,Belgium --headless --ticks 40 --tick-ms 1 --save-checkpoint "$save_tmp/full.json" "$modern_path" >/dev/null

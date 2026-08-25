@@ -35,7 +35,7 @@ browser runtime's shared mutable `main.js` structure.
 8. Derive production country/city/economy inputs and production front layouts
    from an MWSC scenario, then connect the migrated kernels under one native
    tick owner.
-9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v13 `midWar`
+9. Load exact-geography v1 `postStartWar` and exact-live-state v2-v14 `midWar`
    checkpoints into `mw-native`, run their simulation on a dedicated worker,
    and present immutable runtime publications without blocking rendering on a
    tick.
@@ -115,7 +115,7 @@ Normal `mw-native` startup remains map-only. The opt-in `--demo-units` mode
 finds a real adjacent-country land border in the decoded scenario and
 constructs a small explicit runtime. `--runtime-checkpoint PATH` instead loads
 the shared strict checkpoint adapter and requires either an exact-geography v1
-`postStartWar` handoff or an exact-live-state v2-v13 `midWar` handoff. The viewer
+`postStartWar` handoff or an exact-live-state v2-v14 `midWar` handoff. The viewer
 rejects `baselineReplay`; that boundary remains limited to deterministic
 fixtures and benchmarks. `--headless --ticks N` runs the same checkpoint and
 worker for up to `N` successful steps without constructing a window or GPU
@@ -243,7 +243,7 @@ ms/tick, meeting a 33.33 ms 30 Hz median budget. The conservative p95 remains
 131.183 ms per three-tick sample, or about 43.7 ms/tick, so 30 Hz is not yet a
 tail-latency guarantee and the runtime still misses a 16.67 ms 60 Hz budget.
 
-The browser/native handoff has eleven strict versions with explicit semantic
+The browser/native handoff has fourteen strict versions with explicit semantic
 boundaries:
 
 - `native-runtime-checkpoint-v1` retains `postStartWar` as its only
@@ -360,6 +360,13 @@ frames, and observer publication is immutable. Older v1-v11 checkpoints remain
 loadable without missile state. Checkpoint v13 retains complete v12 state and
 adds exact browser-clock continuation for windowed native wars; headless
 exact-step new wars continue to save v12.
+Checkpoint v14 retains complete v13 state and requires `gameTime`: either a
+strict `native-game-calendar-v1` Gregorian date/accumulator with a 500 ms day,
+or `null` when calendar time is disabled. `--start-date YYYY-MM-DD` enables the
+calendar for a new native war, scales elapsed presentation time at 1x/2x/3x,
+and resolves the browser's silo technology gate at bootstrap: years before
+1942 seed no silos. Exact-step headless execution advances neither the date nor
+its residual elapsed time.
 
 The browser keeps v1 as the default export. V2 through v6 are explicit and act as
 quiescent save barriers: they synchronously flush census work, then refuse the
@@ -451,7 +458,9 @@ Logical subticks retain their existing per-tick transaction boundary; if a
 later subtick errors, earlier browser-style mutations remain committed but the
 worker publishes no partial frame and terminates the run.
 Paused foreground frames admit no logical ticks but still advance `frame`;
-paused background intervals advance neither clock. Grace,
+paused background intervals advance neither clock. The unfocused window keeps
+simulation cadence but submits no GPU paints; focus forces the next coherent
+snapshot/territory presentation. Grace,
 active-combat, long-war, naval-operation, and defender-reaction windows thus
 continue in browser-frame coordinates.
 
@@ -552,15 +561,18 @@ The consequence port is intentionally bounded. It does not yet reproduce
 browser releasables, province-border smoothing, or treaty/UI presentation.
 Checkpoint v11 covers material reserve and aircraft cleanup. Browser-authored legacy v2 checkpoints
 omit the optional native planner block and therefore start a fresh deterministic
-front planning boundary. Native-authored v2-v13 saves include current objectives,
+front planning boundary. Native-authored v2-v14 saves include current objectives,
 assignment priors, layout priors, and the last refresh tick. New native-war
-saves use v13 in the windowed sandbox and v12 in exact-step headless mode;
-legacy runtimes select the newest schema supported by their owned continuation
-state. V13 retains complete v12 state plus the strict browser clock, including
+saves use v14 in the windowed sandbox and v12 in exact-step headless mode unless
+`--start-date` enables calendar-bearing v14 saves; legacy runtimes select the
+newest schema supported by their owned continuation state. V13 retains complete
+v12 state plus the strict browser clock, including
 speed, residual accumulator, foreground/background mode, pause state, and
-top-level tick/frame coordinates. V1-v12 remain loadable; windowed startup
-rebases legacy naval/defender execution timestamps while preserving elapsed
-ages, and legacy-format writers convert them back before serialization.
+top-level tick/frame coordinates. V1-v13 remain loadable; windowed startup
+rebases v1-v12 naval/defender execution timestamps while preserving elapsed
+ages, and legacy-format writers convert them back before serialization. V14
+adds required nullable calendar state without weakening the complete v13
+contract.
 
 The native writer accepts only the canonical runtime, simulation, territory
 tile, city, protection, and contiguous-side configuration that the strict
@@ -602,6 +614,16 @@ Draw order mirrors the browser: base map and controller frontlines, air, cities,
 units and their adornments, battles, side labels, country labels, operations,
 then the observer HUD.
 
+Runtime publications first accumulate in pending presentation state. Paint
+admission matches the browser's visual cadence: every frame at 1x, every second
+at 2x, and every fourth at 3x, with a 12 ms simulation-work budget. An
+over-budget atomic commit receives the distinct `commit-frame` deferral reason;
+other over-budget work receives `simulation-over-budget`. Deferral is bounded by
+`max(2, cadence + 1)` frames, and starvation or debounced zoom settling forces
+admission. Only then are every pending FIFO territory delta and the matching
+newest immutable snapshot installed together, preventing a new snapshot from
+being painted against older ownership textures.
+
 ## Migration order
 
 1. Scenario codec and direction field. **Complete.**
@@ -620,7 +642,7 @@ then the observer HUD.
    `NativeRuntime`.**
 8. Derive production scenario inputs and front objectives, then connect AI,
    simulation, territory, and strategic kernels under one runtime owner.
-   **Complete for the bounded v1-v13 checkpoint contracts and runtime.**
+   **Complete for the bounded v1-v14 checkpoint contracts and runtime.**
 9. Load production checkpoints in `mw-native`. **Complete for strict,
    exact-geography `postStartWar` and exact-live-state `midWar` viewer/headless
    operation; `baselineReplay` is deliberately rejected.**
@@ -692,7 +714,11 @@ then the observer HUD.
     admission, paused-frame behavior, coalesced immutable frame publication,
     frame-based operational timers, and exact checkpoint v13 continuation.
     **Complete.**
-31. Native gameplay UI/editor/community parity remains later work after the
+31. Add the Gregorian 500 ms/day campaign calendar, speed-scaled elapsed-time
+    advancement, pre-1942 silo technology gate, browser paint admission, atomic
+    pending snapshot/territory presentation, and exact nullable-game-time
+    checkpoint v14 continuation. **Complete.**
+32. Native gameplay UI/editor/community parity remains later work after the
     remaining simulation boundaries are chosen and measured.
 
 Player order controls, Commander Mode, the full gameplay HUD, map editor,

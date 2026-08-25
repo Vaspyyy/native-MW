@@ -63,6 +63,7 @@ fn runtime() -> NativeRuntime {
             hostility: None,
             production,
             war_grace_end: u64::MAX,
+            game_calendar: None,
         },
     )
     .unwrap();
@@ -95,6 +96,7 @@ fn restored_runtime(state: NativeRuntimeCheckpointState) -> NativeRuntime {
         RuntimeCheckpoint {
             tick: state.tick,
             frame: state.frame,
+            game_calendar: state.game_calendar,
             operational_timers_use_frame: state.operational_timers_use_frame,
             war_grace_end: state.war_grace_end,
             simulation,

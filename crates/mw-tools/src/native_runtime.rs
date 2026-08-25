@@ -26,15 +26,16 @@ use mw_core::{
     CombatLayer, CombatUnit, CommandBand, CommandHomeTarget, ConflictResolutionPlan,
     CountryBattlefieldPrimitives, DEFAULT_GAMEPLAY_RNG_SEED, DecodedScenario, EconomyState,
     FrontLayoutPrior, FrontObjective, GAMEPLAY_RNG_ALGORITHM, GAMEPLAY_RNG_SCHEMA_VERSION,
-    GameplayRngState, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime, NavalPlanningState,
-    OccupationState, OperationalExecutionState, OperationalRuntimeState, PAYROLL_PER_UNIT,
-    ProductionConfig, ReinforcementState, ResolvedCombatModifiers, ResolvedMovementModifiers,
-    RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState,
-    RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation, SimulationConfig,
-    SimulationUnit, StrategicMissileState, StrategicSimulation, TARGET_STARTING_PAYROLL_SHARE,
-    TerritoryCity, TerritoryCommittedState, TerritoryConfig, TerritoryControl, TerritoryMaps,
-    UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy, UnitKind, WorldGridView,
-    browser_discipline, command_refusal_share, decode_mwsc_gzip, derive_scenario_production,
+    GameCalendarState, GameplayRngState, GridSpec, NATIVE_RUNTIME_SCHEMA_VERSION, NativeRuntime,
+    NavalPlanningState, OccupationState, OperationalExecutionState, OperationalRuntimeState,
+    PAYROLL_PER_UNIT, ProductionConfig, ReinforcementState, ResolvedCombatModifiers,
+    ResolvedMovementModifiers, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot,
+    RuntimeState, RuntimeUnitPolicy, STARTING_RESERVE_CYCLES, ScenarioProduction, Simulation,
+    SimulationConfig, SimulationUnit, StrategicMissileState, StrategicSimulation,
+    TARGET_STARTING_PAYROLL_SHARE, TerritoryCity, TerritoryCommittedState, TerritoryConfig,
+    TerritoryControl, TerritoryMaps, UnitAiPolicy, UnitCommandPolicy, UnitInfluencePolicy,
+    UnitKind, WorldGridView, browser_discipline, command_refusal_share, decode_mwsc_gzip,
+    derive_scenario_production,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -52,6 +53,7 @@ pub const NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA: &str = "native-runtime-checkpoin
 pub const NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA: &str = "native-runtime-checkpoint-v11";
 pub const NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA: &str = "native-runtime-checkpoint-v12";
 pub const NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA: &str = "native-runtime-checkpoint-v13";
+pub const NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA: &str = "native-runtime-checkpoint-v14";
 pub const NATIVE_SIDE_DYNAMICS_SCHEMA: &str = "native-side-dynamics-v1";
 pub const NATIVE_INFLUENCE_RUNTIME_SCHEMA: &str = "native-influence-runtime-v1";
 
@@ -379,7 +381,7 @@ pub fn write_runtime_checkpoint_state_v7(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_through_v13(
+    write_runtime_checkpoint_state_v7_through_v14(
         scenario_path,
         baseline,
         state,
@@ -398,7 +400,7 @@ pub fn write_runtime_checkpoint_state_v8(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_through_v13(
+    write_runtime_checkpoint_state_v7_through_v14(
         scenario_path,
         baseline,
         state,
@@ -417,7 +419,7 @@ pub fn write_runtime_checkpoint_state_v9(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_through_v13(
+    write_runtime_checkpoint_state_v7_through_v14(
         scenario_path,
         baseline,
         state,
@@ -436,7 +438,7 @@ pub fn write_runtime_checkpoint_state_v10(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_through_v13(
+    write_runtime_checkpoint_state_v7_through_v14(
         scenario_path,
         baseline,
         state,
@@ -455,7 +457,7 @@ pub fn write_runtime_checkpoint_state_v11(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_through_v13(
+    write_runtime_checkpoint_state_v7_through_v14(
         scenario_path,
         baseline,
         state,
@@ -474,7 +476,7 @@ pub fn write_runtime_checkpoint_state_v12(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_through_v13(
+    write_runtime_checkpoint_state_v7_through_v14(
         scenario_path,
         baseline,
         state,
@@ -494,7 +496,7 @@ pub fn write_runtime_checkpoint_state_v13(
     output: &Path,
     steps: usize,
 ) -> Result<NativeCheckpointWriteReport> {
-    write_runtime_checkpoint_state_v7_through_v13(
+    write_runtime_checkpoint_state_v7_through_v14(
         scenario_path,
         baseline,
         state,
@@ -505,7 +507,27 @@ pub fn write_runtime_checkpoint_state_v13(
     )
 }
 
-fn write_runtime_checkpoint_state_v7_through_v13(
+/// Serialize a v14 checkpoint with exact browser scheduler and game-calendar continuation.
+pub fn write_runtime_checkpoint_state_v14(
+    scenario_path: &Path,
+    baseline: &DecodedScenario,
+    state: &mw_core::NativeRuntimeCheckpointState,
+    clock: BrowserClockState,
+    output: &Path,
+    steps: usize,
+) -> Result<NativeCheckpointWriteReport> {
+    write_runtime_checkpoint_state_v7_through_v14(
+        scenario_path,
+        baseline,
+        state,
+        output,
+        steps,
+        NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA,
+        Some(clock),
+    )
+}
+
+fn write_runtime_checkpoint_state_v7_through_v14(
     scenario_path: &Path,
     baseline: &DecodedScenario,
     state: &mw_core::NativeRuntimeCheckpointState,
@@ -515,16 +537,19 @@ fn write_runtime_checkpoint_state_v7_through_v13(
     browser_clock: Option<BrowserClockState>,
 ) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
-    if schema == NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA {
+    if matches!(
+        schema,
+        NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
+    ) {
         browser_clock
-            .context("checkpoint-v13 writer requires browser clock state")?
+            .context("checkpoint-v13+ writer requires browser clock state")?
             .validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         if !state.operational_timers_use_frame {
-            bail!("checkpoint-v13 writer requires browser-frame operational timers");
+            bail!("checkpoint-v13+ writer requires browser-frame operational timers");
         }
     } else if browser_clock.is_some() {
-        bail!("only checkpoint-v13 may contain browser clock state");
+        bail!("only checkpoint-v13+ may contain browser clock state");
     }
     state
         .battlefield
@@ -585,7 +610,10 @@ fn write_runtime_checkpoint_state_v7_through_v13(
         .as_ref()
         .context("checkpoint-v7 writer requires operational execution state")?
         .clone();
-    let execution_now = if schema == NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA {
+    let execution_now = if matches!(
+        schema,
+        NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
+    ) {
         state.frame
     } else {
         if state.operational_timers_use_frame {
@@ -747,6 +775,7 @@ fn write_runtime_checkpoint_state_with_hash(
     runtime_clock: Option<RuntimeClockFixture>,
 ) -> Result<NativeCheckpointWriteReport> {
     validate_checkpoint_write_steps(steps)?;
+    validate_checkpoint_game_calendar_write(schema, state.game_calendar.as_ref())?;
     if state.runtime_config != RuntimeConfig::default() {
         bail!("checkpoint-v2 writer only supports the canonical runtime configuration");
     }
@@ -979,6 +1008,7 @@ fn write_runtime_checkpoint_state_with_hash(
                 | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
         ) && let Some(units) = battlefield.get_mut("units").and_then(Value::as_array_mut)
         {
             for unit in units {
@@ -1043,6 +1073,7 @@ fn write_runtime_checkpoint_state_with_hash(
             | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
     ) {
         if state.personnel_reserves.len() != state.territory_config.max_sides {
             bail!("personnel reserves must exactly cover every stable side");
@@ -1079,6 +1110,7 @@ fn write_runtime_checkpoint_state_with_hash(
             | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
     ) {
         let reinforcement = state
             .reinforcement
@@ -1107,6 +1139,7 @@ fn write_runtime_checkpoint_state_with_hash(
         NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
     ) {
         let material = state
             .material_logistics
@@ -1124,7 +1157,9 @@ fn write_runtime_checkpoint_state_with_hash(
             .insert("materialLogistics".into(), serde_json::to_value(material)?);
         if matches!(
             schema,
-            NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
         ) {
             let missiles = state
                 .strategic_missiles
@@ -1146,6 +1181,14 @@ fn write_runtime_checkpoint_state_with_hash(
                 serde_json::to_value(runtime_clock)?,
             );
     }
+    if schema == NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA {
+        body.as_object_mut()
+            .expect("checkpoint body is an object")
+            .insert(
+                "gameTime".to_owned(),
+                serde_json::to_value(&state.game_calendar)?,
+            );
+    }
     if matches!(
         schema,
         NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA
@@ -1157,11 +1200,14 @@ fn write_runtime_checkpoint_state_with_hash(
             | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
     ) {
         validate_checkpoint_v5_required_nullable_fields(&body)
             .context("checkpoint writer omitted required nullable operational fields")?;
         validate_checkpoint_v8_supply_collapse_fields(&body)
             .context("checkpoint writer emitted invalid supply-collapse history fields")?;
+        validate_checkpoint_game_time_field(&body)
+            .context("checkpoint writer emitted an invalid game-time field")?;
         let fixture: RuntimeCheckpointFixture = serde_json::from_value(body.clone())
             .context("checkpoint writer produced an invalid wire object")?;
         validate_checkpoint_shape(&fixture)
@@ -1386,6 +1432,7 @@ fn validate_checkpoint_v8_supply_collapse_fields(checkpoint: &Value) -> Result<(
                 | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
         ) && !present
         {
             bail!(
@@ -1400,10 +1447,49 @@ fn validate_checkpoint_v8_supply_collapse_fields(checkpoint: &Value) -> Result<(
                 | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
         ) && present
         {
             bail!("{schema} cannot contain checkpoint-v8 battlefield supplyCollapse history");
         }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_game_time_field(checkpoint: &Value) -> Result<()> {
+    let schema = checkpoint
+        .get("schema")
+        .and_then(Value::as_str)
+        .context("checkpoint.schema must be a string")?;
+    let object = checkpoint
+        .as_object()
+        .context("native runtime checkpoint must be an object")?;
+    let present = object.contains_key("gameTime");
+    if schema == NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA {
+        if !present {
+            bail!("checkpoint-v14 requires gameTime (use null when disabled)");
+        }
+    } else if present {
+        bail!("{schema} cannot contain checkpoint-v14 gameTime state");
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_game_calendar_write(
+    schema: &str,
+    game_calendar: Option<&GameCalendarState>,
+) -> Result<()> {
+    if schema != NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA {
+        if game_calendar.is_some() {
+            bail!("{schema} cannot serialize live game calendar state; use checkpoint-v14");
+        }
+        return Ok(());
+    }
+
+    if let Some(game_calendar) = game_calendar {
+        game_calendar
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
     Ok(())
 }
@@ -2114,6 +2200,8 @@ struct RuntimeCheckpointFixture {
     strategic_missiles: Option<mw_core::StrategicMissileState>,
     #[serde(default)]
     runtime_clock: Option<RuntimeClockFixture>,
+    #[serde(default)]
+    game_time: Option<GameCalendarState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2985,7 +3073,7 @@ pub struct LoadedRuntime {
     pub resumable: bool,
     pub exact_geography_supplied: bool,
     pub unit_count: usize,
-    /// Exact browser scheduler state for v13; legacy checkpoints intentionally
+    /// Exact browser scheduler state for v13+; legacy checkpoints intentionally
     /// leave this absent and start native observer playback from canonical 1x.
     pub browser_clock: Option<BrowserClockState>,
 }
@@ -3047,11 +3135,12 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
                 | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
                 | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+                | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
         )
     ) {
         validate_checkpoint_v5_required_nullable_fields(&checkpoint_value).with_context(|| {
             format!(
-                "failed to validate required v5-v13 operational fields in {}",
+                "failed to validate required v5-v14 operational fields in {}",
                 checkpoint_path.display()
             )
         })?;
@@ -3059,6 +3148,12 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
     validate_checkpoint_v8_supply_collapse_fields(&checkpoint_value).with_context(|| {
         format!(
             "failed to validate checkpoint supply-collapse history fields in {}",
+            checkpoint_path.display()
+        )
+    })?;
+    validate_checkpoint_game_time_field(&checkpoint_value).with_context(|| {
+        format!(
+            "failed to validate checkpoint game-time field in {}",
             checkpoint_path.display()
         )
     })?;
@@ -3178,7 +3273,10 @@ fn prepare_runtime(scenario_path: &PathBuf, checkpoint_path: &PathBuf) -> Result
     }
     let operational_execution = checkpoint.operational_execution.clone();
     if let Some(execution) = operational_execution.as_ref() {
-        let execution_now = if checkpoint.schema == NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA {
+        let execution_now = if matches!(
+            checkpoint.schema.as_str(),
+            NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
+        ) {
             checkpoint.frame
         } else {
             checkpoint.tick
@@ -3630,7 +3728,9 @@ fn validate_exact_geography_owner_ids(
 fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()> {
     if !matches!(
         checkpoint.schema.as_str(),
-        NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+        NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
     ) && checkpoint.strategic_missiles.is_some()
     {
         bail!("checkpoint-v1 through v11 cannot contain strategicMissiles");
@@ -3640,6 +3740,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
         NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
     ) && checkpoint.material_logistics.is_some()
     {
         bail!("checkpoint-v1 through v10 cannot contain materialLogistics");
@@ -3651,6 +3752,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             | NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
             | NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
     ) && (checkpoint.gameplay_rng.is_some() || checkpoint.personnel_reserves.is_some())
     {
         bail!("checkpoint-v1 through v8 cannot contain checkpoint-v9 replay state");
@@ -3659,14 +3761,20 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
         && checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA
         && checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA
         && checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+        && checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
         && checkpoint.reinforcement.is_some()
     {
         bail!("checkpoint-v1 through v9 cannot contain checkpoint-v10 reinforcement state");
     }
-    if checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
-        && checkpoint.runtime_clock.is_some()
+    if !matches!(
+        checkpoint.schema.as_str(),
+        NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
+    ) && checkpoint.runtime_clock.is_some()
     {
         bail!("checkpoint-v1 through v12 cannot contain runtimeClock");
+    }
+    if checkpoint.schema != NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA && checkpoint.game_time.is_some() {
+        bail!("checkpoint-v1 through v13 cannot contain gameTime");
     }
     match checkpoint.schema.as_str() {
         NATIVE_RUNTIME_CHECKPOINT_SCHEMA => {
@@ -4007,7 +4115,9 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 bail!("checkpoint-v12 strategicCycle must leave room for a later cycle");
             }
         }
-        NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA => {
+        NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA => {
+            let is_v14 = checkpoint.schema == NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA;
+            let version = if is_v14 { "v14" } else { "v13" };
             if checkpoint.checkpoint_boundary != CheckpointBoundary::MidWar
                 || checkpoint.territory.is_none()
                 || checkpoint.geography.is_none()
@@ -4025,6 +4135,11 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                 || checkpoint.strategic_missiles.is_none()
                 || checkpoint.runtime_clock.is_none()
             {
+                if is_v14 {
+                    bail!(
+                        "checkpoint-v14 requires complete v13 state plus required gameTime state"
+                    );
+                }
                 bail!("checkpoint-v13 requires complete v12 state plus runtimeClock");
             }
             let gameplay_rng = checkpoint
@@ -4034,7 +4149,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             if gameplay_rng.schema != GAMEPLAY_RNG_SCHEMA_VERSION
                 || gameplay_rng.algorithm != GAMEPLAY_RNG_ALGORITHM
             {
-                bail!("checkpoint-v13 gameplay RNG schema or algorithm is unsupported");
+                bail!("checkpoint-{version} gameplay RNG schema or algorithm is unsupported");
             }
             let reserves = checkpoint
                 .personnel_reserves
@@ -4046,7 +4161,7 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
                     .any(|value| !value.is_finite() || *value < 0.0)
             {
                 bail!(
-                    "checkpoint-v13 personnelReserves must exactly cover sides with finite non-negative values"
+                    "checkpoint-{version} personnelReserves must exactly cover sides with finite non-negative values"
                 );
             }
             checkpoint
@@ -4062,14 +4177,21 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             runtime_clock.state()?;
             if runtime_clock.sim_tick != checkpoint.tick || runtime_clock.frame != checkpoint.frame
             {
-                bail!("checkpoint-v13 runtimeClock tick/frame must match the top-level clocks");
+                bail!(
+                    "checkpoint-{version} runtimeClock tick/frame must match the top-level clocks"
+                );
+            }
+            if is_v14 && let Some(game_time) = checkpoint.game_time.as_ref() {
+                game_time
+                    .validate()
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             }
             if checkpoint.strategic_cycle == u64::MAX {
-                bail!("checkpoint-v13 strategicCycle must leave room for a later cycle");
+                bail!("checkpoint-{version} strategicCycle must leave room for a later cycle");
             }
         }
         _ => bail!(
-            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
+            "unsupported native runtime checkpoint schema {:?}; expected {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, or {:?}",
             checkpoint.schema,
             NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
@@ -4083,7 +4205,8 @@ fn validate_checkpoint_shape(checkpoint: &RuntimeCheckpointFixture) -> Result<()
             NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA,
-            NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA
+            NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
         ),
     }
     if checkpoint.steps == 0 {
@@ -4865,7 +4988,10 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
     let runtime_checkpoint = RuntimeCheckpoint {
         tick: checkpoint.tick,
         frame: checkpoint.frame,
-        operational_timers_use_frame: checkpoint.schema == NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA,
+        operational_timers_use_frame: matches!(
+            checkpoint.schema.as_str(),
+            NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA | NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA
+        ),
         war_grace_end: checkpoint.war_grace_end,
         simulation,
         territory,
@@ -4905,6 +5031,7 @@ fn build_runtime(prepared: &PreparedRuntime) -> Result<NativeRuntime> {
         reinforcement: checkpoint.reinforcement.clone(),
         material_logistics: checkpoint.material_logistics.clone(),
         strategic_missiles: checkpoint.strategic_missiles.clone(),
+        game_calendar: checkpoint.game_time.clone(),
     };
     Ok(NativeRuntime::new(
         RuntimeConfig::default(),
@@ -5434,6 +5561,7 @@ struct RuntimeProductionReport {
 impl PreparedRuntime {
     fn schema(&self) -> &'static str {
         match self.checkpoint.schema.as_str() {
+            NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA,
             NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA => NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA,
@@ -6458,6 +6586,7 @@ mod tests {
             material_logistics: None,
             strategic_missiles: None,
             runtime_clock: None,
+            game_time: None,
         }
     }
 
@@ -6567,6 +6696,36 @@ mod tests {
             missiles: Vec::new(),
             explosions: Vec::new(),
         });
+        checkpoint
+    }
+
+    fn valid_game_calendar() -> GameCalendarState {
+        serde_json::from_value(json!({
+            "schema": mw_core::GAME_CALENDAR_SCHEMA_VERSION,
+            "date": {"year": 1941, "month": 12, "day": 31},
+            "accumulatorMs": 250.0,
+            "dayDurationMs": 500.0
+        }))
+        .unwrap()
+    }
+
+    fn valid_v13_checkpoint() -> RuntimeCheckpointFixture {
+        let mut checkpoint = valid_v12_checkpoint();
+        checkpoint.schema = NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA.to_owned();
+        checkpoint.tick = 17;
+        checkpoint.frame = 9;
+        checkpoint.runtime_clock = Some(RuntimeClockFixture::from_state(
+            BrowserClockState::new(3, 1.0, BrowserClockMode::Foreground, false).unwrap(),
+            checkpoint.tick,
+            checkpoint.frame,
+        ));
+        checkpoint
+    }
+
+    fn valid_v14_checkpoint() -> RuntimeCheckpointFixture {
+        let mut checkpoint = valid_v13_checkpoint();
+        checkpoint.schema = NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA.to_owned();
+        checkpoint.game_time = Some(valid_game_calendar());
         checkpoint
     }
 
@@ -7249,15 +7408,7 @@ mod tests {
 
     #[test]
     fn checkpoint_v13_requires_exact_strict_browser_clock() {
-        let mut v13 = valid_v12_checkpoint();
-        v13.schema = NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA.to_owned();
-        v13.tick = 17;
-        v13.frame = 9;
-        v13.runtime_clock = Some(RuntimeClockFixture::from_state(
-            BrowserClockState::new(3, 1.0, BrowserClockMode::Foreground, false).unwrap(),
-            v13.tick,
-            v13.frame,
-        ));
+        let v13 = valid_v13_checkpoint();
         assert!(validate_checkpoint_shape(&v13).is_ok());
 
         let mut missing = v13.clone();
@@ -7283,6 +7434,118 @@ mod tests {
         let mut strict_wire = serde_json::to_value(v13.runtime_clock.unwrap()).unwrap();
         strict_wire["unknown"] = json!(true);
         assert!(serde_json::from_value::<RuntimeClockFixture>(strict_wire).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v14_requires_the_game_time_key_even_when_disabled() {
+        let missing = json!({"schema": NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA});
+        let error = validate_checkpoint_game_time_field(&missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires gameTime"));
+
+        let disabled = json!({
+            "schema": NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA,
+            "gameTime": null
+        });
+        assert!(validate_checkpoint_game_time_field(&disabled).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_v1_through_v13_forbid_game_time_even_when_null() {
+        for schema in [
+            NATIVE_RUNTIME_CHECKPOINT_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA,
+        ] {
+            let wire = json!({"schema": schema, "gameTime": null});
+            assert!(
+                validate_checkpoint_game_time_field(&wire).is_err(),
+                "{schema} accepted gameTime"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_v2_through_v13_writers_reject_live_game_calendar_state() {
+        let calendar = valid_game_calendar();
+        for schema in [
+            NATIVE_RUNTIME_CHECKPOINT_V2_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V3_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V4_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V5_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V6_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V7_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V8_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V9_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V10_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V11_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V12_SCHEMA,
+            NATIVE_RUNTIME_CHECKPOINT_V13_SCHEMA,
+        ] {
+            let error = validate_checkpoint_game_calendar_write(schema, Some(&calendar))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("use checkpoint-v14"), "{schema}: {error}");
+        }
+
+        assert!(
+            validate_checkpoint_game_calendar_write(
+                NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA,
+                Some(&calendar)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_checkpoint_game_calendar_write(NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn checkpoint_v14_rejects_invalid_game_calendar() {
+        let invalid: GameCalendarState = serde_json::from_value(json!({
+            "schema": mw_core::GAME_CALENDAR_SCHEMA_VERSION,
+            "date": {"year": 1941, "month": 13, "day": 1},
+            "accumulatorMs": 0.0,
+            "dayDurationMs": 500.0
+        }))
+        .unwrap();
+        assert!(invalid.validate().is_err());
+
+        let mut checkpoint = valid_v14_checkpoint();
+        checkpoint.game_time = Some(invalid);
+        assert!(validate_checkpoint_shape(&checkpoint).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v14_game_calendar_round_trips_and_shape_is_complete() {
+        let checkpoint = valid_v14_checkpoint();
+        assert!(validate_checkpoint_shape(&checkpoint).is_ok());
+
+        let encoded = serde_json::to_value(checkpoint.game_time.as_ref().unwrap()).unwrap();
+        let wire = json!({
+            "schema": NATIVE_RUNTIME_CHECKPOINT_V14_SCHEMA,
+            "gameTime": encoded.clone()
+        });
+        assert!(validate_checkpoint_game_time_field(&wire).is_ok());
+        let decoded: GameCalendarState = serde_json::from_value(encoded.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+
+        let mut missing_v13_state = checkpoint.clone();
+        missing_v13_state.runtime_clock = None;
+        assert!(validate_checkpoint_shape(&missing_v13_state).is_err());
     }
 
     #[test]

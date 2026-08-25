@@ -165,6 +165,17 @@ impl std::error::Error for RuntimeWorkerControlError {}
 struct Publication<T, S> {
     territory_updates: Vec<T>,
     snapshot: S,
+    frame_metrics: Option<RuntimeFrameMetrics>,
+}
+
+/// Presentation-only measurements captured around one completed runtime
+/// boundary. They may influence paint admission, never simulation ordering.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuntimeFrameMetrics {
+    pub runtime_frame: u64,
+    pub speed: u8,
+    pub simulation_work_ms: f64,
+    pub commit_frame: bool,
 }
 
 /// One nonblocking renderer drain.  `snapshot` is the newest marker encountered, and it is
@@ -173,6 +184,7 @@ struct Publication<T, S> {
 pub struct RuntimeWorkerDrain {
     pub territory_updates: Vec<Arc<TerritoryRenderUpdate>>,
     pub snapshot: Option<Arc<RuntimeSnapshot>>,
+    pub frame_metrics: Vec<RuntimeFrameMetrics>,
 }
 
 /// Handle owned by the render thread.  It never exposes mutable runtime state.
@@ -339,10 +351,11 @@ impl RuntimeWorker {
     /// then upload `snapshot` once (when present). Intermediate snapshots are intentionally
     /// collapsed, preserving newest-wins rendering while retaining every territory delta.
     pub fn drain_render_state(&self) -> RuntimeWorkerDrain {
-        let (territory_updates, snapshot) = drain_publications(&self.messages);
+        let (territory_updates, snapshot, frame_metrics) = drain_publications(&self.messages);
         RuntimeWorkerDrain {
             territory_updates,
             snapshot,
+            frame_metrics,
         }
     }
 
@@ -509,6 +522,7 @@ fn run_worker(
             let _ = events.status.send(RuntimeWorkerStatus::Stopped);
             return;
         }
+        let simulation_started = Instant::now();
         let snapshot = match runtime.step() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -518,14 +532,21 @@ fn run_worker(
                 return;
             }
         };
-        let deferred =
-            match forward_tick(&mut runtime, snapshot.clone(), &messages, &latest, &control) {
-                Some(deferred) => deferred,
-                None => {
-                    let _ = events.status.send(RuntimeWorkerStatus::Stopped);
-                    return;
-                }
-            };
+        let metrics = frame_metrics(&snapshot, 1, simulation_started.elapsed());
+        let deferred = match forward_tick(
+            &mut runtime,
+            snapshot.clone(),
+            &messages,
+            &latest,
+            &control,
+            metrics,
+        ) {
+            Some(deferred) => deferred,
+            None => {
+                let _ = events.status.send(RuntimeWorkerStatus::Stopped);
+                return;
+            }
+        };
         // Establish the ordinary next deadline first. Deferred controls were received while this
         // tick's publication was backpressured and may intentionally replace this schedule.
         due_at = next_due(due_at, tick_interval, Instant::now());
@@ -592,6 +613,7 @@ fn run_browser_worker(
 
     let mut frame_interval = frame_interval;
     let mut due_at = Instant::now();
+    let mut last_foreground_at = due_at.checked_sub(frame_interval).unwrap_or(due_at);
     for request in initial_controls {
         if apply_browser_control(
             request,
@@ -626,13 +648,40 @@ fn run_browser_worker(
             continue;
         }
 
+        let frame_started_at = Instant::now();
         let mut staged_clock = clock;
         let logical_subticks = staged_clock.admit_frame();
-        let advanced = match staged_clock.mode {
-            BrowserClockMode::Foreground => runtime.advance_browser_frame(logical_subticks),
-            BrowserClockMode::Background => {
-                runtime.advance_browser_background_frame(logical_subticks)
+        let game_time_elapsed_ms = match staged_clock.mode {
+            BrowserClockMode::Foreground => {
+                let elapsed = frame_started_at
+                    .saturating_duration_since(last_foreground_at)
+                    .as_secs_f64()
+                    * 1_000.0;
+                last_foreground_at = frame_started_at;
+                if staged_clock.paused {
+                    0.0
+                } else {
+                    // Browser updateLoop clamps the real RAF delta so returning
+                    // from a stalled or hidden window cannot jump the calendar.
+                    elapsed.min(50.0)
+                }
             }
+            // The hidden-tab setInterval passes its nominal 100 ms directly
+            // to tickGameTime rather than measuring callback wall time.
+            BrowserClockMode::Background => 100.0,
+        };
+        let simulation_started = Instant::now();
+        let advanced = match staged_clock.mode {
+            BrowserClockMode::Foreground => runtime.advance_browser_frame_timed(
+                logical_subticks,
+                game_time_elapsed_ms,
+                staged_clock.sim_speed,
+            ),
+            BrowserClockMode::Background => runtime.advance_browser_background_frame_timed(
+                logical_subticks,
+                game_time_elapsed_ms,
+                staged_clock.sim_speed,
+            ),
         };
         let snapshot = match advanced {
             Ok(snapshot) => snapshot,
@@ -644,6 +693,7 @@ fn run_browser_worker(
             }
         };
         clock = staged_clock;
+        let metrics = frame_metrics(&snapshot, clock.sim_speed, simulation_started.elapsed());
         let deferred = match forward_browser_frame(
             &mut runtime,
             snapshot.clone(),
@@ -651,6 +701,7 @@ fn run_browser_worker(
             &latest,
             &control,
             clock,
+            metrics,
         ) {
             Some(deferred) => deferred,
             None => {
@@ -1035,7 +1086,15 @@ fn forward_initial_state_with_clock(
     browser_clock: Option<BrowserClockState>,
 ) -> Option<Vec<RuntimeWorkerControl>> {
     let snapshot = runtime.latest_snapshot();
-    forward_publication(runtime, snapshot, messages, latest, control, browser_clock)
+    forward_publication(
+        runtime,
+        snapshot,
+        messages,
+        latest,
+        control,
+        browser_clock,
+        None,
+    )
 }
 
 fn forward_tick(
@@ -1044,8 +1103,17 @@ fn forward_tick(
     messages: &SyncSender<Publication<Arc<TerritoryRenderUpdate>, Arc<RuntimeSnapshot>>>,
     latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
     control: &Receiver<RuntimeWorkerControl>,
+    frame_metrics: RuntimeFrameMetrics,
 ) -> Option<Vec<RuntimeWorkerControl>> {
-    forward_publication(runtime, snapshot, messages, latest, control, None)
+    forward_publication(
+        runtime,
+        snapshot,
+        messages,
+        latest,
+        control,
+        None,
+        Some(frame_metrics),
+    )
 }
 
 fn forward_browser_frame(
@@ -1055,6 +1123,7 @@ fn forward_browser_frame(
     latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
     control: &Receiver<RuntimeWorkerControl>,
     browser_clock: BrowserClockState,
+    frame_metrics: RuntimeFrameMetrics,
 ) -> Option<Vec<RuntimeWorkerControl>> {
     forward_publication(
         runtime,
@@ -1063,6 +1132,7 @@ fn forward_browser_frame(
         latest,
         control,
         Some(browser_clock),
+        Some(frame_metrics),
     )
 }
 
@@ -1073,6 +1143,7 @@ fn forward_publication(
     latest: &Arc<Mutex<Arc<RuntimeSnapshot>>>,
     control: &Receiver<RuntimeWorkerControl>,
     browser_clock: Option<BrowserClockState>,
+    frame_metrics: Option<RuntimeFrameMetrics>,
 ) -> Option<Vec<RuntimeWorkerControl>> {
     let mut territory_updates = Vec::new();
     while let Some(update) = runtime.pop_render_update() {
@@ -1086,6 +1157,7 @@ fn forward_publication(
         Publication {
             territory_updates,
             snapshot: snapshot.clone(),
+            frame_metrics,
         },
     )?;
     *latest
@@ -1094,14 +1166,36 @@ fn forward_publication(
     Some(deferred)
 }
 
-fn drain_publications<T, S>(receiver: &Receiver<Publication<T, S>>) -> (Vec<T>, Option<S>) {
+fn drain_publications<T, S>(
+    receiver: &Receiver<Publication<T, S>>,
+) -> (Vec<T>, Option<S>, Vec<RuntimeFrameMetrics>) {
     let mut territory_updates = Vec::new();
     let mut snapshot = None;
+    let mut frame_metrics = Vec::new();
     while let Ok(publication) = receiver.try_recv() {
         territory_updates.extend(publication.territory_updates);
         snapshot = Some(publication.snapshot);
+        if let Some(metrics) = publication.frame_metrics {
+            frame_metrics.push(metrics);
+        }
     }
-    (territory_updates, snapshot)
+    (territory_updates, snapshot, frame_metrics)
+}
+
+fn frame_metrics(
+    snapshot: &RuntimeSnapshot,
+    speed: u8,
+    simulation_work: Duration,
+) -> RuntimeFrameMetrics {
+    RuntimeFrameMetrics {
+        runtime_frame: snapshot.frame,
+        speed,
+        simulation_work_ms: simulation_work.as_secs_f64() * 1_000.0,
+        // The browser defers a costly paint when an atomic phase commit lands.
+        // Native census and strategic cycles are the equivalent all-state
+        // boundaries; ordinary dirty territory tiles remain presentation-only.
+        commit_frame: snapshot.counters.census.committed || snapshot.counters.strategic.is_some(),
+    }
 }
 
 /// Sends one item without losing it to a full FIFO.  The control wait is what makes a bounded
@@ -1226,6 +1320,7 @@ mod tests {
                 hostility: None,
                 production: ProductionConfig::default(),
                 war_grace_end: 600,
+                game_calendar: None,
             },
         )
         .unwrap()
@@ -1669,18 +1764,33 @@ mod tests {
             .send(Publication {
                 territory_updates: vec![1_u8, 2],
                 snapshot: 10_u8,
+                frame_metrics: Some(RuntimeFrameMetrics {
+                    runtime_frame: 10,
+                    speed: 1,
+                    simulation_work_ms: 2.0,
+                    commit_frame: false,
+                }),
             })
             .unwrap();
         sender
             .send(Publication {
                 territory_updates: vec![3_u8],
                 snapshot: 11_u8,
+                frame_metrics: Some(RuntimeFrameMetrics {
+                    runtime_frame: 11,
+                    speed: 1,
+                    simulation_work_ms: 13.0,
+                    commit_frame: true,
+                }),
             })
             .unwrap();
 
-        let (updates, snapshot) = drain_publications(&receiver);
+        let (updates, snapshot, metrics) = drain_publications(&receiver);
         assert_eq!(updates, vec![1, 2, 3]);
         assert_eq!(snapshot, Some(11));
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[1].runtime_frame, 11);
+        assert!(metrics[1].commit_frame);
     }
 
     #[test]

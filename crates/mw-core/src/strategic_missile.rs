@@ -81,8 +81,8 @@ pub struct MissileExplosion {
 pub struct StrategicMissileState {
     pub schema: String,
     pub enabled: bool,
-    /// Resolved date/technology gate. Exact handoffs retain the browser decision without porting
-    /// campaign time into native sandbox mode.
+    /// Resolved start-date technology gate. Browser parity creates no silos
+    /// before 1942, so a later calendar rollover cannot retroactively add them.
     pub technology_allowed: bool,
     pub bases: Vec<MissileBase>,
     pub missiles: Vec<StrategicMissile>,

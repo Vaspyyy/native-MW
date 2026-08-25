@@ -13,12 +13,13 @@ use mw_checkpoint::native_runtime::{
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
     write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
     write_runtime_checkpoint_state_v10, write_runtime_checkpoint_state_v11,
-    write_runtime_checkpoint_state_v12,
+    write_runtime_checkpoint_state_v12, write_runtime_checkpoint_state_v14,
 };
 use mw_core::{
-    CombatEvent, CombatLayer, ConflictResolutionKind, GridSpec, NativeWarBootstrapConfig,
-    ProductionConfig, ProductionCountry, RuntimeSnapshot, RuntimeState, TerritoryRenderUpdate,
-    UnitKind, bootstrap_native_war, decode_mwsc_gzip_file, derive_scenario_production,
+    BrowserClockState, CombatEvent, CombatLayer, ConflictResolutionKind, GameCalendarState,
+    GridSpec, NativeWarBootstrapConfig, ProductionConfig, ProductionCountry, RuntimeSnapshot,
+    RuntimeState, TerritoryRenderUpdate, UnitKind, bootstrap_native_war, decode_mwsc_gzip_file,
+    derive_scenario_production,
 };
 use serde_json::json;
 
@@ -81,7 +82,7 @@ fn resolve_sides(
 /// constructs no window or GPU state.
 pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
     ensure!(steps > 0, "headless worker steps must be greater than zero");
-    let (baseline, runtime, boundary, unit_count) = if let Some(checkpoint_path) =
+    let (baseline, runtime, boundary, unit_count, browser_clock) = if let Some(checkpoint_path) =
         options.runtime_checkpoint_path.as_ref()
     {
         let loaded = load_runtime_checkpoint(&options.scenario_path, checkpoint_path)
@@ -110,6 +111,7 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
             loaded.runtime,
             loaded.checkpoint_boundary,
             loaded.unit_count,
+            loaded.browser_clock,
         )
     } else {
         ensure!(
@@ -120,17 +122,26 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
             .with_context(|| format!("failed to decode {}", options.scenario_path.display()))?;
         let production = derive_scenario_production(&baseline, &ProductionConfig::default())?;
         let sides = resolve_sides(&options.native_war_sides, &production.countries)?;
-        let runtime = bootstrap_native_war(
+        let mut runtime = bootstrap_native_war(
             &baseline,
             &NativeWarBootstrapConfig {
                 sides,
                 hostility: None,
                 production: ProductionConfig::default(),
                 war_grace_end: 600,
+                game_calendar: options
+                    .start_date
+                    .map(GameCalendarState::new)
+                    .transpose()
+                    .context("invalid native-war calendar")?,
             },
         )?;
+        let browser_clock = options.start_date.map(|_| {
+            runtime.enable_browser_frame_timers();
+            BrowserClockState::default()
+        });
         let units = runtime.latest_snapshot().frame_snapshot.units.len();
-        (baseline, runtime, "nativeNewWar", units)
+        (baseline, runtime, "nativeNewWar", units, browser_clock)
     };
     let initial = runtime.latest_snapshot();
     ensure!(
@@ -178,40 +189,47 @@ pub fn run_headless(options: &AppOptions, steps: u64) -> Result<()> {
         let state = worker.checkpoint_state().map_err(|error| {
             anyhow::anyhow!("failed to capture native runtime checkpoint state: {error}")
         })?;
-        let writer = if state.strategic_missiles.is_some()
+        let complete_v12 = state.strategic_missiles.is_some()
             && state.material_logistics.is_some()
             && state.reinforcement.is_some()
-            && state.naval_planning.is_some()
-        {
-            write_runtime_checkpoint_state_v12
-        } else if state.material_logistics.is_some()
-            && state.reinforcement.is_some()
-            && state.naval_planning.is_some()
-        {
-            write_runtime_checkpoint_state_v11
-        } else if state.reinforcement.is_some() && state.naval_planning.is_some() {
-            write_runtime_checkpoint_state_v10
-        } else if state.naval_planning.is_some() {
-            write_runtime_checkpoint_state_v9
-        } else if state.operational_execution.is_some() && state.air_power.is_some() {
-            write_runtime_checkpoint_state_v6
-        } else if state.operations.is_some() {
-            write_runtime_checkpoint_state_v5
-        } else if state.side_dynamics.is_some() {
-            write_runtime_checkpoint_state_v4
-        } else if state.influence_runtime.is_some() {
-            write_runtime_checkpoint_state_v3
+            && state.naval_planning.is_some();
+        let steps = usize::try_from(completion.completed_steps)
+            .context("completed steps exceed save format")?;
+        let report = if complete_v12 && let Some(clock) = browser_clock {
+            write_runtime_checkpoint_state_v14(
+                &options.scenario_path,
+                &baseline,
+                &state,
+                clock,
+                path,
+                steps,
+            )?
         } else {
-            write_runtime_checkpoint_state_v2
+            let writer = if complete_v12 {
+                write_runtime_checkpoint_state_v12
+            } else if state.material_logistics.is_some()
+                && state.reinforcement.is_some()
+                && state.naval_planning.is_some()
+            {
+                write_runtime_checkpoint_state_v11
+            } else if state.reinforcement.is_some() && state.naval_planning.is_some() {
+                write_runtime_checkpoint_state_v10
+            } else if state.naval_planning.is_some() {
+                write_runtime_checkpoint_state_v9
+            } else if state.operational_execution.is_some() && state.air_power.is_some() {
+                write_runtime_checkpoint_state_v6
+            } else if state.operations.is_some() {
+                write_runtime_checkpoint_state_v5
+            } else if state.side_dynamics.is_some() {
+                write_runtime_checkpoint_state_v4
+            } else if state.influence_runtime.is_some() {
+                write_runtime_checkpoint_state_v3
+            } else {
+                write_runtime_checkpoint_state_v2
+            };
+            writer(&options.scenario_path, &baseline, &state, path, steps)?
         };
-        Ok(Some(writer(
-            &options.scenario_path,
-            &baseline,
-            &state,
-            path,
-            usize::try_from(completion.completed_steps)
-                .context("completed steps exceed save format")?,
-        )?))
+        Ok(Some(report))
     })();
     let joined = worker.stop_and_join();
     if joined.is_err() {

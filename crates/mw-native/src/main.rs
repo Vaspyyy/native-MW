@@ -12,15 +12,15 @@ use mw_checkpoint::native_runtime::{
     write_runtime_checkpoint_state_v4, write_runtime_checkpoint_state_v5,
     write_runtime_checkpoint_state_v6, write_runtime_checkpoint_state_v9,
     write_runtime_checkpoint_state_v10, write_runtime_checkpoint_state_v11,
-    write_runtime_checkpoint_state_v12, write_runtime_checkpoint_state_v13,
+    write_runtime_checkpoint_state_v12, write_runtime_checkpoint_state_v14,
 };
 use mw_core::{
     BrowserClockMode, BrowserClockState, CombatConfig, CombatUnit, DecodedScenario, FrameSnapshot,
-    GridSpec, NativeRuntime, NativeWarBootstrapConfig, ProductionCity, ProductionConfig,
-    RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot, RuntimeState,
-    RuntimeUnitPolicy, ScenarioProduction, Simulation, SimulationConfig, SimulationUnit,
-    StrategicSimulation, TerritoryCity, TerritoryConfig, TerritoryControl, TerritoryMaps,
-    TerritoryRenderUpdate, TerritoryTilePixels, UnitKind, bootstrap_native_war,
+    GameCalendarState, GameDate, GridSpec, NativeRuntime, NativeWarBootstrapConfig, ProductionCity,
+    ProductionConfig, RuntimeCheckpoint, RuntimeConfig, RuntimeDiplomacy, RuntimeSnapshot,
+    RuntimeState, RuntimeUnitPolicy, ScenarioProduction, Simulation, SimulationConfig,
+    SimulationUnit, StrategicSimulation, TerritoryCity, TerritoryConfig, TerritoryControl,
+    TerritoryMaps, TerritoryRenderUpdate, TerritoryTilePixels, UnitKind, bootstrap_native_war,
     decode_mwsc_gzip_file, derive_scenario_production,
 };
 use serde_json::Value;
@@ -41,6 +41,7 @@ mod observer;
 mod observer_hud;
 mod options;
 mod projection;
+mod render_admission;
 mod runtime_worker;
 mod unit_renderer;
 mod world_overlay;
@@ -57,6 +58,7 @@ use projection::{
     browser_zoom, geographic_to_world, pixels_per_world_for_zoom, world_to_geographic,
     world_to_grid,
 };
+use render_admission::{BrowserPlaybackSpeed, BrowserRenderAdmission, BrowserRenderFrame};
 use runtime_worker::{RuntimeWorker, RuntimeWorkerControlEvent, RuntimeWorkerStatus};
 use unit_renderer::UnitRenderer;
 use world_overlay::WorldOverlayRenderer;
@@ -145,12 +147,14 @@ struct App {
     scenario_path: PathBuf,
     runtime_checkpoint_path: Option<PathBuf>,
     native_war_sides: Vec<Vec<String>>,
+    start_date: Option<GameDate>,
     save_checkpoint_path: Option<PathBuf>,
     checkpoint_baseline: Option<DecodedScenario>,
     demo_units_requested: bool,
     runtime_tick_interval: std::time::Duration,
     runtime_queue_capacity: usize,
     window: Option<Arc<Window>>,
+    window_focused: bool,
     gpu: Option<GpuState>,
     ownership: Vec<u16>,
     dominant_sides: Vec<i16>,
@@ -184,18 +188,22 @@ struct App {
     runtime_initial_tick: Option<u64>,
     runtime_terminal: bool,
     latest_snapshot: Option<Arc<RuntimeSnapshot>>,
+    pending_runtime_snapshot: Option<Arc<RuntimeSnapshot>>,
     snapshot_dirty: bool,
     world_overlay_dirty: bool,
     map_labels_static_dirty: bool,
     map_labels_sides_dirty: bool,
     observer_hud_visible: bool,
     observer_hud_dirty: bool,
+    render_admission: BrowserRenderAdmission,
+    paint_pending: bool,
     selected_country_id: Option<u16>,
     playback_paused: bool,
     playback_speed_index: usize,
     playback_hovered: Option<PlaybackAction>,
     playback_pressed: Option<PlaybackAction>,
     territory_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
+    pending_runtime_territory_updates: VecDeque<Arc<TerritoryRenderUpdate>>,
     fps_epoch: Instant,
     fps: f64,
     fatal_error: Option<String>,
@@ -207,12 +215,14 @@ impl App {
             scenario_path: options.scenario_path,
             runtime_checkpoint_path: options.runtime_checkpoint_path,
             native_war_sides: options.native_war_sides,
+            start_date: options.start_date,
             save_checkpoint_path: options.save_checkpoint_path,
             checkpoint_baseline: None,
             demo_units_requested: options.demo_units,
             runtime_tick_interval: options.runtime_tick_interval,
             runtime_queue_capacity: options.runtime_queue_capacity,
             window: None,
+            window_focused: true,
             gpu: None,
             ownership: Vec::new(),
             dominant_sides: Vec::new(),
@@ -246,18 +256,22 @@ impl App {
             runtime_initial_tick: None,
             runtime_terminal: false,
             latest_snapshot: None,
+            pending_runtime_snapshot: None,
             snapshot_dirty: false,
             world_overlay_dirty: false,
             map_labels_static_dirty: false,
             map_labels_sides_dirty: false,
             observer_hud_visible: true,
             observer_hud_dirty: true,
+            render_admission: BrowserRenderAdmission::new(),
+            paint_pending: true,
             selected_country_id: None,
             playback_paused: false,
             playback_speed_index: 0,
             playback_hovered: None,
             playback_pressed: None,
             territory_updates: VecDeque::new(),
+            pending_runtime_territory_updates: VecDeque::new(),
             fps_epoch: Instant::now(),
             fps: 0.0,
             fatal_error: None,
@@ -323,6 +337,11 @@ impl App {
                         hostility: None,
                         production: ProductionConfig::default(),
                         war_grace_end: 600,
+                        game_calendar: self
+                            .start_date
+                            .map(GameCalendarState::new)
+                            .transpose()
+                            .context("invalid native-war calendar")?,
                     },
                 )
                 .context("failed to bootstrap native war")?;
@@ -347,7 +366,15 @@ impl App {
                 .context("--demo-units requires an adjacent-country land border")?;
                 let production = derive_scenario_production(&decoded, &ProductionConfig::default())
                     .context("failed to derive scenario production data for native runtime")?;
-                let runtime = create_demo_runtime(border, &decoded, production)?;
+                let runtime = create_demo_runtime(
+                    border,
+                    &decoded,
+                    production,
+                    self.start_date
+                        .map(GameCalendarState::new)
+                        .transpose()
+                        .context("invalid demo calendar")?,
+                )?;
                 (
                     decoded,
                     Some(runtime),
@@ -867,6 +894,11 @@ impl App {
                 lines: &observer_model.lines,
                 accent: self.observer_hud_accent(),
                 playback: self.playback_presentation(),
+                game_date: self
+                    .latest_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.game_calendar_snapshot.as_ref())
+                    .map(|calendar| calendar.date),
                 show_observer: self.observer_hud_visible,
             },
         );
@@ -903,6 +935,24 @@ impl App {
         self.map_material = None;
         self.occupation_palette.clear();
         self.occupation_palette.shrink_to_fit();
+        let snapshot_status = self
+            .latest_snapshot
+            .as_ref()
+            .map_or_else(String::new, |snapshot| {
+                format!(
+                    " | tick {} | {} units",
+                    snapshot.tick,
+                    snapshot.frame_snapshot.units.len()
+                )
+            });
+        window.set_title(&format!(
+            "Modern Wars Native | {}x{} @ {:.2}° | zoom {:.1}{}",
+            self.grid_width,
+            self.grid_height,
+            self.grid_res,
+            browser_zoom(self.zoom),
+            snapshot_status
+        ));
         self.window = Some(window);
         if let Some(runtime) = pending_runtime {
             let step_limit = self.smoke_frames.map(|_| 1);
@@ -966,6 +1016,7 @@ impl App {
     fn invalidate_map_labels(&mut self) {
         self.map_labels_static_dirty = true;
         self.map_labels_sides_dirty = true;
+        self.paint_pending = true;
     }
 
     fn reset_camera(&mut self, size: PhysicalSize<u32>) {
@@ -1035,7 +1086,7 @@ impl App {
             && state.reinforcement.is_some()
             && state.naval_planning.is_some();
         let report = if complete_v12 && let Some(clock) = checkpoint.browser_clock {
-            write_runtime_checkpoint_state_v13(
+            write_runtime_checkpoint_state_v14(
                 &self.scenario_path,
                 baseline,
                 state,
@@ -1078,6 +1129,30 @@ impl App {
         Ok(())
     }
 
+    fn commit_pending_runtime_presentation(&mut self) -> Result<()> {
+        while let Some(update) = self.pending_runtime_territory_updates.pop_front() {
+            apply_territory_update_to_grid(
+                &mut self.ownership,
+                &mut self.dominant_sides,
+                &mut self.dominant_city_controlled,
+                self.grid_width as usize,
+                self.grid_height as usize,
+                &update,
+            )?;
+            self.map_labels_static_dirty = true;
+            self.territory_updates.push_back(update);
+        }
+        if let Some(snapshot) = self.pending_runtime_snapshot.take() {
+            self.latest_snapshot = Some(snapshot);
+            self.snapshot_dirty = true;
+            self.world_overlay_dirty = true;
+            self.map_labels_sides_dirty = true;
+            self.observer_hud_dirty = true;
+        }
+        self.paint_pending = true;
+        Ok(())
+    }
+
     fn drain_runtime_worker(&mut self) -> Result<()> {
         let Some(worker) = self.runtime_worker.as_ref() else {
             return Ok(());
@@ -1099,22 +1174,52 @@ impl App {
             drained
                 .territory_updates
                 .extend(final_drain.territory_updates);
+            drained.frame_metrics.extend(final_drain.frame_metrics);
             if final_drain.snapshot.is_some() {
                 drained.snapshot = final_drain.snapshot;
             }
         }
 
-        for update in drained.territory_updates {
-            apply_territory_update_to_grid(
-                &mut self.ownership,
-                &mut self.dominant_sides,
-                &mut self.dominant_city_controlled,
-                self.grid_width as usize,
-                self.grid_height as usize,
-                &update,
-            )?;
-            self.map_labels_static_dirty = true;
-            self.territory_updates.push_back(update);
+        self.pending_runtime_territory_updates
+            .extend(drained.territory_updates);
+        let mut paint_admitted = drained.frame_metrics.is_empty() && drained.snapshot.is_some();
+        let terminal_publication = drained
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !matches!(snapshot.state, RuntimeState::Running));
+        let metrics_count = drained.frame_metrics.len();
+        for (index, metrics) in drained.frame_metrics.into_iter().enumerate() {
+            let speed = match metrics.speed {
+                1 => BrowserPlaybackSpeed::OneX,
+                2 => BrowserPlaybackSpeed::TwoX,
+                3 => BrowserPlaybackSpeed::ThreeX,
+                speed => anyhow::bail!("runtime published invalid paint speed {speed}"),
+            };
+            let admission = self
+                .render_admission
+                .evaluate(BrowserRenderFrame {
+                    runtime_frame: metrics.runtime_frame,
+                    speed,
+                    simulation_work_ms: metrics.simulation_work_ms,
+                    commit_frame: metrics.commit_frame,
+                    // Foreground conflict resolution returns before the
+                    // browser increments simFrameCount. Its final coherent
+                    // publication therefore legitimately repeats the last
+                    // frame coordinate and must still be painted once.
+                    force: terminal_publication && index + 1 == metrics_count,
+                })
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            // Only the newest decision may expose the newest immutable snapshot.
+            // Older snapshots are intentionally coalesced by RuntimeWorkerDrain.
+            paint_admitted = admission.admit;
+            log::trace!(
+                "runtime frame {} paint {:?}: {:.2} ms, commit={}, deferred={}",
+                metrics.runtime_frame,
+                admission.reason,
+                metrics.simulation_work_ms,
+                metrics.commit_frame,
+                admission.frames_since_render,
+            );
         }
         if let Some(snapshot) = drained.snapshot {
             log::trace!(
@@ -1127,11 +1232,15 @@ impl App {
                 snapshot.counters.influence.touched_influence_cells,
                 snapshot.counters.census.committed,
             );
-            self.latest_snapshot = Some(snapshot);
-            self.snapshot_dirty = true;
-            self.world_overlay_dirty = true;
-            self.map_labels_sides_dirty = true;
-            self.observer_hud_dirty = true;
+            self.pending_runtime_snapshot = Some(snapshot);
+        }
+        if !statuses.is_empty() {
+            // The browser always leaves its final coherent state available;
+            // terminal service cannot wait for a later starvation boundary.
+            paint_admitted = true;
+        }
+        if paint_admitted {
+            self.commit_pending_runtime_presentation()?;
         }
         for event in control_events {
             match event {
@@ -1170,6 +1279,7 @@ impl App {
                     self.playback_hovered = None;
                     self.playback_pressed = None;
                     self.observer_hud_dirty = true;
+                    self.paint_pending = true;
                     log::debug!(
                         "runtime rejected playback control after terminal tick {tick}, frame {frame}"
                     );
@@ -1183,6 +1293,7 @@ impl App {
                     self.playback_hovered = None;
                     self.playback_pressed = None;
                     self.observer_hud_dirty = true;
+                    self.paint_pending = true;
                     log::info!("native runtime worker stopped");
                 }
                 RuntimeWorkerStatus::Terminal(state) => {
@@ -1190,6 +1301,7 @@ impl App {
                     self.playback_hovered = None;
                     self.playback_pressed = None;
                     self.observer_hud_dirty = true;
+                    self.paint_pending = true;
                     log::warn!("native runtime reached terminal state: {state:?}");
                 }
                 RuntimeWorkerStatus::Completed { steps } => {
@@ -1197,6 +1309,7 @@ impl App {
                     self.playback_hovered = None;
                     self.playback_pressed = None;
                     self.observer_hud_dirty = true;
+                    self.paint_pending = true;
                     log::info!("native runtime completed its {steps}-step limit");
                 }
                 RuntimeWorkerStatus::Failed(error) => {
@@ -1249,6 +1362,7 @@ impl App {
             return false;
         }
         self.zoom_at(self.wheel_cursor, delta_zoom);
+        self.render_admission.force();
         self.invalidate_map_labels();
         true
     }
@@ -1383,6 +1497,7 @@ impl App {
             }
         }
         self.observer_hud_dirty = true;
+        self.paint_pending = true;
         Ok(())
     }
 
@@ -1402,6 +1517,14 @@ impl App {
 
     fn render(&mut self) -> Result<()> {
         self.drain_runtime_worker()?;
+        if !self.window_focused && self.smoke_frames.is_none() {
+            return Ok(());
+        }
+        if !self.paint_pending && self.smoke_frames.is_none() {
+            return Ok(());
+        }
+        let presenting_latest_runtime = self.pending_runtime_snapshot.is_none()
+            && self.pending_runtime_territory_updates.is_empty();
         let Some(window) = &self.window else {
             return Ok(());
         };
@@ -1426,6 +1549,10 @@ impl App {
                 self.observer_hud_model(),
                 self.observer_hud_accent(),
                 self.playback_presentation(),
+                self.latest_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.game_calendar_snapshot.as_ref())
+                    .map(|calendar| calendar.date),
             )
         });
         let Some(gpu) = &mut self.gpu else {
@@ -1488,7 +1615,7 @@ impl App {
             );
             self.map_labels_sides_dirty = false;
         }
-        if let Some((model, accent, playback)) = observer_upload {
+        if let Some((model, accent, playback, game_date)) = observer_upload {
             gpu.observer_hud.upload(
                 &gpu.device,
                 &gpu.queue,
@@ -1497,6 +1624,7 @@ impl App {
                     lines: &model.lines,
                     accent,
                     playback,
+                    game_date,
                     show_observer: observer_hud_visible,
                 },
             );
@@ -1570,6 +1698,13 @@ impl App {
         gpu.queue.submit(Some(encoder.finish()));
         window.pre_present_notify();
         frame.present();
+        self.paint_pending = false;
+        if presenting_latest_runtime {
+            // A renderer-local hover/camera paint may intentionally leave an
+            // over-budget runtime publication deferred. Do not let that stale
+            // paint reset the runtime starvation bound.
+            self.render_admission.mark_rendered();
+        }
 
         self.frame_count += 1;
         self.presented_frames += 1;
@@ -1642,6 +1777,14 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    // The browser resumes with one coherent visual frame after
+                    // hidden-tab simulation has continued without painting.
+                    self.render_admission.force();
+                    self.paint_pending = true;
+                    window.request_redraw();
+                }
                 if self.smoke_frames.is_none()
                     && let Some(worker) = self.runtime_worker.as_ref()
                 {
@@ -1676,6 +1819,7 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::KeyH) => {
                         self.observer_hud_visible = !self.observer_hud_visible;
                         self.observer_hud_dirty = true;
+                        self.paint_pending = true;
                         self.dragging = false;
                         self.drag_origin = None;
                         self.playback_pressed = None;
@@ -1726,12 +1870,14 @@ impl ApplicationHandler for App {
                 if hovered != self.playback_hovered {
                     self.playback_hovered = hovered;
                     self.observer_hud_dirty = true;
+                    self.paint_pending = true;
                     window.request_redraw();
                 }
                 if self.dragging {
                     self.center[0] -= (position.x - self.last_drag.x) as f32 / self.zoom;
                     self.center[1] -= (position.y - self.last_drag.y) as f32 / self.zoom;
                     self.center = world_copy_jump(self.center);
+                    self.paint_pending = true;
                     window.request_redraw();
                 }
                 self.last_drag = position;
@@ -1746,6 +1892,7 @@ impl ApplicationHandler for App {
                         HudHit::Playback(action) => {
                             self.playback_pressed = Some(action);
                             self.observer_hud_dirty = true;
+                            self.paint_pending = true;
                             self.dragging = false;
                             self.drag_origin = None;
                             window.request_redraw();
@@ -1773,6 +1920,7 @@ impl ApplicationHandler for App {
                     let pressed_action = self.playback_pressed.take();
                     if let Some(action) = pressed_action {
                         self.observer_hud_dirty = true;
+                        self.paint_pending = true;
                         if Some(action) == released_action
                             && let Err(error) = self.apply_playback_action(action)
                         {
@@ -1796,6 +1944,7 @@ impl ApplicationHandler for App {
                         self.selected_country_id = (id != 0).then_some(id);
                         self.observer_hud_dirty = true;
                         self.world_overlay_dirty = true;
+                        self.paint_pending = true;
                         println!(
                             "country={id} name={:?} lat={lat:.4} lng={lng:.4}",
                             self.country_name(id)
@@ -2080,6 +2229,7 @@ fn create_demo_runtime(
     border: DemoBorder,
     decoded: &DecodedScenario,
     production: ScenarioProduction,
+    game_calendar: Option<GameCalendarState>,
 ) -> Result<NativeRuntime> {
     let normal = border.toward_second;
     let tangent = [-normal[1], normal[0]];
@@ -2245,6 +2395,7 @@ fn create_demo_runtime(
         RuntimeCheckpoint {
             tick: 0,
             frame: 0,
+            game_calendar,
             operational_timers_use_frame: false,
             war_grace_end: 0,
             simulation,
@@ -3041,7 +3192,7 @@ mod tests {
         };
         let production =
             derive_scenario_production(&decoded, &ProductionConfig::default()).unwrap();
-        let mut runtime = create_demo_runtime(border, &decoded, production).unwrap();
+        let mut runtime = create_demo_runtime(border, &decoded, production, None).unwrap();
         let snapshot = runtime.latest_snapshot();
         assert_eq!(snapshot.frame_snapshot.units.len(), 4);
         assert!(

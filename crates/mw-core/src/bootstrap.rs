@@ -12,6 +12,7 @@ use crate::{
         BattlefieldBuff, BattlefieldConfig, BattlefieldRuntimeState, BattlefieldUnitState,
         BattlefieldUrbanCenter, BattlefieldWarPhase, CountryBattlefieldPrimitives,
     },
+    calendar::GameCalendarState,
     combat::{CombatUnit, UnitKind, formation_strength},
     dynamics::bootstrap_sides,
     economy::{
@@ -39,6 +40,9 @@ pub struct NativeWarBootstrapConfig {
     pub hostility: Option<Vec<u8>>,
     pub production: ProductionConfig,
     pub war_grace_end: u64,
+    /// Checked browser Time System state. `None` keeps the calendar hidden and
+    /// uses the browser's unrestricted modern-equipment behavior.
+    pub game_calendar: Option<GameCalendarState>,
 }
 
 #[derive(Debug, Error)]
@@ -82,8 +86,8 @@ const PRE_MISSILE_SCENARIO_KEYWORDS: &[&str] = &[
 ];
 
 fn scenario_enables_strategic_missiles(scenario: &DecodedScenario) -> bool {
-    // Native sandbox has no campaign clock. Preserve the browser's independent name gate exactly
-    // so pre-missile scenarios still suppress silo seeding and autonomous launches.
+    // Preserve the browser's independent scenario-name disable gate. Calendar
+    // technology gating is resolved separately from the configured start year.
     let name = scenario
         .metadata
         .get("name")
@@ -721,12 +725,16 @@ pub fn bootstrap_native_war(
     let mut gameplay_rng =
         crate::gameplay_rng::GameplayRng::new(crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED);
     let missiles_enabled = scenario_enables_strategic_missiles(scenario);
+    let missile_technology_allowed = config
+        .game_calendar
+        .as_ref()
+        .is_none_or(|calendar| calendar.date.year >= 1942);
     let strategic_missiles = StrategicMissileState::bootstrap(
         &controlled_cells_by_side,
         scenario.target.width,
         scenario.target.grid_res,
         missiles_enabled,
-        true,
+        missile_technology_allowed,
         &mut gameplay_rng,
     )?;
     Ok(NativeRuntime::new(
@@ -734,6 +742,7 @@ pub fn bootstrap_native_war(
         RuntimeCheckpoint {
             tick: 0,
             frame: 0,
+            game_calendar: config.game_calendar.clone(),
             // The bootstrap is scheduler-neutral. Windowed browser playback
             // upgrades this before its first frame; exact-step headless runs
             // retain the legacy tick coordinate for split-save compatibility.
@@ -808,6 +817,7 @@ mod tests {
             hostility: None,
             production: ProductionConfig::default(),
             war_grace_end: 600,
+            game_calendar: None,
         }
     }
 
@@ -932,6 +942,43 @@ mod tests {
             expected_rng.next_f64();
         }
         assert_eq!(state.gameplay_rng, expected_rng.state());
+    }
+
+    #[test]
+    fn pre_1942_calendar_suppresses_silos_and_preserves_rng_stream() {
+        let scenario = scenario();
+        let start_date = crate::calendar::GameDate::new(1941, 12, 31).unwrap();
+        let mut bootstrap = config(vec![vec![10], vec![20]]);
+        bootstrap.game_calendar = Some(GameCalendarState::new(start_date).unwrap());
+
+        let mut runtime = bootstrap_native_war(&scenario, &bootstrap).unwrap();
+        let initial = runtime.latest_snapshot();
+        let state = runtime.checkpoint_state().unwrap();
+        let missiles = state.strategic_missiles.unwrap();
+
+        assert_eq!(
+            initial.game_calendar_snapshot.as_ref().unwrap().date,
+            start_date
+        );
+        assert!(missiles.enabled);
+        assert!(!missiles.technology_allowed);
+        assert!(missiles.bases.is_empty());
+        assert_eq!(
+            state.gameplay_rng,
+            crate::gameplay_rng::GameplayRngState {
+                state: crate::gameplay_rng::DEFAULT_GAMEPLAY_RNG_SEED
+            }
+        );
+
+        let mut bootstrap = config(vec![vec![10], vec![20]]);
+        bootstrap.game_calendar = Some(
+            GameCalendarState::new(crate::calendar::GameDate::new(1942, 1, 1).unwrap()).unwrap(),
+        );
+        let mut runtime = bootstrap_native_war(&scenario, &bootstrap).unwrap();
+        let state = runtime.checkpoint_state().unwrap();
+        let missiles = state.strategic_missiles.unwrap();
+        assert!(missiles.technology_allowed);
+        assert_eq!(missiles.bases.len(), 4);
     }
 
     #[test]
